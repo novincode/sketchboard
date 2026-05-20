@@ -1,3 +1,5 @@
+import type { Color } from '../math/Color'
+
 type Listener<T> = (payload: T) => void
 
 class Hook<T = void> {
@@ -26,6 +28,8 @@ export class BoardHooks {
   readonly layerRemoved = new Hook<{ id: string }>()
   readonly toolChanged = new Hook<{ name: string }>()
   readonly activeLayerChanged = new Hook<{ id: string | null }>()
+  /** Fired by EyedropperTool (or any plugin) when a color is sampled */
+  readonly colorPicked = new Hook<{ color: Color }>()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly destroy = new Hook<any>()
 }

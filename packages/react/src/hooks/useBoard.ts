@@ -9,11 +9,19 @@ export interface UseBoardOptions extends BoardOptions {
   layerHeight?: number
   /** Whether to create an initial raster layer automatically */
   autoLayer?: boolean
+  /**
+   * Called once when the Board is fully mounted and ready.
+   * Use this to register tools, plugins, and hook listeners.
+   */
+  onReady?: (board: Board) => void
 }
 
 export function useBoard(options: UseBoardOptions = {}) {
   const containerRef = useRef<HTMLDivElement>(null)
   const boardRef = useRef<Board | null>(null)
+  // Stable ref to onReady to avoid re-running the effect if the callback changes
+  const onReadyRef = useRef(options.onReady)
+  onReadyRef.current = options.onReady
 
   useEffect(() => {
     const container = containerRef.current
@@ -23,6 +31,7 @@ export function useBoard(options: UseBoardOptions = {}) {
     const board = new Board(container, boardOptions)
     boardRef.current = board
 
+    // Default tools always registered so keyboard shortcuts resolve them
     board.registerTool('brush', new BrushTool())
     board.registerTool('eraser', new EraserTool())
     board.setActiveTool('brush')
@@ -32,6 +41,9 @@ export function useBoard(options: UseBoardOptions = {}) {
       board.addLayer(layer)
       board.setActiveLayer(layer.id)
     }
+
+    // Notify caller — here they can register extra tools, plugins, hook listeners
+    onReadyRef.current?.(board)
 
     return () => {
       board.destroy()

@@ -90,9 +90,52 @@ pnpm typecheck    # type-check everything
 All packages use synchronized versioning (bump all when any breaking change occurs).
 Internal dependencies use `"workspace:*"`.
 
+## Tools Available
+
+| Tool | Class | Key | Notes |
+|------|-------|-----|-------|
+| Pen | `PenTool` | `P` | Hard edge, pressure → size |
+| Brush | `BrushTool` | `B` | Soft edge, configurable |
+| Pencil | `PencilTool` | `N` | Jitter texture stamps |
+| Eraser | `EraserTool` | `E` | destination-out composite |
+| Pan/Hand | `PanTool` | `H` | Also: Space hold = temp pan |
+| Eyedropper | `EyedropperTool` | `I` | Fires `hooks.colorPicked` |
+
+## Keyboard System
+
+```typescript
+import { KeyboardPlugin, type ShortcutOverrides } from '@sketchboard/core'
+
+// Default shortcuts cover all tools + undo/redo/brush size
+board.use(new KeyboardPlugin())
+
+// Override or add shortcuts:
+board.use(new KeyboardPlugin({
+  brush: null,              // disable
+  undo: { key: 'z', cmdOrCtrl: true, description: 'Undo', handler: (b) => b.history.undo() },
+  myCustom: { key: 'f', description: 'My action', handler: (b) => { /* ... */ } },
+}))
+```
+
+**Important:** The `hooks.toolChanged` subscriber must NOT call `store.setActiveToolId()` (which
+calls board) — that creates an infinite loop. Instead, use `zustand.setState({ activeToolId })` directly.
+
+## Templates (in apps/demo)
+
+Templates are self-contained UI implementations that demonstrate the headless core:
+
+- `src/templates/freeform/` — full-screen drawing canvas (Apple Freeform style)
+  - `FreeformTemplate.tsx` — top-level component
+  - `store.ts` — Zustand store (syncs with Board via hooks)
+  - `components/` — Toolbar, ColorPickerPopup, BrushPanel, Background, StatusBar
+
+Pattern: UI events → store actions → board methods → hook events → `zustand.setState()`.
+Never hook → store action → board → hook (creates loops).
+
 ## Roadmap
 
 - [ ] `FrameLayer` — RasterLayer with multiple frames (frame-by-frame animation)
+- [ ] Node-based compositing pipeline (see docs/ARCHITECTURE.md)
 - [ ] `VectorLayer` — SVG path-based layer
 - [ ] `CompositionLayer` — nested Board instance as a layer
 - [ ] WebGL renderer (`@sketchboard/renderer-webgl`)

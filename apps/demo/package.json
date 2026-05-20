@@ -1,32 +1,38 @@
 {
-  "name": "@sketchboard/demo",
-  "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "preview": "wrangler pages dev .vercel/output/static --compatibility-date=2025-01-01",
-    "deploy": "pnpm build && wrangler pages deploy .vercel/output/static",
-    "typecheck": "tsc --noEmit",
-    "lint": "next lint",
-    "clean": "rm -rf .next .vercel dist"
-  },
-  "dependencies": {
-    "@sketchboard/animation": "workspace:*",
-    "@sketchboard/core": "workspace:*",
-    "@sketchboard/react": "workspace:*",
-    "next": "^15",
-    "react": "^19",
-    "react-dom": "^19"
-  },
-  "devDependencies": {
-    "@cloudflare/next-on-pages": "^1",
-    "@types/node": "^22",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "^15",
-    "typescript": "^5",
-    "wrangler": "^3"
-  }
+	"name": "demo",
+	"version": "0.1.0",
+	"private": true,
+	"scripts": {
+		"dev": "next dev",
+		"build": "next build",
+		"start": "next start",
+		"lint": "next lint",
+		"deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+		"upload": "opennextjs-cloudflare build && opennextjs-cloudflare upload",
+		"preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+		"cf-typegen": "wrangler types --env-interface CloudflareEnv ./cloudflare-env.d.ts"
+	},
+	"dependencies": {
+		"@opennextjs/cloudflare": "^1.19.9",
+		"@sketchboard/core": "workspace:*",
+		"@sketchboard/react": "workspace:*",
+		"lucide-react": "^0",
+		"next": "16.2.6",
+		"react": "^19.1.7",
+		"react-colorful": "^5",
+		"react-dom": "^19.1.7",
+		"zustand": "^5"
+	},
+	"devDependencies": {
+		"@eslint/eslintrc": "^3",
+		"@tailwindcss/postcss": "^4",
+		"@types/node": "^20.19.41",
+		"@types/react": "^19.1.7",
+		"@types/react-dom": "^19.1.7",
+		"eslint": "^9",
+		"eslint-config-next": "16.2.6",
+		"tailwindcss": "^4",
+		"typescript": "^5.7.4",
+		"wrangler": "^4.93.0"
+	}
 }

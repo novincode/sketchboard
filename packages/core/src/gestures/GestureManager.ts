@@ -5,6 +5,7 @@ export class GestureManager {
   private activePointers = new Map<number, PointerEvent>()
   private lastPinchDist = 0
   private lastTwoFingerCenter = { x: 0, y: 0 }
+  private isSpaceHeld = false
 
   constructor(
     private readonly element: HTMLElement,
@@ -16,8 +17,12 @@ export class GestureManager {
     element.addEventListener('pointerup', this.onPointerUp)
     element.addEventListener('pointercancel', this.onPointerCancel)
     element.addEventListener('wheel', this.onWheel, { passive: false })
+    window.addEventListener('keydown', this.onKeyDown)
+    window.addEventListener('keyup', this.onKeyUp)
     element.style.touchAction = 'none'
   }
+
+  // ─── Pointer helpers ──────────────────────────────────────────────────────
 
   private toPointerData(e: PointerEvent) {
     const rect = this.element.getBoundingClientRect()
@@ -32,6 +37,8 @@ export class GestureManager {
       timeStamp: e.timeStamp,
     }
   }
+
+  // ─── Pointer events ───────────────────────────────────────────────────────
 
   private onPointerDown = (e: PointerEvent): void => {
     this.element.setPointerCapture(e.pointerId)
@@ -52,6 +59,7 @@ export class GestureManager {
   private onPointerMove = (e: PointerEvent): void => {
     this.activePointers.set(e.pointerId, e)
 
+    // Two-finger gesture: pinch-zoom + pan
     if (this.activePointers.size >= 2) {
       const [a, b] = [...this.activePointers.values()] as [PointerEvent, PointerEvent]
       const dist = this.distance(a, b)
@@ -59,14 +67,16 @@ export class GestureManager {
       const rect = this.element.getBoundingClientRect()
       const cx = center.x - rect.left
       const cy = center.y - rect.top
-      const lc = this.lastTwoFingerCenter
+      const prevCx = this.lastTwoFingerCenter.x - rect.left
+      const prevCy = this.lastTwoFingerCenter.y - rect.top
 
       if (this.lastPinchDist > 0) {
         const zoomFactor = dist / this.lastPinchDist
         this.camera.zoomAt(zoomFactor, cx, cy, this.element.clientWidth, this.element.clientHeight)
-        const panX = cx - (lc.x - rect.left)
-        const panY = cy - (lc.y - rect.top)
-        this.camera.pan(-panX, -panY)
+        // Pan by midpoint delta
+        const panX = cx - prevCx
+        const panY = cy - prevCy
+        this.camera.pan(panX, panY)
         this.board.markDirty()
       }
 
@@ -80,9 +90,7 @@ export class GestureManager {
 
   private onPointerUp = (e: PointerEvent): void => {
     this.activePointers.delete(e.pointerId)
-    if (this.activePointers.size < 2) {
-      this.lastPinchDist = 0
-    }
+    if (this.activePointers.size < 2) this.lastPinchDist = 0
     this.board.activeTool?.onPointerUp(this.toPointerData(e))
   }
 
@@ -106,6 +114,25 @@ export class GestureManager {
     this.board.markDirty()
   }
 
+  // ─── Keyboard (spacebar → temp pan) ──────────────────────────────────────
+
+  private onKeyDown = (e: KeyboardEvent): void => {
+    if (e.code !== 'Space' || e.repeat || this.isSpaceHeld) return
+    const tag = (e.target as HTMLElement | null)?.tagName ?? ''
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+    this.isSpaceHeld = true
+    this.board.setTempTool('pan')
+    e.preventDefault()
+  }
+
+  private onKeyUp = (e: KeyboardEvent): void => {
+    if (e.code !== 'Space') return
+    this.isSpaceHeld = false
+    this.board.clearTempTool()
+  }
+
+  // ─── Math helpers ─────────────────────────────────────────────────────────
+
   private distance(a: PointerEvent, b: PointerEvent): number {
     return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY)
   }
@@ -114,11 +141,15 @@ export class GestureManager {
     return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 }
   }
 
+  // ─── Lifecycle ────────────────────────────────────────────────────────────
+
   destroy(): void {
     this.element.removeEventListener('pointerdown', this.onPointerDown)
     this.element.removeEventListener('pointermove', this.onPointerMove)
     this.element.removeEventListener('pointerup', this.onPointerUp)
     this.element.removeEventListener('pointercancel', this.onPointerCancel)
     this.element.removeEventListener('wheel', this.onWheel)
+    window.removeEventListener('keydown', this.onKeyDown)
+    window.removeEventListener('keyup', this.onKeyUp)
   }
 }

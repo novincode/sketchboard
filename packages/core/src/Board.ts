@@ -22,6 +22,8 @@ export class Board {
   private layers: Layer[] = []
   private toolRegistry = new Map<string, Tool>()
   private _activeTool: Tool | null = null
+  /** Transient tool override (e.g. Space-to-pan) — never fires toolChanged hook */
+  private _tempTool: Tool | null = null
   private _activeLayerId: string | null = null
   private rafId: number | null = null
   private _dirty = true
@@ -129,8 +131,27 @@ export class Board {
     this.hooks.toolChanged.call({ name })
   }
 
+  /**
+   * Temporarily override the active tool without firing toolChanged.
+   * Used by GestureManager for Space-to-pan. UI stays on the real active tool.
+   */
+  setTempTool(name: string): void {
+    const tool = this.toolRegistry.get(name)
+    if (!tool) return
+    this._tempTool = tool
+    tool.onActivate()
+  }
+
+  clearTempTool(): void {
+    this._tempTool?.onDeactivate()
+    this._tempTool = null
+    // Restore cursor from the real active tool
+    this._activeTool?.onActivate()
+  }
+
+  /** Returns the temp tool if set, otherwise the regular active tool */
   get activeTool(): Tool | null {
-    return this._activeTool
+    return this._tempTool ?? this._activeTool
   }
 
   getTool<T extends Tool>(name: string): T | undefined {

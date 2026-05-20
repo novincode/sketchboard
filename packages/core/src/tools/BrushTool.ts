@@ -123,7 +123,7 @@ export class BrushTool extends Tool {
     }
   }
 
-  private drawStamp(
+  protected drawStamp(
     ctx: CanvasRenderingContext2D,
     pos: Vec2,
     size: number,

@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+:root {
+	--background: #0d0d0d;
+	--foreground: #ededed;
+}
+
+@theme inline {
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+}
+
+html,
+body {
+	height: 100%;
+	overflow: hidden;
+	background: var(--background);
+	color: var(--foreground);
+	font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+	-webkit-font-smoothing: antialiased;
+}
+
+/* react-colorful — fit the dark glass aesthetic */
+.react-colorful {
+	width: 100% !important;
+	border-radius: 10px;
+	overflow: hidden;
+}
+
+.react-colorful__saturation {
+	border-radius: 8px 8px 0 0;
+}
+
+.react-colorful__last-control {
+	border-radius: 0 0 8px 8px;
+}
+
+.react-colorful__pointer {
+	width: 16px;
+	height: 16px;
+	border: 2px solid white;
+	box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}

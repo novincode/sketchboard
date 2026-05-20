@@ -12,6 +12,10 @@ export { GroupLayer } from './layers/GroupLayer'
 export { Tool } from './tools/Tool'
 export { BrushTool } from './tools/BrushTool'
 export { EraserTool } from './tools/EraserTool'
+export { PenTool } from './tools/PenTool'
+export { PencilTool } from './tools/PencilTool'
+export { PanTool } from './tools/PanTool'
+export { EyedropperTool } from './tools/EyedropperTool'
 export type { BrushSettings } from './tools/BrushTool'
 
 // Renderer
@@ -21,6 +25,12 @@ export { Canvas2DRenderer } from './renderer/Canvas2DRenderer'
 // Plugins
 export type { Plugin } from './plugins/Plugin'
 export { PluginManager } from './plugins/PluginManager'
+
+// Keyboard
+export { KeyboardManager } from './keyboard/KeyboardManager'
+export { KeyboardPlugin } from './keyboard/KeyboardPlugin'
+export { DEFAULT_SHORTCUTS } from './keyboard/KeyboardManager'
+export type { ShortcutDef, DefaultShortcutId, ShortcutOverrides } from './keyboard/KeyboardManager'
 
 // History
 export { HistoryManager } from './history/HistoryManager'

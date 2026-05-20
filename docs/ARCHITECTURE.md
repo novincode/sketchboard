@@ -1,5 +1,40 @@
 # Architecture Deep-Dive
 
+## Node System Vision (next major milestone)
+
+The long-term rendering model is **node-based compositing** — inspired by Blender's compositor and
+After Effects' effect stack. Every drawable item is a **node** with typed inputs and outputs:
+
+```
+RasterLayerNode ──▶ BlurNode ──▶ ColorCorrectionNode ──▶ MergeNode ──▶ OutputNode
+VectorLayerNode ──────────────────────────────────────▶ MergeNode
+```
+
+**Foundation (in progress):**
+```typescript
+interface RenderNode {
+  readonly id: string
+  readonly inputs:  ReadonlyMap<string, RenderNode>   // upstream dependencies
+  readonly outputs: ReadonlyMap<string, RenderNode>   // downstream consumers
+  process(ctx: OffscreenCanvasRenderingContext2D, camera: Camera): void
+}
+```
+
+`Layer` will implement `RenderNode`. The `Canvas2DRenderer` will traverse the node graph in
+topological order instead of a flat array. Plugins can inject nodes (e.g., a bloom effect) without
+touching the renderer code.
+
+**Why this matters:**
+- One unified rendering/preview pipeline — no duplicated compositing code for export vs. preview
+- Export (PNG, MP4) just calls the same node graph at the desired resolution
+- Future: GPU shader nodes via WebGPU, live collaboration nodes, AI-generated fill nodes
+
+**Current state:** layers are a flat ordered array. The node graph is the roadmap abstraction.
+Incremental migration plan: make `Layer` implement `RenderNode` without changing the public API,
+then add `NodeGraph` as an optional wrapper that the `AnimationPlugin` uses for frame compositing.
+
+---
+
 ## Rendering Pipeline
 
 ```
