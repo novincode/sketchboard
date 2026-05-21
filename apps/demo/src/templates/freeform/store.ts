@@ -2,9 +2,9 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool, Layer } from '@sketchboard/core'
-import { Color, RasterLayer } from '@sketchboard/core'
-import type { ToolId, Background } from './types'
+import type { Board, BrushTool, VectorBrushTool, Layer } from '@sketchboard/core'
+import { Color, RasterLayer, VectorLayer } from '@sketchboard/core'
+import type { ToolId, Background, EraserMode, LayerType } from './types'
 
 // ─── State shape ─────────────────────────────────────────────────────────────
 
@@ -14,6 +14,7 @@ interface LayerMeta {
   visible: boolean
   opacity: number
   blendMode: string
+  type: LayerType
 }
 
 interface FreeformState {
@@ -23,14 +24,18 @@ interface FreeformState {
   brushSize: number
   brushOpacity: number
   brushHardness: number
-  brushColor: string // hex e.g. "#1a1a1a"
+  brushColor: string       // hex
+
+  eraserSize: number
+  eraserMode: EraserMode
+
+  vectorSize: number
+  vectorOpacity: number
 
   background: Background
   showColorPicker: boolean
-  showBrushPanel: boolean   // unused—kept for future panels
   showLayerPanel: boolean
 
-  // Layer list — mirrors board.getLayers() for UI reactivity
   layers: LayerMeta[]
   activeLayerId: string | null
 }
@@ -44,13 +49,18 @@ interface FreeformActions {
   setBrushHardness(hardness: number): void
   setBrushColor(hex: string): void
 
+  setEraserSize(size: number): void
+  setEraserMode(mode: EraserMode): void
+
+  setVectorSize(size: number): void
+  setVectorOpacity(opacity: number): void
+
   setBackground(bg: Background): void
   toggleColorPicker(): void
   closePanels(): void
   toggleLayerPanel(): void
 
-  // Layer management
-  addLayer(): void
+  addLayer(type?: LayerType): void
   removeLayer(id: string): void
   setActiveLayerId(id: string): void
   setLayerVisibility(id: string, visible: boolean): void
@@ -65,28 +75,30 @@ interface FreeformActions {
 
 function applyBrushColor(board: Board, hex: string) {
   const color = Color.fromHex(hex)
-  for (const name of ['pen', 'brush', 'pencil'] as const) {
+  for (const name of ['pen', 'brush'] as const) {
     const tool = board.getTool<BrushTool>(name)
     if (tool) tool.settings.color = color
   }
+  const vec = board.getTool<VectorBrushTool>('vector')
+  if (vec) vec.settings.color = color
 }
 
 function applyBrushSize(board: Board, size: number) {
-  for (const name of ['pen', 'brush', 'pencil', 'eraser'] as const) {
+  for (const name of ['pen', 'brush'] as const) {
     const tool = board.getTool<BrushTool>(name)
     if (tool) tool.settings.size = size
   }
 }
 
 function applyBrushOpacity(board: Board, opacity: number) {
-  for (const name of ['pen', 'brush', 'pencil'] as const) {
+  for (const name of ['pen', 'brush'] as const) {
     const tool = board.getTool<BrushTool>(name)
     if (tool) tool.settings.opacity = opacity
   }
 }
 
 function applyBrushHardness(board: Board, hardness: number) {
-  for (const name of ['pen', 'brush', 'pencil'] as const) {
+  for (const name of ['pen', 'brush'] as const) {
     const tool = board.getTool<BrushTool>(name)
     if (tool) tool.settings.hardness = hardness
   }
@@ -99,6 +111,7 @@ function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
     visible: l.visible,
     opacity: l.opacity,
     blendMode: l.blendMode,
+    type: (l as RasterLayer | VectorLayer).type === 'vector' ? 'vector' : 'raster',
   }))
 }
 
@@ -112,38 +125,37 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     brushOpacity: 1,
     brushHardness: 0.9,
     brushColor: '#1a1a1a',
+    eraserSize: 24,
+    eraserMode: 'pixel',
+    vectorSize: 4,
+    vectorOpacity: 1,
     background: 'dots',
     showColorPicker: false,
-    showBrushPanel: false,
     showLayerPanel: false,
     layers: [],
     activeLayerId: null,
 
     // ── Board ──────────────────────────────────────────────────────────────
     _setBoard(board) {
-      if (!board) {
-        set({ board: null, layers: [], activeLayerId: null })
-        return
-      }
+      if (!board) { set({ board: null, layers: [], activeLayerId: null }); return }
       set({ board, layers: layersToMeta(board.getLayers()) })
 
-      // Sync initial settings
       const s = get()
       applyBrushColor(board, s.brushColor)
       applyBrushSize(board, s.brushSize)
       applyBrushOpacity(board, s.brushOpacity)
       applyBrushHardness(board, s.brushHardness)
 
-      // Keep layer list in sync with board
-      board.hooks.layerAdded.tap('store', () => {
-        set({ layers: layersToMeta(board.getLayers()) })
-      })
-      board.hooks.layerRemoved.tap('store', () => {
-        set({ layers: layersToMeta(board.getLayers()) })
-      })
-      board.hooks.activeLayerChanged.tap('store', ({ id }) => {
-        set({ activeLayerId: id })
-      })
+      const vec = board.getTool<VectorBrushTool>('vector')
+      if (vec) {
+        vec.settings.size = s.vectorSize
+        vec.settings.opacity = s.vectorOpacity
+        vec.settings.color = Color.fromHex(s.brushColor)
+      }
+
+      board.hooks.layerAdded.tap('store', () => set({ layers: layersToMeta(board.getLayers()) }))
+      board.hooks.layerRemoved.tap('store', () => set({ layers: layersToMeta(board.getLayers()) }))
+      board.hooks.activeLayerChanged.tap('store', ({ id }) => set({ activeLayerId: id }))
     },
 
     // ── Tool ──────────────────────────────────────────────────────────────
@@ -153,7 +165,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       set({ activeToolId: id })
     },
 
-    // ── Brush ─────────────────────────────────────────────────────────────
+    // ── Raster brush ──────────────────────────────────────────────────────
     setBrushSize(size) {
       const { board } = get()
       if (board) applyBrushSize(board, size)
@@ -175,6 +187,29 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       set({ brushColor: hex })
     },
 
+    // ── Eraser ────────────────────────────────────────────────────────────
+    setEraserSize(size) {
+      const { board } = get()
+      const tool = board?.getTool<BrushTool>('eraser')
+      if (tool) tool.settings.size = size
+      set({ eraserSize: size })
+    },
+    setEraserMode(mode) { set({ eraserMode: mode }) },
+
+    // ── Vector brush ──────────────────────────────────────────────────────
+    setVectorSize(size) {
+      const { board } = get()
+      const tool = board?.getTool<VectorBrushTool>('vector')
+      if (tool) tool.settings.size = size
+      set({ vectorSize: size })
+    },
+    setVectorOpacity(opacity) {
+      const { board } = get()
+      const tool = board?.getTool<VectorBrushTool>('vector')
+      if (tool) tool.settings.opacity = opacity
+      set({ vectorOpacity: opacity })
+    },
+
     // ── UI ────────────────────────────────────────────────────────────────
     setBackground: (bg) => set({ background: bg }),
     toggleColorPicker: () =>
@@ -184,12 +219,19 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       set((s) => ({ showLayerPanel: !s.showLayerPanel, showColorPicker: false })),
 
     // ── Layer management ──────────────────────────────────────────────────
-    addLayer() {
+    addLayer(type = 'raster') {
       const { board } = get()
       if (!board) return
-      const layer = new RasterLayer(3840, 2160, `Layer ${board.getLayers().length + 1}`)
+      const n = board.getLayers().length + 1
+      let layer: Layer
+      if (type === 'vector') {
+        layer = new VectorLayer(`Vector ${n}`)
+      } else {
+        const r = new RasterLayer(3840, 2160, `Layer ${n}`)
+        r.backgroundColor = null
+        layer = r
+      }
       const added = board.addLayer(layer)
-      // Immediately activate the newly created layer
       board.setActiveLayer(added.id)
     },
 
@@ -215,9 +257,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       if (!layer) return
       layer.visible = visible
       board?.markDirty()
-      set((s) => ({
-        layers: s.layers.map((l) => (l.id === id ? { ...l, visible } : l)),
-      }))
+      set((s) => ({ layers: s.layers.map((l) => (l.id === id ? { ...l, visible } : l)) }))
     },
 
     setLayerOpacity(id, opacity) {
@@ -226,9 +266,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       if (!layer) return
       layer.opacity = opacity
       board?.markDirty()
-      set((s) => ({
-        layers: s.layers.map((l) => (l.id === id ? { ...l, opacity } : l)),
-      }))
+      set((s) => ({ layers: s.layers.map((l) => (l.id === id ? { ...l, opacity } : l)) }))
     },
 
     setLayerName(id, name) {
@@ -236,21 +274,17 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const layer = board?.getLayerById(id)
       if (!layer) return
       layer.name = name
-      set((s) => ({
-        layers: s.layers.map((l) => (l.id === id ? { ...l, name } : l)),
-      }))
+      set((s) => ({ layers: s.layers.map((l) => (l.id === id ? { ...l, name } : l)) }))
     },
 
     setLayerBlendMode(id, blendMode) {
       const { board } = get()
-      const layer = board?.getLayerById(id) as RasterLayer | undefined
+      const layer = board?.getLayerById(id)
       if (!layer) return
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      layer.blendMode = blendMode as any
+      ;(layer as any).blendMode = blendMode
       board?.markDirty()
-      set((s) => ({
-        layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l)),
-      }))
+      set((s) => ({ layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l)) }))
     },
 
     // ── Export ────────────────────────────────────────────────────────────

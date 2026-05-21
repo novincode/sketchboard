@@ -49,6 +49,8 @@ export class GestureManager {
     if (e.button === 1) {
       this.isMiddleDown = true
       this.board.setTempTool('pan')
+      // Forward down to pan tool so it enters drag mode
+      this.board.activeTool?.onPointerDown(this.toPointerData(e))
       e.preventDefault()
       return
     }

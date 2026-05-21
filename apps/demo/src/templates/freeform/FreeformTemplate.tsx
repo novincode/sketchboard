@@ -4,17 +4,19 @@ import React, { useCallback, useEffect, useState } from 'react'
 import type { Board } from '@sketchboard/core'
 import {
   PenTool,
-  PencilTool,
   PanTool,
   EyedropperTool,
   RasterLayer,
+  VectorBrushTool,
   KeyboardPlugin,
 } from '@sketchboard/core'
+import { BrushTool } from '@sketchboard/core'
+import { EraserTool } from '@sketchboard/core'
 import { useBoard } from '@sketchboard/react'
 import { useFreeformStore } from './store'
 import { TopBar } from './components/TopBar'
 import { Toolbar } from './components/Toolbar'
-import { SideControls } from './components/SideControls'
+import { ToolOptionsPanel } from './components/ToolOptionsPanel'
 import { ColorPickerPopup } from './components/ColorPickerPopup'
 import { LayerPanel } from './components/LayerPanel'
 import { BrushCursor } from './components/BrushCursor'
@@ -24,16 +26,17 @@ import type { ToolId } from './types'
 const LAYER_W = 3840
 const LAYER_H = 2160
 
-// ─── Board setup ─────────────────────────────────────────────────────────────
-
 function useFreeformSetup(board: Board | null) {
   const { _setBoard, setBrushColor } = useFreeformStore()
 
   useEffect(() => {
     if (!board || board.destroyed) return
 
+    // Register all tools
     board.registerTool('pen', new PenTool())
-    board.registerTool('pencil', new PencilTool())
+    board.registerTool('brush', new BrushTool())
+    board.registerTool('eraser', new EraserTool())
+    board.registerTool('vector', new VectorBrushTool())
     board.registerTool('pan', new PanTool())
     board.registerTool('eyedropper', new EyedropperTool())
     board.setActiveTool('pen')
@@ -48,7 +51,7 @@ function useFreeformSetup(board: Board | null) {
       useFreeformStore.setState({ activeToolId: name as ToolId })
     })
 
-    // White-background drawing layer centered in viewport
+    // White background raster layer, centered in viewport
     const layer = new RasterLayer(LAYER_W, LAYER_H, 'Layer 1')
     layer.backgroundColor = '#ffffff'
     board.addLayer(layer)
@@ -65,8 +68,6 @@ function useFreeformSetup(board: Board | null) {
     }
   }, [board, _setBoard, setBrushColor])
 }
-
-// ─── Template ────────────────────────────────────────────────────────────────
 
 export function FreeformTemplate() {
   const { background, showColorPicker, showLayerPanel } = useFreeformStore()
@@ -88,19 +89,18 @@ export function FreeformTemplate() {
     <div className="relative h-screen w-screen overflow-hidden bg-[#0d0d0d]">
       <CanvasBackground type={background} />
 
-      {/* Board canvas + stroke overlay — both injected by Board into this div */}
+      {/* Board canvas + stroke overlay injected into this div */}
       <div
         ref={containerRef}
         className="absolute inset-0"
         style={{ cursor: 'none' }}
       />
 
-      {/* Custom brush cursor */}
       <BrushCursor />
 
       {/* UI chrome */}
       <TopBar />
-      <SideControls />
+      <ToolOptionsPanel />
       <Toolbar />
 
       {/* Panels */}
