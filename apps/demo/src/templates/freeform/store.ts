@@ -2,8 +2,8 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool, RasterLayer, Layer } from '@sketchboard/core'
-import { Color } from '@sketchboard/core'
+import type { Board, BrushTool, Layer } from '@sketchboard/core'
+import { Color, RasterLayer } from '@sketchboard/core'
 import type { ToolId, Background } from './types'
 
 // ─── State shape ─────────────────────────────────────────────────────────────
@@ -187,9 +187,10 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     addLayer() {
       const { board } = get()
       if (!board) return
-      const { RasterLayer } = require('@sketchboard/core') as typeof import('@sketchboard/core')
       const layer = new RasterLayer(3840, 2160, `Layer ${board.getLayers().length + 1}`)
-      board.addLayer(layer)
+      const added = board.addLayer(layer)
+      // Immediately activate the newly created layer
+      board.setActiveLayer(added.id)
     },
 
     removeLayer(id) {

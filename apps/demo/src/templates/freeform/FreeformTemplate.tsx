@@ -12,20 +12,19 @@ import {
 } from '@sketchboard/core'
 import { useBoard } from '@sketchboard/react'
 import { useFreeformStore } from './store'
+import { TopBar } from './components/TopBar'
 import { Toolbar } from './components/Toolbar'
-import { ToolSettingsPanel } from './components/ToolSettingsPanel'
+import { SideControls } from './components/SideControls'
 import { ColorPickerPopup } from './components/ColorPickerPopup'
 import { LayerPanel } from './components/LayerPanel'
 import { BrushCursor } from './components/BrushCursor'
 import { CanvasBackground } from './components/Background'
-import { StatusBar } from './components/StatusBar'
 import type { ToolId } from './types'
 
-// Layer size in world pixels — large enough for any viewport
 const LAYER_W = 3840
 const LAYER_H = 2160
 
-// ─── Board setup hook ────────────────────────────────────────────────────────
+// ─── Board setup ─────────────────────────────────────────────────────────────
 
 function useFreeformSetup(board: Board | null) {
   const { _setBoard, setBrushColor } = useFreeformStore()
@@ -33,19 +32,15 @@ function useFreeformSetup(board: Board | null) {
   useEffect(() => {
     if (!board || board.destroyed) return
 
-    // Register all drawing tools (brush + eraser pre-registered by useBoard)
     board.registerTool('pen', new PenTool())
     board.registerTool('pencil', new PencilTool())
     board.registerTool('pan', new PanTool())
     board.registerTool('eyedropper', new EyedropperTool())
     board.setActiveTool('pen')
 
-    // Install keyboard shortcuts (defaults cover all tools + undo/redo/[ ] size)
     board.use(new KeyboardPlugin())
 
-    // Sync board events → store (for UI reactivity)
-    // CRITICAL: use setState directly, never call setActiveToolId() here — that would
-    // call board.setActiveTool() → hook fires → setActiveToolId() → infinite loop
+    // CRITICAL: use setState directly — calling setActiveToolId would loop back through board
     const unsubColor = board.hooks.colorPicked.tap('freeform', ({ color }) => {
       setBrushColor(color.toHex())
     })
@@ -53,17 +48,14 @@ function useFreeformSetup(board: Board | null) {
       useFreeformStore.setState({ activeToolId: name as ToolId })
     })
 
-    // Create the main drawing layer with a white background so it's visible
+    // White-background drawing layer centered in viewport
     const layer = new RasterLayer(LAYER_W, LAYER_H, 'Layer 1')
     layer.backgroundColor = '#ffffff'
     board.addLayer(layer)
     board.setActiveLayer(layer.id)
-
-    // Center camera so the artboard is in the middle of the viewport
     board.camera.position.x = LAYER_W / 2
     board.camera.position.y = LAYER_H / 2
 
-    // Hand off board reference → triggers brush settings sync
     _setBoard(board)
 
     return () => {
@@ -84,7 +76,7 @@ export function FreeformTemplate() {
   const handleDestroy = useCallback(() => setBoard(null), [])
 
   const { containerRef } = useBoard({
-    autoLayer: false,     // we create our own layer in useFreeformSetup
+    autoLayer: false,
     background: 'transparent',
     onReady: handleReady,
     onDestroy: handleDestroy,
@@ -94,29 +86,26 @@ export function FreeformTemplate() {
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#0d0d0d]">
-      {/* Dot / grid background pattern */}
       <CanvasBackground type={background} />
 
-      {/* Board canvas */}
-      <div ref={containerRef} className="absolute inset-0" style={{ cursor: 'none' }} />
+      {/* Board canvas + stroke overlay — both injected by Board into this div */}
+      <div
+        ref={containerRef}
+        className="absolute inset-0"
+        style={{ cursor: 'none' }}
+      />
 
-      {/* Custom brush size cursor */}
+      {/* Custom brush cursor */}
       <BrushCursor />
 
-      {/* Left floating toolbar */}
+      {/* UI chrome */}
+      <TopBar />
+      <SideControls />
       <Toolbar />
 
-      {/* Tool settings panel — slides out to the right of the toolbar */}
-      <ToolSettingsPanel />
-
-      {/* Color picker popup — anchored to color swatch */}
+      {/* Panels */}
       {showColorPicker && <ColorPickerPopup />}
-
-      {/* Layer panel — right side */}
       {showLayerPanel && <LayerPanel />}
-
-      {/* Keyboard hint strip */}
-      <StatusBar />
     </div>
   )
 }

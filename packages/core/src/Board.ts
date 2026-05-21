@@ -34,15 +34,32 @@ export class Board {
   /** Logical (CSS) canvas height in pixels. Tracks the last ResizeObserver measurement. */
   private _logicalHeight = 0
 
+  /**
+   * Viewport-sized overlay canvas for active stroke visual feedback.
+   * Drawing here is very cheap because no layer compositing is required during a stroke.
+   * null when the container is a raw HTMLCanvasElement (can't add overlay).
+   */
+  strokeCanvas: HTMLCanvasElement | null = null
+  strokeCtx: CanvasRenderingContext2D | null = null
+
   constructor(container: HTMLElement | HTMLCanvasElement, options: BoardOptions = {}) {
     if (container instanceof HTMLCanvasElement) {
       this.canvas = container
     } else {
+      // Ensure the container can host absolute children
+      if (getComputedStyle(container).position === 'static') {
+        container.style.position = 'relative'
+      }
       this.canvas = document.createElement('canvas')
-      this.canvas.style.display = 'block'
-      this.canvas.style.width = '100%'
-      this.canvas.style.height = '100%'
+      this.canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%'
       container.appendChild(this.canvas)
+
+      // Stroke overlay — sits on top, pointer-events:none so gestures fall through
+      this.strokeCanvas = document.createElement('canvas')
+      this.strokeCanvas.style.cssText =
+        'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none'
+      container.appendChild(this.strokeCanvas)
+      this.strokeCtx = this.strokeCanvas.getContext('2d')!
     }
 
     this.hooks = new BoardHooks()
@@ -61,8 +78,14 @@ export class Board {
       this._logicalWidth = width
       this._logicalHeight = height
       const dpr = options.pixelRatio ?? window.devicePixelRatio ?? 1
-      this.canvas.width = Math.round(width * dpr)
-      this.canvas.height = Math.round(height * dpr)
+      const pw = Math.round(width * dpr)
+      const ph = Math.round(height * dpr)
+      this.canvas.width = pw
+      this.canvas.height = ph
+      if (this.strokeCanvas) {
+        this.strokeCanvas.width = pw
+        this.strokeCanvas.height = ph
+      }
       this.markDirty()
     })
     this.resizeObserver.observe(observeTarget)
@@ -130,6 +153,14 @@ export class Board {
     const map = new Map(this.layers.map((l) => [l.id, l]))
     this.layers = ids.map((id) => map.get(id)).filter(Boolean) as Layer[]
     this.markDirty()
+  }
+
+  // ─── Stroke overlay helpers ────────────────────────────────────────────────
+
+  clearStrokeCanvas(): void {
+    if (this.strokeCtx && this.strokeCanvas) {
+      this.strokeCtx.clearRect(0, 0, this.strokeCanvas.width, this.strokeCanvas.height)
+    }
   }
 
   // ─── Tool API ──────────────────────────────────────────────────────────────

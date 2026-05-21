@@ -61,6 +61,8 @@ export class GestureManager {
 
     // Two-finger gesture: pinch-zoom + pan
     if (this.activePointers.size >= 2) {
+      // Don't process coalesced events for two-finger gestures
+
       const [a, b] = [...this.activePointers.values()] as [PointerEvent, PointerEvent]
       const dist = this.distance(a, b)
       const center = this.midpoint(a, b)
@@ -83,7 +85,17 @@ export class GestureManager {
       return
     }
 
-    this.board.activeTool?.onPointerMove(this.toPointerData(e))
+    // Use coalesced events to capture all intermediate pointer positions between frames.
+    // This is the single biggest factor for smooth, non-jagged strokes on high-Hz devices.
+    const coalesced = e.getCoalescedEvents?.() ?? [e]
+    for (const ce of coalesced) {
+      this.board.activeTool?.onPointerMove(this.toPointerData(ce))
+    }
+    // Predicted events give sub-frame latency — pass the final one only
+    const predicted = e.getPredictedEvents?.()
+    if (predicted?.length) {
+      this.board.activeTool?.onPointerMove(this.toPointerData(predicted[predicted.length - 1]!))
+    }
   }
 
   private onPointerUp = (e: PointerEvent): void => {

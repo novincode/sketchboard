@@ -7,17 +7,22 @@ import type { RasterLayer } from '../layers/RasterLayer'
 export interface BrushSettings {
   size: number
   opacity: number
-  /** 0 = fully soft, 1 = hard edge */
+  /** 0 = very soft/blurry, 1 = hard crisp edge */
   hardness: number
   pressureAffectsSize: boolean
   pressureAffectsOpacity: boolean
   color: Color
-  /** Blend mode for each stamp, normally 'source-over' */
+  /** CSS compositeOperation for the path — use 'destination-out' for eraser */
   compositeOperation: GlobalCompositeOperation
 }
 
 interface StrokePoint {
-  pos: Vec2
+  /** Screen-space CSS pixel position — used for stroke overlay rendering */
+  sx: number
+  sy: number
+  /** Layer-canvas-local pixel position — used when committing to layer */
+  lx: number
+  ly: number
   pressure: number
 }
 
@@ -35,40 +40,64 @@ export class BrushTool extends Tool {
   private isDrawing = false
   private points: StrokePoint[] = []
   private activeLayer: RasterLayer | null = null
-  /** Snapshot before stroke starts — pushed to history on commit */
   private preStrokeSnapshot: ImageData | null = null
+  /** Prevents scheduling more than one rAF redraw per frame */
+  private _overlayPending = false
+
+  /** True when we can use the stroke overlay canvas for rendering. */
+  private get usesOverlay(): boolean {
+    return this.settings.compositeOperation !== 'destination-out' && !!this.board?.strokeCtx
+  }
+
+  // ─── Pointer handlers ─────────────────────────────────────────────────────
 
   onPointerDown(e: PointerData): void {
     if (!this.board) return
-    const layer = this.board.getActiveLayer()
-    if (!layer) return
+    const layer = this.board.getActiveLayer() as RasterLayer | undefined
+    if (!layer?.ctx) return
 
-    // dynamic import guard — avoids hard coupling to RasterLayer type in Tool base
-    const rl = layer as RasterLayer
-    if (typeof rl.ctx === 'undefined') return
-
-    this.activeLayer = rl
+    this.activeLayer = layer
     this.isDrawing = true
     this.points = []
-    this.preStrokeSnapshot = rl.getImageData()
+    this.overlayDrawnTo = 0
+    this.preStrokeSnapshot = layer.getImageData()
 
     this.addPoint(e)
-    this.renderStroke()
-    this.board.markDirty()
+
+    if (this.usesOverlay) {
+      this.appendToOverlay()
+      // No markDirty — overlay handles visual feedback
+    } else {
+      this.renderToLayer()
+      this.board.markDirty()
+    }
   }
 
   onPointerMove(e: PointerData): void {
-    if (!this.isDrawing || !this.activeLayer || !this.board) return
+    if (!this.isDrawing || !this.board) return
+
     this.addPoint(e)
-    this.renderStroke()
-    this.board.markDirty()
+
+    if (this.usesOverlay) {
+      this.appendToOverlay()   // O(1) — only draws the new tail segment
+    } else {
+      this.renderToLayer()
+      this.board.markDirty()
+    }
   }
 
   onPointerUp(e: PointerData): void {
     if (!this.isDrawing || !this.board) return
+
     this.addPoint(e)
-    this.renderStroke()
-    this.commitHistory()
+
+    if (this.usesOverlay) {
+      // Commit the stroke to the layer canvas (once), then clear overlay
+      this.renderToLayer()
+      this.board.clearStrokeCanvas()
+    }
+
+    this.pushHistory()
     this.isDrawing = false
     this.activeLayer = null
     this.points = []
@@ -76,92 +105,177 @@ export class BrushTool extends Tool {
   }
 
   onPointerCancel(_e: PointerData): void {
-    if (!this.isDrawing || !this.activeLayer) return
-    // revert to pre-stroke state
-    if (this.preStrokeSnapshot) {
+    if (!this.isDrawing || !this.board) return
+    if (this.preStrokeSnapshot && this.activeLayer) {
       this.activeLayer.putImageData(this.preStrokeSnapshot)
     }
+    if (this.usesOverlay) this.board.clearStrokeCanvas()
     this.isDrawing = false
     this.activeLayer = null
     this.points = []
-    this.board?.markDirty()
+    this.board.markDirty()
   }
 
+  // ─── Point recording ──────────────────────────────────────────────────────
+
   private addPoint(e: PointerData): void {
-    if (!this.board) return
-    // Use logical CSS dimensions — canvas.width is in physical pixels and would break coords
+    if (!this.board || !this.activeLayer) return
     const world = this.board.camera.screenToWorld(
-      e.x,
-      e.y,
+      e.x, e.y,
       this.board.logicalWidth,
       this.board.logicalHeight,
     )
-    // Invert layer transform so stamp lands at correct canvas pixel
-    const layer = this.activeLayer
-    const lx = layer ? world.x - layer.transform.x : world.x
-    const ly = layer ? world.y - layer.transform.y : world.y
-    this.points.push({ pos: new Vec2(lx, ly), pressure: e.pressure > 0 ? e.pressure : 0.5 })
+    this.points.push({
+      sx: e.x,
+      sy: e.y,
+      lx: world.x - this.activeLayer.transform.x,
+      ly: world.y - this.activeLayer.transform.y,
+      pressure: e.pressure > 0 ? e.pressure : 0.5,
+    })
   }
 
-  private renderStroke(): void {
-    if (!this.activeLayer || this.points.length === 0) return
+  // ─── Overlay rendering (screen space, no composite cost) ──────────────────
+
+  /**
+   * Incrementally appends the NEW tail of the stroke to the overlay canvas.
+   * O(1) per pointer event — never redraws old points.
+   * The overlay is only cleared on stroke start (onPointerDown) and stroke end.
+   */
+  private appendToOverlay(): void {
+    const board = this.board!
+    const { strokeCtx } = board
+    if (!strokeCtx || this.points.length === 0) return
+
+    // We need at least 1 overlap point for smooth bezier joining
+    const startIdx = Math.max(0, this.overlayDrawnTo - 1)
+    const slice = this.points.slice(startIdx)
+    if (slice.length < 2) return
+
+    const dpr = window.devicePixelRatio ?? 1
+    strokeCtx.save()
+    strokeCtx.scale(dpr, dpr)
+    this.applyBrushStyle(strokeCtx, board.camera.zoom, true)
+    this.drawPath(strokeCtx, slice, 'screen')
+    strokeCtx.restore()
+    this.overlayDrawnTo = this.points.length - 1
+  }
+
+  // ─── Layer canvas rendering (world space, called once per stroke) ─────────
+
+  private renderToLayer(): void {
+    if (!this.activeLayer) return
     const ctx = this.activeLayer.ctx
-    const last = this.points[this.points.length - 1]!
-
-    const effectiveSize = this.settings.pressureAffectsSize
-      ? this.settings.size * (0.2 + last.pressure * 0.8)
-      : this.settings.size
-    const effectiveOpacity = this.settings.pressureAffectsOpacity
-      ? this.settings.opacity * (0.3 + last.pressure * 0.7)
-      : this.settings.opacity
-
-    if (this.points.length === 1) {
-      this.drawStamp(ctx, last.pos, effectiveSize, effectiveOpacity)
-      return
-    }
-
-    const prev = this.points[this.points.length - 2]!
-    const dist = prev.pos.distanceTo(last.pos)
-    const spacing = Math.max(1, effectiveSize * 0.2)
-    const steps = Math.ceil(dist / spacing)
-
-    for (let i = 1; i <= steps; i++) {
-      const t = i / steps
-      const pos = prev.pos.lerp(last.pos, t)
-      this.drawStamp(ctx, pos, effectiveSize, effectiveOpacity)
-    }
-  }
-
-  protected drawStamp(
-    ctx: CanvasRenderingContext2D,
-    pos: Vec2,
-    size: number,
-    opacity: number,
-  ): void {
-    const radius = size / 2
-    const { r, g, b } = this.settings.color
-    const gradient = ctx.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, radius)
-    gradient.addColorStop(0, `rgba(${r},${g},${b},${opacity})`)
-    gradient.addColorStop(this.settings.hardness, `rgba(${r},${g},${b},${opacity})`)
-    gradient.addColorStop(1, `rgba(${r},${g},${b},0)`)
-
     ctx.save()
-    ctx.globalCompositeOperation = this.settings.compositeOperation
-    ctx.fillStyle = gradient
-    ctx.beginPath()
-    ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2)
-    ctx.fill()
+    this.applyBrushStyle(ctx, 1, false)
+    this.drawPath(ctx, this.points, 'world')
     ctx.restore()
   }
 
-  private commitHistory(): void {
+  // ─── Style application ────────────────────────────────────────────────────
+
+  private applyBrushStyle(
+    ctx: CanvasRenderingContext2D,
+    zoom: number,
+    isScreen: boolean,
+  ): void {
+    const { r, g, b } = this.settings.color
+    ctx.strokeStyle = `rgb(${r},${g},${b})`
+    ctx.fillStyle = `rgb(${r},${g},${b})`
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    ctx.globalAlpha = this.settings.opacity
+    ctx.globalCompositeOperation = this.settings.compositeOperation
+
+    // Soft brush: apply blur. Scale blur by zoom for screen rendering.
+    if (this.settings.hardness < 0.95) {
+      const blurPx = (1 - this.settings.hardness) * this.settings.size * (isScreen ? zoom : 1) * 0.4
+      if (blurPx > 0.5) ctx.filter = `blur(${blurPx.toFixed(1)}px)`
+    }
+  }
+
+  // ─── Smooth bezier path drawing ───────────────────────────────────────────
+
+  private drawPath(
+    ctx: CanvasRenderingContext2D,
+    pts: StrokePoint[],
+    space: 'screen' | 'world',
+  ): void {
+    if (pts.length === 0) return
+    const zoom = this.board?.camera.zoom ?? 1
+
+    const coord = (p: StrokePoint) =>
+      space === 'screen' ? { x: p.sx, y: p.sy } : { x: p.lx, y: p.ly }
+
+    const baseSize = this.settings.size * (space === 'screen' ? zoom : 1)
+
+    // Single dot
+    if (pts.length === 1) {
+      const c = coord(pts[0]!)
+      const size = this.effectiveSize(pts[0]!.pressure, baseSize)
+      ctx.beginPath()
+      ctx.arc(c.x, c.y, size / 2, 0, Math.PI * 2)
+      ctx.fill()
+      return
+    }
+
+    // Multi-segment variable-width bezier stroke.
+    // Each segment is drawn as a quadratic bezier from midpoint[i-1] to midpoint[i]
+    // with pts[i] as the control point. Width varies per segment.
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = pts[i - 1]!
+      const p1 = pts[i]!
+      const c0 = coord(p0)
+      const c1 = coord(p1)
+
+      const avgPressure = (p0.pressure + p1.pressure) / 2
+      const w = this.effectiveSize(avgPressure, baseSize)
+
+      ctx.lineWidth = w
+
+      // Midpoints for smooth joining between segments
+      let mx0: number, my0: number, mx1: number, my1: number
+
+      if (i === 1) {
+        mx0 = c0.x
+        my0 = c0.y
+      } else {
+        const pp = coord(pts[i - 2]!)
+        mx0 = (pp.x + c0.x) / 2
+        my0 = (pp.y + c0.y) / 2
+      }
+
+      if (i === pts.length - 1) {
+        mx1 = c1.x
+        my1 = c1.y
+      } else {
+        const pn = coord(pts[i + 1]!)
+        mx1 = (c0.x + pn.x) / 2
+        my1 = (c0.y + pn.y) / 2
+      }
+
+      ctx.beginPath()
+      ctx.moveTo(mx0, my0)
+      ctx.quadraticCurveTo(c0.x, c0.y, (c0.x + mx1) / 2, (c0.y + my1) / 2)
+      ctx.stroke()
+    }
+  }
+
+  private effectiveSize(pressure: number, baseSize: number): number {
+    if (!this.settings.pressureAffectsSize) return baseSize
+    return baseSize * (0.15 + pressure * 0.85)
+  }
+
+  // ─── History ──────────────────────────────────────────────────────────────
+
+  private pushHistory(): void {
     if (!this.board || !this.activeLayer || !this.preStrokeSnapshot) return
     const layer = this.activeLayer
     const before = this.preStrokeSnapshot
     const after = layer.getImageData()
-    this.board.history.push({
-      undo: () => layer.putImageData(before),
-      redo: () => layer.putImageData(after),
+    const board = this.board
+    board.history.push({
+      undo: () => { layer.putImageData(before); board.markDirty() },
+      redo: () => { layer.putImageData(after); board.markDirty() },
     })
     this.preStrokeSnapshot = null
   }
