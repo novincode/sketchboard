@@ -1,4 +1,12 @@
-export type ToolId = 'pen' | 'brush' | 'eraser' | 'vector' | 'pan' | 'eyedropper'
+export type ToolId =
+  | 'pen'
+  | 'brush'
+  | 'eraser'
+  | 'vector'
+  | 'vectorpen'
+  | 'select'
+  | 'pan'
+  | 'eyedropper'
 
 export type EraserMode = 'pixel' | 'stroke'
 
@@ -14,13 +22,15 @@ export interface ToolMeta {
 }
 
 export const TOOLS: ToolMeta[] = [
-  { id: 'pen',        label: 'Pen',        shortcut: 'P', icon: 'pen' },
-  { id: 'brush',      label: 'Brush',      shortcut: 'B', icon: 'brush' },
-  { id: 'eraser',     label: 'Eraser',     shortcut: 'E', icon: 'eraser' },
-  { id: 'vector',     label: 'Vector',     shortcut: 'V', icon: 'vector' },
-  { id: 'eyedropper', label: 'Eyedropper', shortcut: 'I', icon: 'eyedropper' },
-  { id: 'pan',        label: 'Hand',       shortcut: 'H', icon: 'hand' },
+  { id: 'select',     label: 'Select',      shortcut: 'V', icon: 'select' },
+  { id: 'pen',        label: 'Pen',         shortcut: 'P', icon: 'pen' },
+  { id: 'brush',      label: 'Brush',       shortcut: 'B', icon: 'brush' },
+  { id: 'eraser',     label: 'Eraser',      shortcut: 'E', icon: 'eraser' },
+  { id: 'vector',     label: 'Vector Brush',shortcut: 'W', icon: 'vector' },
+  { id: 'vectorpen',  label: 'Vector Pen',  shortcut: 'Q', icon: 'vectorpen' },
+  { id: 'eyedropper', label: 'Eyedropper',  shortcut: 'I', icon: 'eyedropper' },
+  { id: 'pan',        label: 'Hand',        shortcut: 'H', icon: 'hand' },
 ]
 
-export const DRAWING_TOOLS: ToolId[] = ['pen', 'brush', 'eraser', 'vector']
 export const BRUSH_TOOLS: ToolId[] = ['pen', 'brush']
+export const VECTOR_TOOLS: ToolId[] = ['vector', 'vectorpen']

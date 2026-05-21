@@ -8,7 +8,10 @@ export { Layer } from './layers/Layer'
 export { RasterLayer } from './layers/RasterLayer'
 export { GroupLayer } from './layers/GroupLayer'
 export { VectorLayer } from './layers/VectorLayer'
-export type { VectorStroke, VectorStrokePoint } from './layers/VectorLayer'
+export type {
+  VectorStroke, VectorStrokePoint,
+  VectorPath, BezierAnchor,
+} from './layers/VectorLayer'
 
 // Tools
 export { Tool } from './tools/Tool'
@@ -19,8 +22,11 @@ export { PencilTool } from './tools/PencilTool'
 export { PanTool } from './tools/PanTool'
 export { EyedropperTool } from './tools/EyedropperTool'
 export { VectorBrushTool } from './tools/VectorBrushTool'
+export { VectorPenTool } from './tools/VectorPenTool'
+export { SelectTool } from './tools/SelectTool'
 export type { BrushSettings } from './tools/BrushTool'
 export type { VectorBrushSettings } from './tools/VectorBrushTool'
+export type { VectorPenSettings } from './tools/VectorPenTool'
 
 // Renderer
 export type { Renderer } from './renderer/Renderer'

@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool, VectorBrushTool, Layer } from '@sketchboard/core'
+import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool } from '@sketchboard/core'
 import { Color, RasterLayer, VectorLayer } from '@sketchboard/core'
 import type { ToolId, Background, EraserMode, LayerType } from './types'
 
@@ -81,6 +81,8 @@ function applyBrushColor(board: Board, hex: string) {
   }
   const vec = board.getTool<VectorBrushTool>('vector')
   if (vec) vec.settings.color = color
+  const pen = board.getTool<VectorPenTool>('vectorpen')
+  if (pen) pen.settings.strokeColor = hex
 }
 
 function applyBrushSize(board: Board, size: number) {
@@ -291,9 +293,29 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     exportPng(filename = 'sketchboard-export.png') {
       const { board } = get()
       if (!board) return
+
+      // Determine export size from the first raster layer (canvas artboard)
+      const layers = board.getLayers()
+      let exportW = 1920, exportH = 1080
+      for (const l of layers) {
+        if (l instanceof RasterLayer) { exportW = l.width; exportH = l.height; break }
+      }
+
+      // Composite all visible layers at native resolution.
+      // Both RasterLayer and VectorLayer ignore the camera param — they render in world space.
+      const offscreen = document.createElement('canvas')
+      offscreen.width = exportW
+      offscreen.height = exportH
+      const ctx = offscreen.getContext('2d')!
+
+      for (const l of layers) {
+        if (!l.visible) continue
+        l.render(ctx, board.camera)
+      }
+
       const link = document.createElement('a')
       link.download = filename
-      link.href = board.canvas.toDataURL('image/png')
+      link.href = offscreen.toDataURL('image/png')
       link.click()
     },
   })),

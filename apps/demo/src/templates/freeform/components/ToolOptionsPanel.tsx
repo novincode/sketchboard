@@ -17,28 +17,25 @@ export function ToolOptionsPanel() {
     vectorOpacity,   setVectorOpacity,
   } = useFreeformStore()
 
-  if (activeToolId === 'pan' || activeToolId === 'eyedropper') return null
+  const showPanel = !['pan', 'eyedropper', 'select'].includes(activeToolId)
+  if (!showPanel) return null
 
   return (
-    <div className="fixed bottom-[72px] left-1/2 z-40 -translate-x-1/2">
-      <div className="flex items-end gap-3 rounded-2xl border border-white/10 bg-black/80 px-4 py-3 shadow-2xl backdrop-blur-xl">
+    <div className="fixed bottom-17 left-1/2 z-40 -translate-x-1/2">
+      <div className="flex items-end gap-3 rounded-2xl border border-white/10 bg-black/80 px-4 py-3 shadow-xl backdrop-blur-xl">
         {(activeToolId === 'pen' || activeToolId === 'brush') && (
           <>
             <DraggableInput
               label="Size"
               value={brushSize}
-              min={1}
-              max={200}
-              unit="px"
+              min={1} max={200} unit="px"
               onChange={setBrushSize}
             />
             <Divider />
             <DraggableInput
               label="Opacity"
               value={Math.round(brushOpacity * 100)}
-              min={1}
-              max={100}
-              unit="%"
+              min={1} max={100} unit="%"
               onChange={(v) => setBrushOpacity(v / 100)}
             />
             {activeToolId === 'brush' && (
@@ -47,9 +44,7 @@ export function ToolOptionsPanel() {
                 <DraggableInput
                   label="Hardness"
                   value={Math.round(brushHardness * 100)}
-                  min={0}
-                  max={100}
-                  unit="%"
+                  min={0} max={100} unit="%"
                   onChange={(v) => setBrushHardness(v / 100)}
                 />
               </>
@@ -62,9 +57,7 @@ export function ToolOptionsPanel() {
             <DraggableInput
               label="Size"
               value={eraserSize}
-              min={1}
-              max={400}
-              unit="px"
+              min={1} max={400} unit="px"
               onChange={setEraserSize}
             />
             <Divider />
@@ -72,25 +65,31 @@ export function ToolOptionsPanel() {
           </>
         )}
 
-        {activeToolId === 'vector' && (
+        {(activeToolId === 'vector' || activeToolId === 'vectorpen') && (
           <>
             <DraggableInput
               label="Size"
               value={vectorSize}
-              min={1}
-              max={100}
-              unit="px"
+              min={1} max={100} unit="px"
               onChange={setVectorSize}
             />
             <Divider />
             <DraggableInput
               label="Opacity"
               value={Math.round(vectorOpacity * 100)}
-              min={1}
-              max={100}
-              unit="%"
+              min={1} max={100} unit="%"
               onChange={(v) => setVectorOpacity(v / 100)}
             />
+            {activeToolId === 'vectorpen' && (
+              <>
+                <Divider />
+                <div className="flex flex-col items-center gap-1 select-none">
+                  <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">Hint</span>
+                  <span className="text-[10px] text-white/40 whitespace-nowrap">Click to add · Drag for handles</span>
+                  <span className="text-[10px] text-white/25 whitespace-nowrap">↩ finish · Esc cancel · Click ① close</span>
+                </div>
+              </>
+            )}
           </>
         )}
       </div>
@@ -102,13 +101,7 @@ function Divider() {
   return <div className="h-8 w-px rounded bg-white/10" />
 }
 
-function EraserModeToggle({
-  mode,
-  onChange,
-}: {
-  mode: EraserMode
-  onChange: (m: EraserMode) => void
-}) {
+function EraserModeToggle({ mode, onChange }: { mode: EraserMode; onChange: (m: EraserMode) => void }) {
   return (
     <div className="flex flex-col items-center gap-1 select-none">
       <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">Mode</span>

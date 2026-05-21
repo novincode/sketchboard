@@ -2,6 +2,7 @@ import { Layer } from './Layer'
 import type { Camera } from '../Camera'
 
 export class GroupLayer extends Layer {
+  readonly type = 'group' as const
   children: Layer[] = []
 
   constructor(name?: string) {

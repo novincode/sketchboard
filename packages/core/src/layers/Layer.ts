@@ -5,6 +5,8 @@ import type { BlendMode } from '../types'
 let _nextId = 1
 
 export abstract class Layer {
+  abstract readonly type: string
+
   readonly id: string
   name: string
   visible: boolean = true

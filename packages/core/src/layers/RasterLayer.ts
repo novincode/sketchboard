@@ -2,6 +2,7 @@ import { Layer } from './Layer'
 import type { Camera } from '../Camera'
 
 export class RasterLayer extends Layer {
+  readonly type = 'raster' as const
   readonly canvas: HTMLCanvasElement
   readonly ctx: CanvasRenderingContext2D
 
