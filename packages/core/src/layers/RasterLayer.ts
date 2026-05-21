@@ -5,6 +5,13 @@ export class RasterLayer extends Layer {
   readonly canvas: HTMLCanvasElement
   readonly ctx: CanvasRenderingContext2D
 
+  /**
+   * Optional background fill drawn behind the layer's pixels each frame.
+   * Set to '#ffffff' to give the layer a white artboard appearance.
+   * null = fully transparent (default).
+   */
+  backgroundColor: string | null = null
+
   constructor(
     public width: number,
     public height: number,
@@ -24,6 +31,13 @@ export class RasterLayer extends Layer {
     ctx.globalAlpha = this.opacity
     ctx.globalCompositeOperation = this.blendMode as GlobalCompositeOperation
     this.transform.applyToContext(ctx)
+
+    // Draw optional background (artboard fill) before pixel content
+    if (this.backgroundColor) {
+      ctx.fillStyle = this.backgroundColor
+      ctx.fillRect(0, 0, this.width, this.height)
+    }
+
     ctx.drawImage(this.canvas, 0, 0)
     ctx.restore()
   }
@@ -40,7 +54,7 @@ export class RasterLayer extends Layer {
     this.ctx.putImageData(data, x, y)
   }
 
-  /** Sample a single pixel — useful for eyedropper tool */
+  /** Sample a single pixel at canvas-local coordinates (useful for eyedropper) */
   pickColor(x: number, y: number): [r: number, g: number, b: number, a: number] {
     const d = this.ctx.getImageData(Math.floor(x), Math.floor(y), 1, 1).data
     return [d[0] ?? 0, d[1] ?? 0, d[2] ?? 0, d[3] ?? 0]
@@ -52,6 +66,7 @@ export class RasterLayer extends Layer {
     copy.opacity = this.opacity
     copy.blendMode = this.blendMode
     copy.transform = this.transform.clone()
+    copy.backgroundColor = this.backgroundColor
     return copy
   }
 }

@@ -2,31 +2,37 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool } from '@sketchboard/core'
+import type { Board, BrushTool, RasterLayer, Layer } from '@sketchboard/core'
 import { Color } from '@sketchboard/core'
 import type { ToolId, Background } from './types'
 
-// ─── State shape ────────────────────────────────────────────────────────────
+// ─── State shape ─────────────────────────────────────────────────────────────
+
+interface LayerMeta {
+  id: string
+  name: string
+  visible: boolean
+  opacity: number
+  blendMode: string
+}
 
 interface FreeformState {
-  // Board reference — set once mounted, null before/after
   board: Board | null
 
-  // Tool
   activeToolId: ToolId
-
-  // Brush settings (shared across pen / brush / pencil)
   brushSize: number
   brushOpacity: number
   brushHardness: number
   brushColor: string // hex e.g. "#1a1a1a"
 
-  // Canvas background
   background: Background
-
-  // UI panels
   showColorPicker: boolean
-  showBrushPanel: boolean
+  showBrushPanel: boolean   // unused—kept for future panels
+  showLayerPanel: boolean
+
+  // Layer list — mirrors board.getLayers() for UI reactivity
+  layers: LayerMeta[]
+  activeLayerId: string | null
 }
 
 interface FreeformActions {
@@ -41,13 +47,21 @@ interface FreeformActions {
   setBackground(bg: Background): void
   toggleColorPicker(): void
   closePanels(): void
-  toggleBrushPanel(): void
+  toggleLayerPanel(): void
 
-  /** Export the visible canvas as a PNG download */
+  // Layer management
+  addLayer(): void
+  removeLayer(id: string): void
+  setActiveLayerId(id: string): void
+  setLayerVisibility(id: string, visible: boolean): void
+  setLayerOpacity(id: string, opacity: number): void
+  setLayerName(id: string, name: string): void
+  setLayerBlendMode(id: string, blendMode: string): void
+
   exportPng(filename?: string): void
 }
 
-// ─── Internal helpers ────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function applyBrushColor(board: Board, hex: string) {
   const color = Color.fromHex(hex)
@@ -78,11 +92,20 @@ function applyBrushHardness(board: Board, hardness: number) {
   }
 }
 
-// ─── Store ───────────────────────────────────────────────────────────────────
+function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
+  return layers.map((l) => ({
+    id: l.id,
+    name: l.name,
+    visible: l.visible,
+    opacity: l.opacity,
+    blendMode: l.blendMode,
+  }))
+}
+
+// ─── Store ────────────────────────────────────────────────────────────────────
 
 export const useFreeformStore = create<FreeformState & FreeformActions>()(
   subscribeWithSelector((set, get) => ({
-    // Initial state
     board: null,
     activeToolId: 'pen',
     brushSize: 8,
@@ -92,17 +115,35 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     background: 'dots',
     showColorPicker: false,
     showBrushPanel: false,
+    showLayerPanel: false,
+    layers: [],
+    activeLayerId: null,
 
     // ── Board ──────────────────────────────────────────────────────────────
     _setBoard(board) {
-      set({ board })
-      if (!board) return
-      // Sync initial settings to newly mounted board
+      if (!board) {
+        set({ board: null, layers: [], activeLayerId: null })
+        return
+      }
+      set({ board, layers: layersToMeta(board.getLayers()) })
+
+      // Sync initial settings
       const s = get()
       applyBrushColor(board, s.brushColor)
       applyBrushSize(board, s.brushSize)
       applyBrushOpacity(board, s.brushOpacity)
       applyBrushHardness(board, s.brushHardness)
+
+      // Keep layer list in sync with board
+      board.hooks.layerAdded.tap('store', () => {
+        set({ layers: layersToMeta(board.getLayers()) })
+      })
+      board.hooks.layerRemoved.tap('store', () => {
+        set({ layers: layersToMeta(board.getLayers()) })
+      })
+      board.hooks.activeLayerChanged.tap('store', ({ id }) => {
+        set({ activeLayerId: id })
+      })
     },
 
     // ── Tool ──────────────────────────────────────────────────────────────
@@ -118,19 +159,16 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       if (board) applyBrushSize(board, size)
       set({ brushSize: size })
     },
-
     setBrushOpacity(opacity) {
       const { board } = get()
       if (board) applyBrushOpacity(board, opacity)
       set({ brushOpacity: opacity })
     },
-
     setBrushHardness(hardness) {
       const { board } = get()
       if (board) applyBrushHardness(board, hardness)
       set({ brushHardness: hardness })
     },
-
     setBrushColor(hex) {
       const { board } = get()
       if (board) applyBrushColor(board, hex)
@@ -138,20 +176,80 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     },
 
     // ── UI ────────────────────────────────────────────────────────────────
-    setBackground(bg) {
-      set({ background: bg })
+    setBackground: (bg) => set({ background: bg }),
+    toggleColorPicker: () =>
+      set((s) => ({ showColorPicker: !s.showColorPicker, showLayerPanel: false })),
+    closePanels: () => set({ showColorPicker: false, showLayerPanel: false }),
+    toggleLayerPanel: () =>
+      set((s) => ({ showLayerPanel: !s.showLayerPanel, showColorPicker: false })),
+
+    // ── Layer management ──────────────────────────────────────────────────
+    addLayer() {
+      const { board } = get()
+      if (!board) return
+      const { RasterLayer } = require('@sketchboard/core') as typeof import('@sketchboard/core')
+      const layer = new RasterLayer(3840, 2160, `Layer ${board.getLayers().length + 1}`)
+      board.addLayer(layer)
     },
 
-    toggleColorPicker() {
-      set((s) => ({ showColorPicker: !s.showColorPicker, showBrushPanel: false }))
+    removeLayer(id) {
+      const { board, activeLayerId } = get()
+      if (!board) return
+      board.removeLayer(id)
+      if (activeLayerId === id) {
+        const remaining = board.getLayers()
+        if (remaining.length > 0) board.setActiveLayer(remaining.at(-1)!.id)
+      }
     },
 
-    closePanels() {
-      set({ showColorPicker: false, showBrushPanel: false })
+    setActiveLayerId(id) {
+      const { board } = get()
+      board?.setActiveLayer(id)
+      set({ activeLayerId: id })
     },
 
-    toggleBrushPanel() {
-      set((s) => ({ showBrushPanel: !s.showBrushPanel, showColorPicker: false }))
+    setLayerVisibility(id, visible) {
+      const { board } = get()
+      const layer = board?.getLayerById(id)
+      if (!layer) return
+      layer.visible = visible
+      board?.markDirty()
+      set((s) => ({
+        layers: s.layers.map((l) => (l.id === id ? { ...l, visible } : l)),
+      }))
+    },
+
+    setLayerOpacity(id, opacity) {
+      const { board } = get()
+      const layer = board?.getLayerById(id)
+      if (!layer) return
+      layer.opacity = opacity
+      board?.markDirty()
+      set((s) => ({
+        layers: s.layers.map((l) => (l.id === id ? { ...l, opacity } : l)),
+      }))
+    },
+
+    setLayerName(id, name) {
+      const { board } = get()
+      const layer = board?.getLayerById(id)
+      if (!layer) return
+      layer.name = name
+      set((s) => ({
+        layers: s.layers.map((l) => (l.id === id ? { ...l, name } : l)),
+      }))
+    },
+
+    setLayerBlendMode(id, blendMode) {
+      const { board } = get()
+      const layer = board?.getLayerById(id) as RasterLayer | undefined
+      if (!layer) return
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      layer.blendMode = blendMode as any
+      board?.markDirty()
+      set((s) => ({
+        layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l)),
+      }))
     },
 
     // ── Export ────────────────────────────────────────────────────────────

@@ -1,143 +1,174 @@
-# Architecture Deep-Dive
+# @sketchboard Architecture
 
-## Node System Vision (next major milestone)
+## Core Design Philosophy
 
-The long-term rendering model is **node-based compositing** — inspired by Blender's compositor and
-After Effects' effect stack. Every drawable item is a **node** with typed inputs and outputs:
+**Headless core, opinionated templates.** `@sketchboard/core` contains zero UI, zero framework dependency. It is a rendering engine and data model. Everything visual lives in `apps/demo/src/templates/` and can be replaced freely.
+
+---
+
+## Coordinate System
+
+All public API coordinates are **logical CSS pixels** (not physical/DPR-scaled).
 
 ```
-RasterLayerNode ──▶ BlurNode ──▶ ColorCorrectionNode ──▶ MergeNode ──▶ OutputNode
-VectorLayerNode ──────────────────────────────────────▶ MergeNode
+Physical pixels = logical × devicePixelRatio
+Board.logicalWidth  ← always use this for coordinate math
+Board.canvas.width  ← only for raw canvas ops (getImageData etc.)
 ```
 
-**Foundation (in progress):**
-```typescript
-interface RenderNode {
-  readonly id: string
-  readonly inputs:  ReadonlyMap<string, RenderNode>   // upstream dependencies
-  readonly outputs: ReadonlyMap<string, RenderNode>   // downstream consumers
-  process(ctx: OffscreenCanvasRenderingContext2D, camera: Camera): void
-}
-```
-
-`Layer` will implement `RenderNode`. The `Canvas2DRenderer` will traverse the node graph in
-topological order instead of a flat array. Plugins can inject nodes (e.g., a bloom effect) without
-touching the renderer code.
-
-**Why this matters:**
-- One unified rendering/preview pipeline — no duplicated compositing code for export vs. preview
-- Export (PNG, MP4) just calls the same node graph at the desired resolution
-- Future: GPU shader nodes via WebGPU, live collaboration nodes, AI-generated fill nodes
-
-**Current state:** layers are a flat ordered array. The node graph is the roadmap abstraction.
-Incremental migration plan: make `Layer` implement `RenderNode` without changing the public API,
-then add `NodeGraph` as an optional wrapper that the `AnimationPlugin` uses for frame compositing.
+`Canvas2DRenderer` scales the context by `dpr` before applying the camera, so all layer rendering runs in logical-pixel space. Brush stamps land at world-space coordinates on the offscreen layer canvas.
 
 ---
 
 ## Rendering Pipeline
 
 ```
-Board.startRenderLoop()
-  └─▶ requestAnimationFrame (loop)
-        ├── if dirty:
-        │     ├── hooks.beforeRender.call(board)   ← plugins may update layer state here
-        │     ├── Canvas2DRenderer.render(layers, camera)
-        │     │     ├── ctx.clearRect(...)
-        │     │     ├── ctx.save()
-        │     │     ├── camera.applyToContext(ctx, w, h)
-        │     │     ├── for each visible layer: layer.render(ctx, camera)
-        │     │     └── ctx.restore()
-        │     ├── hooks.afterRender.call(board)
-        │     └── dirty = false
-        └── next frame
+RAF loop → Board.render()
+  → Canvas2DRenderer.render(layers, camera)
+      → ctx.scale(dpr, dpr)                      ← enter logical pixel space
+      → camera.applyToContext(ctx, logW, logH)   ← pan/zoom/rotate
+      → for each Layer (bottom → top):
+          layer.render(ctx, camera)               ← each draws in world space
 ```
 
-## Camera & Coordinate Systems
+Each `RasterLayer` holds its own offscreen `HTMLCanvasElement`. Only dirty frames trigger re-render (`Board.markDirty()`).
 
-- **World space**: The abstract coordinate system that layers live in. A `RasterLayer(1920, 1080)`
-  occupies world coordinates (0,0) → (1920, 1080).
-- **Screen space**: CSS logical pixels on the canvas element.
-- **Physical pixels**: CSS pixels × `devicePixelRatio`. The HTMLCanvasElement `.width` is in physical pixels.
+### Future: Node-Based Pipeline
 
-The Camera maps world → screen with: `screen = (world - camera.position) × zoom + canvasCenter`.
+Layers composited bottom-to-top today. The roadmap adds a **NodeGraph** compositor:
 
-The Board sizes the canvas in physical pixels but exposes logical CSS dimensions to Camera.
+```
+[RasterLayer] ──→ [ColorCorrectNode] ──→ [MergeNode] ──→ [OutputNode]
+[RasterLayer] ──╯
+```
 
-## Layer System
+Non-destructive effects, masking nodes, and conditional compositing without changing the `Layer` API.
 
-Every layer has an independent offscreen `HTMLCanvasElement`. The compositor (Canvas2DRenderer) calls
-`layer.render(ctx, camera)` which draws the layer's canvas into the compositing context at the layer's
-transform position.
+---
 
-**Blending** uses the standard CSS composite operations (`ctx.globalCompositeOperation`). Each layer
-specifies its own blend mode.
+## Camera Model
 
-## Tool System & Input
+```
+camera.position  = world-space point shown at logical viewport center
+camera.zoom      = logical pixels per world unit  (1.0 = 1:1)
+camera.rotation  = radians
+```
 
-`GestureManager` attaches to the main canvas and dispatches events:
-- **1 active pointer**: forwarded to `board.activeTool` as `PointerData`
-- **2 active pointers**: interpreted as pinch-zoom + two-finger pan by `GestureManager` directly
+`camera.applyToContext(ctx, logW, logH)`:
+1. `translate(logW/2, logH/2)` — origin to screen center
+2. `rotate(rotation)`
+3. `scale(zoom, zoom)`
+4. `translate(-pos.x, -pos.y)` — offset by camera position
 
-`PointerData` always contains **screen-space** coordinates. Tools that draw to a `RasterLayer` must
-convert to world space via `board.camera.screenToWorld(x, y, canvasW, canvasH)`.
+Coordinate conversion:
+```typescript
+const world = camera.screenToWorld(pointer.x, pointer.y, board.logicalWidth, board.logicalHeight)
+const canvasX = world.x - layer.transform.x   // layer-local pixel
+```
 
-## History / Undo-Redo
+---
 
-Stroke-level history: when `BrushTool.onPointerDown` fires, it captures a full `ImageData` snapshot of
-the active layer. On `onPointerUp`, it pushes a `HistoryEntry` with before/after snapshots.
+## Tool System
 
-This is simple and correct but memory-heavy for large canvases. Future optimization: tile-based diff
-(only snapshot dirty tiles).
+```
+GestureManager (pointer/wheel/spacebar) → board.activeTool?.onPointerDown/Move/Up()
+```
 
-## Plugin Hooks
+`BrushTool` flow:
+1. Convert pointer coords → world coords (via `camera.screenToWorld`)
+2. Subtract layer transform → layer canvas coords
+3. Draw radial gradient stamps along the stroke path
+4. On stroke complete: snapshot `ImageData` before/after and push to `HistoryManager`
+
+**Temp tool override (Space-to-pan)**: `board.setTempTool('pan')` — `board.activeTool` returns the temp tool transparently. `clearTempTool()` restores the real tool without firing `hooks.toolChanged`.
+
+---
+
+## Plugin System
 
 ```typescript
-// BoardHooks exposes these typed hooks:
-board.hooks.beforeRender      // fires every frame before compositing
-board.hooks.afterRender       // fires every frame after compositing
-board.hooks.layerAdded        // fires when a layer is added
-board.hooks.layerRemoved      // fires when a layer is removed
-board.hooks.toolChanged       // fires when active tool changes
-board.hooks.activeLayerChanged
-board.hooks.destroy           // fires when board.destroy() is called
+class MyPlugin implements Plugin {
+  readonly name = 'my-plugin'
+  onInstall(board: Board): void { /* tap hooks, register tools */ }
+  onUninstall?(board: Board): void { /* cleanup */ }
+}
+board.use(new MyPlugin())
 ```
 
-Plugins use `hook.tap('plugin-name', handler)` which returns an unsubscribe function.
+Key hooks:
+- `hooks.beforeRender` / `hooks.afterRender` — every frame
+- `hooks.colorPicked` — fired by EyedropperTool
+- `hooks.toolChanged` — fired when `setActiveTool` is called
+- `hooks.layerAdded` / `hooks.layerRemoved`
 
-## Animation Plugin
+⚠️ **Never call `board.setActiveTool(name)` inside a `toolChanged` listener.** This creates an infinite loop. Use `zustandStore.setState({ activeToolId })` directly.
 
-`AnimationPlugin` installs a `Timeline` that drives layer and camera properties:
+---
+
+## Keyboard System
+
+`KeyboardPlugin` installs a `KeyboardManager` with default shortcuts for all tools + undo/redo/size. Override or extend:
+```typescript
+board.use(new KeyboardPlugin({
+  brush: null,   // disable default B shortcut
+  fill: { key: 'f', cmdOrCtrl: false, description: 'Fill', handler: (b) => myFill(b) },
+}))
+```
+
+---
+
+## History
+
+Each stroke commit stores `ImageData` snapshots (before/after) for the affected layer. Configure depth:
+```typescript
+new Board(container, { historySize: 128 })  // default: 64
+```
+
+Future optimization: incremental tile diffs to reduce memory 10–100×.
+
+---
+
+## DPR / High-DPI
 
 ```
-Timeline
-├── tracks: Map<"layerId.property", KeyframeTrack>
-├── currentTime: number (seconds)
-├── duration, fps, loop
-└── tick() via requestAnimationFrame
-      └── evaluates all tracks → applyValue(targetId, property, value)
-            ├── layer.transform.x / y / rotation / scaleX / scaleY / zDepth
-            ├── layer.opacity
-            └── camera.zoom / rotation / position.x / position.y
-                 (targetId '__camera__' is reserved for the camera)
+ResizeObserver → board._logicalWidth/Height = CSS px
+              → canvas.width/height = CSS px × dpr
+Canvas2DRenderer → ctx.scale(dpr, dpr) → camera uses logical dimensions
+BrushTool → camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
 ```
 
-Keyframe interpolation: linear lerp with pluggable easing function per keyframe.
+---
 
-## Future: Frame-by-Frame Layer
+## Templates (`apps/demo/src/templates/`)
 
-A `FrameLayer` will extend `RasterLayer` with:
-- `frames: HTMLCanvasElement[]` — one canvas per frame
-- `currentFrameIndex: number` — driven by the Timeline
-- The Timeline will animate `'__frame__'` property on the layer to trigger frame switches
+Each template is a standalone React module:
+```
+<name>/
+├── FreeformTemplate.tsx   ← orchestrator
+├── store.ts               ← Zustand (UI state ↔ Board sync)
+├── types.ts               ← tool IDs, backgrounds
+└── components/            ← toolbar, panels, cursor, etc.
+```
 
-## Future: Vector Layer
+Template pattern: **UI events → store actions → board methods → hook events → `zustand.setState()`**
 
-A `VectorLayer` will store `Path2D` objects + stroke/fill styles. It renders via `ctx.stroke(path)`.
-Vectors scale perfectly with camera zoom (no pixelation). SVG import/export via `DOMParser`.
+The core never imports from templates. Templates import from core.
 
-## Future: Composition Layer
+---
 
-A `CompositionLayer` wraps another `Board` instance. On `render()`, it calls the nested board's
-renderer into an offscreen canvas, then composites that into the parent canvas at the layer's transform.
-This enables nested animations with independent timelines.
+## Package Boundaries
+
+```
+@sketchboard/core        ← zero external deps; Browser APIs ok
+@sketchboard/animation   ← depends on core only
+@sketchboard/react       ← depends on core; react is a peerDep
+apps/demo                ← depends on core + react; uses Tailwind, Zustand, etc.
+```
+
+---
+
+## Masking & Alpha Lock (Foundation)
+
+`RasterLayer.alphaLock` (to be added): when `true`, BrushTool uses `source-atop` composite op — paints only where alpha > 0 already. Foundation exists in the architecture; not yet exposed in the template UI.
+
+Clipping masks and layer masks require the future NodeGraph compositor.

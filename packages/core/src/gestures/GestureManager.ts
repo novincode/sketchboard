@@ -72,11 +72,9 @@ export class GestureManager {
 
       if (this.lastPinchDist > 0) {
         const zoomFactor = dist / this.lastPinchDist
-        this.camera.zoomAt(zoomFactor, cx, cy, this.element.clientWidth, this.element.clientHeight)
-        // Pan by midpoint delta
-        const panX = cx - prevCx
-        const panY = cy - prevCy
-        this.camera.pan(panX, panY)
+        this.camera.zoomAt(zoomFactor, cx, cy, this.board.logicalWidth, this.board.logicalHeight)
+        // Pan: midpoint moved right → camera looks further right → content moves right
+        this.camera.pan(cx - prevCx, cy - prevCy)
         this.board.markDirty()
       }
 
@@ -103,13 +101,15 @@ export class GestureManager {
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault()
     const rect = this.element.getBoundingClientRect()
-    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
+    // Use logarithmic zoom for trackpad (deltaY can be fractional)
+    const delta = e.ctrlKey ? e.deltaY : e.deltaY * 0.5
+    const factor = Math.pow(0.999, delta)
     this.camera.zoomAt(
       factor,
       e.clientX - rect.left,
       e.clientY - rect.top,
-      this.element.clientWidth,
-      this.element.clientHeight,
+      this.board.logicalWidth,
+      this.board.logicalHeight,
     )
     this.board.markDirty()
   }

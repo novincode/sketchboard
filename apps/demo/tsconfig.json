@@ -19,13 +19,27 @@
 			}
 		],
 		"paths": {
-			"@/*": ["./src/*"]
+			"@/*": ["./src/*"],
+			"@sketchboard/core": ["../../packages/core/src/index.ts"],
+			"@sketchboard/core/*": ["../../packages/core/src/*"],
+			"@sketchboard/react": ["../../packages/react/src/index.ts"],
+			"@sketchboard/react/*": ["../../packages/react/src/*"],
+			"@sketchboard/animation": ["../../packages/animation/src/index.ts"],
+			"@sketchboard/animation/*": ["../../packages/animation/src/*"]
 		},
 		"types": [
 			"./cloudflare-env.d.ts",
 			"node"
 		]
 	},
-	"include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts", ".next/dev/types/**/*.ts"],
+	"include": [
+		"next-env.d.ts",
+		"**/*.ts",
+		"**/*.tsx",
+		".next/types/**/*.ts",
+		".next/dev/types/**/*.ts",
+		"../../packages/core/src/**/*.ts",
+		"../../packages/react/src/**/*.ts"
+	],
 	"exclude": ["node_modules"]
 }

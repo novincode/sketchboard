@@ -89,9 +89,18 @@ export class BrushTool extends Tool {
 
   private addPoint(e: PointerData): void {
     if (!this.board) return
-    const { canvas } = this.board
-    const world = this.board.camera.screenToWorld(e.x, e.y, canvas.width, canvas.height)
-    this.points.push({ pos: world, pressure: e.pressure > 0 ? e.pressure : 0.5 })
+    // Use logical CSS dimensions — canvas.width is in physical pixels and would break coords
+    const world = this.board.camera.screenToWorld(
+      e.x,
+      e.y,
+      this.board.logicalWidth,
+      this.board.logicalHeight,
+    )
+    // Invert layer transform so stamp lands at correct canvas pixel
+    const layer = this.activeLayer
+    const lx = layer ? world.x - layer.transform.x : world.x
+    const ly = layer ? world.y - layer.transform.y : world.y
+    this.points.push({ pos: new Vec2(lx, ly), pressure: e.pressure > 0 ? e.pressure : 0.5 })
   }
 
   private renderStroke(): void {

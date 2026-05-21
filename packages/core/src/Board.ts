@@ -22,12 +22,17 @@ export class Board {
   private layers: Layer[] = []
   private toolRegistry = new Map<string, Tool>()
   private _activeTool: Tool | null = null
-  /** Transient tool override (e.g. Space-to-pan) — never fires toolChanged hook */
+  /** Transient tool override (Space-to-pan etc.) — never fires toolChanged hook */
   private _tempTool: Tool | null = null
   private _activeLayerId: string | null = null
   private rafId: number | null = null
   private _dirty = true
   private resizeObserver: ResizeObserver
+
+  /** Logical (CSS) canvas width in pixels. Tracks the last ResizeObserver measurement. */
+  private _logicalWidth = 0
+  /** Logical (CSS) canvas height in pixels. Tracks the last ResizeObserver measurement. */
+  private _logicalHeight = 0
 
   constructor(container: HTMLElement | HTMLCanvasElement, options: BoardOptions = {}) {
     if (container instanceof HTMLCanvasElement) {
@@ -42,27 +47,39 @@ export class Board {
 
     this.hooks = new BoardHooks()
     this.camera = new Camera()
-    this.history = new HistoryManager(() => this.markDirty())
-    this.renderer = new Canvas2DRenderer(this.canvas, options.background)
+    this.history = new HistoryManager(() => this.markDirty(), options.historySize)
+    this.renderer = new Canvas2DRenderer(this.canvas, options.background, options.pixelRatio)
     this.plugins = new PluginManager(this)
     this.gestureManager = new GestureManager(this.canvas, this.camera, this)
+
+    const observeTarget =
+      container instanceof HTMLCanvasElement ? container.parentElement ?? document.body : container
 
     this.resizeObserver = new ResizeObserver(([entry]) => {
       if (!entry) return
       const { width, height } = entry.contentRect
+      this._logicalWidth = width
+      this._logicalHeight = height
       const dpr = options.pixelRatio ?? window.devicePixelRatio ?? 1
       this.canvas.width = Math.round(width * dpr)
       this.canvas.height = Math.round(height * dpr)
-      this.canvas.style.width = `${width}px`
-      this.canvas.style.height = `${height}px`
       this.markDirty()
     })
-
-    const observeTarget =
-      container instanceof HTMLCanvasElement ? container.parentElement ?? document.body : container
     this.resizeObserver.observe(observeTarget)
 
     this.startRenderLoop()
+  }
+
+  // ─── Dimensions ────────────────────────────────────────────────────────────
+
+  /** Logical (CSS) canvas width. Use this for all coordinate math. */
+  get logicalWidth(): number {
+    return this._logicalWidth || this.canvas.clientWidth || this.canvas.width
+  }
+
+  /** Logical (CSS) canvas height. Use this for all coordinate math. */
+  get logicalHeight(): number {
+    return this._logicalHeight || this.canvas.clientHeight || this.canvas.height
   }
 
   // ─── Plugin API ────────────────────────────────────────────────────────────
@@ -133,7 +150,7 @@ export class Board {
 
   /**
    * Temporarily override the active tool without firing toolChanged.
-   * Used by GestureManager for Space-to-pan. UI stays on the real active tool.
+   * Used by GestureManager for Space-to-pan. The toolbar stays on the real active tool.
    */
   setTempTool(name: string): void {
     const tool = this.toolRegistry.get(name)
@@ -145,7 +162,6 @@ export class Board {
   clearTempTool(): void {
     this._tempTool?.onDeactivate()
     this._tempTool = null
-    // Restore cursor from the real active tool
     this._activeTool?.onActivate()
   }
 
@@ -179,7 +195,15 @@ export class Board {
 
   // ─── Lifecycle ─────────────────────────────────────────────────────────────
 
+  /** True after destroy() has been called */
+  private _destroyed = false
+  get destroyed(): boolean {
+    return this._destroyed
+  }
+
   destroy(): void {
+    if (this._destroyed) return
+    this._destroyed = true
     if (this.rafId !== null) cancelAnimationFrame(this.rafId)
     this.resizeObserver.disconnect()
     this.gestureManager.destroy()

@@ -10,28 +10,46 @@ export interface UseBoardOptions extends BoardOptions {
   /** Whether to create an initial raster layer automatically */
   autoLayer?: boolean
   /**
-   * Called once when the Board is fully mounted and ready.
-   * Use this to register tools, plugins, and hook listeners.
+   * Called once when the Board is fully mounted and tools/layer are ready.
+   * Use this to register additional tools, plugins, and hook listeners.
    */
   onReady?: (board: Board) => void
+  /**
+   * Called just before the Board is destroyed (e.g., component unmount or
+   * React Strict Mode's double-invoke cleanup). Use this to clear any
+   * state references to the old Board instance.
+   */
+  onDestroy?: () => void
 }
 
 export function useBoard(options: UseBoardOptions = {}) {
   const containerRef = useRef<HTMLDivElement>(null)
   const boardRef = useRef<Board | null>(null)
-  // Stable ref to onReady to avoid re-running the effect if the callback changes
+  // Stable refs so effect doesn't re-run when callbacks change identity
   const onReadyRef = useRef(options.onReady)
+  const onDestroyRef = useRef(options.onDestroy)
   onReadyRef.current = options.onReady
+  onDestroyRef.current = options.onDestroy
 
   useEffect(() => {
     const container = containerRef.current
     if (!container || boardRef.current) return
 
-    const { layerWidth = 1920, layerHeight = 1080, autoLayer = true, ...boardOptions } = options
+    const {
+      layerWidth = 1920,
+      layerHeight = 1080,
+      autoLayer = true,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      onReady: _onReady,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      onDestroy: _onDestroy,
+      ...boardOptions
+    } = options
+
     const board = new Board(container, boardOptions)
     boardRef.current = board
 
-    // Default tools always registered so keyboard shortcuts resolve them
+    // Register default tools so keyboard shortcuts resolve them
     board.registerTool('brush', new BrushTool())
     board.registerTool('eraser', new EraserTool())
     board.setActiveTool('brush')
@@ -42,10 +60,10 @@ export function useBoard(options: UseBoardOptions = {}) {
       board.setActiveLayer(layer.id)
     }
 
-    // Notify caller — here they can register extra tools, plugins, hook listeners
     onReadyRef.current?.(board)
 
     return () => {
+      onDestroyRef.current?.()
       board.destroy()
       boardRef.current = null
     }
