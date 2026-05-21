@@ -6,6 +6,7 @@ export class GestureManager {
   private lastPinchDist = 0
   private lastTwoFingerCenter = { x: 0, y: 0 }
   private isSpaceHeld = false
+  private isMiddleDown = false
 
   constructor(
     private readonly element: HTMLElement,
@@ -43,6 +44,14 @@ export class GestureManager {
   private onPointerDown = (e: PointerEvent): void => {
     this.element.setPointerCapture(e.pointerId)
     this.activePointers.set(e.pointerId, e)
+
+    // Middle mouse button → temporary pan (same as Space)
+    if (e.button === 1) {
+      this.isMiddleDown = true
+      this.board.setTempTool('pan')
+      e.preventDefault()
+      return
+    }
 
     if (this.activePointers.size === 2) {
       const [a, b] = [...this.activePointers.values()] as [PointerEvent, PointerEvent]
@@ -101,6 +110,13 @@ export class GestureManager {
   private onPointerUp = (e: PointerEvent): void => {
     this.activePointers.delete(e.pointerId)
     if (this.activePointers.size < 2) this.lastPinchDist = 0
+
+    if (e.button === 1 && this.isMiddleDown) {
+      this.isMiddleDown = false
+      this.board.clearTempTool()
+      return
+    }
+
     this.board.activeTool?.onPointerUp(this.toPointerData(e))
   }
 

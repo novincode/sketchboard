@@ -59,14 +59,13 @@ export class BrushTool extends Tool {
     this.activeLayer = layer
     this.isDrawing = true
     this.points = []
-    this.overlayDrawnTo = 0
     this.preStrokeSnapshot = layer.getImageData()
 
     this.addPoint(e)
 
     if (this.usesOverlay) {
-      this.appendToOverlay()
-      // No markDirty — overlay handles visual feedback
+      this.board.clearStrokeCanvas()
+      this.scheduleOverlayRedraw()
     } else {
       this.renderToLayer()
       this.board.markDirty()
@@ -79,7 +78,7 @@ export class BrushTool extends Tool {
     this.addPoint(e)
 
     if (this.usesOverlay) {
-      this.appendToOverlay()   // O(1) — only draws the new tail segment
+      this.scheduleOverlayRedraw()
     } else {
       this.renderToLayer()
       this.board.markDirty()
@@ -136,28 +135,26 @@ export class BrushTool extends Tool {
 
   // ─── Overlay rendering (screen space, no composite cost) ──────────────────
 
-  /**
-   * Incrementally appends the NEW tail of the stroke to the overlay canvas.
-   * O(1) per pointer event — never redraws old points.
-   * The overlay is only cleared on stroke start (onPointerDown) and stroke end.
-   */
-  private appendToOverlay(): void {
+  private scheduleOverlayRedraw(): void {
+    if (this._overlayPending) return
+    this._overlayPending = true
+    requestAnimationFrame(() => {
+      this._overlayPending = false
+      if (this.isDrawing) this.redrawOverlayFull()
+    })
+  }
+
+  private redrawOverlayFull(): void {
     const board = this.board!
     const { strokeCtx } = board
     if (!strokeCtx || this.points.length === 0) return
-
-    // We need at least 1 overlap point for smooth bezier joining
-    const startIdx = Math.max(0, this.overlayDrawnTo - 1)
-    const slice = this.points.slice(startIdx)
-    if (slice.length < 2) return
-
     const dpr = window.devicePixelRatio ?? 1
+    strokeCtx.clearRect(0, 0, strokeCtx.canvas.width, strokeCtx.canvas.height)
     strokeCtx.save()
     strokeCtx.scale(dpr, dpr)
     this.applyBrushStyle(strokeCtx, board.camera.zoom, true)
-    this.drawPath(strokeCtx, slice, 'screen')
+    this.drawPath(strokeCtx, this.points, 'screen')
     strokeCtx.restore()
-    this.overlayDrawnTo = this.points.length - 1
   }
 
   // ─── Layer canvas rendering (world space, called once per stroke) ─────────
@@ -218,44 +215,39 @@ export class BrushTool extends Tool {
       return
     }
 
-    // Multi-segment variable-width bezier stroke.
-    // Each segment is drawn as a quadratic bezier from midpoint[i-1] to midpoint[i]
-    // with pts[i] as the control point. Width varies per segment.
+    // Variable-width quadratic bezier chain.
+    // Each segment goes from midpoint(pts[i-2], pts[i-1]) to midpoint(pts[i-1], pts[i])
+    // with pts[i-1] as the control point — guaranteed C0 continuity between segments.
     for (let i = 1; i < pts.length; i++) {
       const p0 = pts[i - 1]!
       const p1 = pts[i]!
       const c0 = coord(p0)
       const c1 = coord(p1)
 
-      const avgPressure = (p0.pressure + p1.pressure) / 2
-      const w = this.effectiveSize(avgPressure, baseSize)
+      ctx.lineWidth = this.effectiveSize((p0.pressure + p1.pressure) / 2, baseSize)
 
-      ctx.lineWidth = w
-
-      // Midpoints for smooth joining between segments
-      let mx0: number, my0: number, mx1: number, my1: number
-
+      // Start: midpoint(pts[i-2], pts[i-1]), or pts[0] for the first segment
+      let sx: number, sy: number
       if (i === 1) {
-        mx0 = c0.x
-        my0 = c0.y
+        sx = c0.x; sy = c0.y
       } else {
         const pp = coord(pts[i - 2]!)
-        mx0 = (pp.x + c0.x) / 2
-        my0 = (pp.y + c0.y) / 2
+        sx = (pp.x + c0.x) / 2
+        sy = (pp.y + c0.y) / 2
       }
 
+      // End: midpoint(pts[i-1], pts[i]), or pts[n] for the last segment
+      let ex: number, ey: number
       if (i === pts.length - 1) {
-        mx1 = c1.x
-        my1 = c1.y
+        ex = c1.x; ey = c1.y
       } else {
-        const pn = coord(pts[i + 1]!)
-        mx1 = (c0.x + pn.x) / 2
-        my1 = (c0.y + pn.y) / 2
+        ex = (c0.x + c1.x) / 2
+        ey = (c0.y + c1.y) / 2
       }
 
       ctx.beginPath()
-      ctx.moveTo(mx0, my0)
-      ctx.quadraticCurveTo(c0.x, c0.y, (c0.x + mx1) / 2, (c0.y + my1) / 2)
+      ctx.moveTo(sx, sy)
+      ctx.quadraticCurveTo(c0.x, c0.y, ex, ey)
       ctx.stroke()
     }
   }
