@@ -2,6 +2,7 @@ import { Camera } from './Camera'
 import { BoardHooks } from './hooks/BoardHooks'
 import { HistoryManager } from './history/HistoryManager'
 import { PluginManager } from './plugins/PluginManager'
+import { BrushRegistry } from './brushes/BrushRegistry'
 import { Canvas2DRenderer } from './renderer/Canvas2DRenderer'
 import { GestureManager } from './gestures/GestureManager'
 import type { Layer } from './layers/Layer'
@@ -16,6 +17,7 @@ export class Board {
   readonly hooks: BoardHooks
   readonly history: HistoryManager
   readonly plugins: PluginManager
+  readonly brushRegistry: BrushRegistry
 
   private renderer: Renderer
   private gestureManager: GestureManager
@@ -43,6 +45,7 @@ export class Board {
   strokeCtx: CanvasRenderingContext2D | null = null
 
   constructor(container: HTMLElement | HTMLCanvasElement, options: BoardOptions = {}) {
+    this.brushRegistry = new BrushRegistry()
     if (container instanceof HTMLCanvasElement) {
       this.canvas = container
     } else {

@@ -17,12 +17,12 @@ import { LayerPanel } from './components/LayerPanel'
 import { BrushCursor } from './components/BrushCursor'
 import { CanvasBackground } from './components/Background'
 import { LayerMismatchPrompt } from './components/LayerMismatchPrompt'
+import { DrawBlockedToast } from './components/DrawBlockedToast'
 import type { ToolId } from './types'
 
 const LAYER_W = 3840
 const LAYER_H = 2160
 
-/** Tools that hide the OS cursor and show the custom BrushCursor instead */
 const HIDE_CURSOR_TOOLS = new Set<ToolId>(['pen', 'brush', 'eraser', 'vector', 'vectorpen'])
 
 function useFreeformSetup(board: Board | null) {
@@ -31,7 +31,7 @@ function useFreeformSetup(board: Board | null) {
   useEffect(() => {
     if (!board || board.destroyed) return
 
-    // Register all tools
+    // 1. Register all tools
     board.registerTool('select',     new SelectTool())
     board.registerTool('pen',        new PenTool())
     board.registerTool('brush',      new BrushTool())
@@ -40,25 +40,23 @@ function useFreeformSetup(board: Board | null) {
     board.registerTool('vectorpen',  new VectorPenTool())
     board.registerTool('pan',        new PanTool())
     board.registerTool('eyedropper', new EyedropperTool())
-    board.setActiveTool('pen')
+    board.setActiveTool('brush')
 
-    // Single keyboard plugin handles ALL shortcuts
+    // 2. Keyboard shortcuts via plugin
     board.use(new KeyboardPlugin({
-      // Disable pencil (not registered)
-      pencil: null,
-      // New tools
+      pencil:      null,  // not registered
+      pen:         { key: 'p', description: 'Raster pen', handler: (b) => b.setActiveTool('pen') },
+      brush:       { key: 'b', description: 'Raster brush', handler: (b) => b.setActiveTool('brush') },
       selectTool:  { key: 'v', description: 'Select',       handler: (b) => b.setActiveTool('select') },
       vectorBrush: { key: 'w', description: 'Vector brush', handler: (b) => b.setActiveTool('vector') },
       vectorPen:   { key: 'q', description: 'Vector pen',   handler: (b) => b.setActiveTool('vectorpen') },
-      // Delete selected vector elements
       deleteEl:    { key: 'Delete',    description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       deleteElBS:  { key: 'Backspace', description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
-      // Pen path control
-      finishPath:  { key: 'Enter',  description: 'Finish path',  handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.finishPath() },
-      cancelPath:  { key: 'Escape', description: 'Cancel path',  handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.cancelPath() },
+      finishPath:  { key: 'Enter',  description: 'Finish vector path', handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.finishPath() },
+      cancelPath:  { key: 'Escape', description: 'Cancel vector path', handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.cancelPath() },
     }))
 
-    // CRITICAL: use setState directly — calling setActiveToolId loops back through board
+    // 3. Store hooks — subscribe BEFORE creating layers so events fire correctly
     const unsubColor = board.hooks.colorPicked.tap('freeform', ({ color }) => {
       setBrushColor(color.toHex())
     })
@@ -66,26 +64,51 @@ function useFreeformSetup(board: Board | null) {
       useFreeformStore.setState({ activeToolId: name as ToolId })
     })
 
-    // White background raster layer, centered in viewport
-    const layer = new RasterLayer(LAYER_W, LAYER_H, 'Layer 1')
-    layer.backgroundColor = '#ffffff'
-    board.addLayer(layer)
-    board.setActiveLayer(layer.id)
-    board.camera.position.x = LAYER_W / 2
-    board.camera.position.y = LAYER_H / 2
-
+    // 4. Wire store with board (hooks registered internally here)
     _setBoard(board)
+
+    // 5. Create layers AFTER _setBoard so hooks fire into the store correctly
+    const bgLayer = new RasterLayer(LAYER_W, LAYER_H, 'Background')
+    bgLayer.backgroundColor = '#ffffff'
+    board.addLayer(bgLayer)
+
+    const drawLayer = new RasterLayer(LAYER_W, LAYER_H, 'Layer 1')
+    board.addLayer(drawLayer)
+    board.setActiveLayer(drawLayer.id)
+
+    // Store background layer id
+    useFreeformStore.setState({ backgroundLayerId: bgLayer.id })
+
+    // 6. Fit canvas to viewport on first mount
+    const fitToViewport = () => {
+      const vw = board.logicalWidth || window.innerWidth
+      const vh = board.logicalHeight || window.innerHeight
+      if (vw > 0 && vh > 0) {
+        const zoom = Math.min((vw * 0.88) / LAYER_W, (vh * 0.88) / LAYER_H)
+        board.camera.zoom = zoom
+        board.camera.position.x = LAYER_W / 2
+        board.camera.position.y = LAYER_H / 2
+        board.markDirty()
+      }
+    }
+    // Try immediately, then again after resize observer fires
+    fitToViewport()
+    const unsub = board.hooks.afterRender.tap('fit-once', () => {
+      fitToViewport()
+      unsub()
+    })
 
     return () => {
       unsubColor()
       unsubTool()
       _setBoard(null)
+      useFreeformStore.setState({ backgroundLayerId: null })
     }
   }, [board, _setBoard, setBrushColor])
 }
 
 export function FreeformTemplate() {
-  const { background, showColorPicker, showLayerPanel, activeToolId } = useFreeformStore()
+  const { background, showColorPicker, showLayerPanel, activeToolId, backgroundLayerId, layers } = useFreeformStore()
   const [board, setBoard] = useState<Board | null>(null)
 
   const handleReady  = useCallback((b: Board) => setBoard(b), [])
@@ -100,14 +123,18 @@ export function FreeformTemplate() {
 
   useFreeformSetup(board)
 
-  // Only hide OS cursor for drawing tools so Select/Pan/Eyedropper work normally
   const hideCursor = HIDE_CURSOR_TOOLS.has(activeToolId)
+
+  // Show transparent checker when background layer is hidden
+  const bgLayer = layers.find((l) => l.id === backgroundLayerId)
+  const bgHidden = bgLayer && !bgLayer.visible
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#0d0d0d]">
-      <CanvasBackground type={background} />
+      {bgHidden
+        ? <TransparentPattern />
+        : <CanvasBackground type={background} />}
 
-      {/* Board canvas + stroke overlay injected by Board into this div */}
       <div
         ref={containerRef}
         className="absolute inset-0"
@@ -115,16 +142,34 @@ export function FreeformTemplate() {
       />
 
       <BrushCursor />
-
-      {/* UI chrome */}
       <TopBar />
       <ToolOptionsPanel />
       <Toolbar />
 
-      {/* Prompts & panels */}
       <LayerMismatchPrompt />
+      <DrawBlockedToast />
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>
+  )
+}
+
+/** Modern transparent checkerboard shown when background is hidden */
+function TransparentPattern() {
+  return (
+    <div
+      className="absolute inset-0"
+      style={{
+        backgroundImage: `
+          linear-gradient(45deg, #1a1a1a 25%, transparent 25%),
+          linear-gradient(-45deg, #1a1a1a 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, #1a1a1a 75%),
+          linear-gradient(-45deg, transparent 75%, #1a1a1a 75%)
+        `,
+        backgroundSize: '20px 20px',
+        backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0',
+        backgroundColor: '#141414',
+      }}
+    />
   )
 }

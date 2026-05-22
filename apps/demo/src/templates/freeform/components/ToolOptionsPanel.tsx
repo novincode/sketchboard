@@ -23,6 +23,7 @@ export function ToolOptionsPanel() {
   return (
     <div className="fixed bottom-17 left-1/2 z-40 -translate-x-1/2">
       <div className="flex items-end gap-3 rounded-2xl border border-white/10 bg-black/80 px-4 py-3 shadow-xl backdrop-blur-xl">
+        {/* pen is hidden from toolbar but still activated via P key */}
         {(activeToolId === 'pen' || activeToolId === 'brush') && (
           <>
             <DraggableInput

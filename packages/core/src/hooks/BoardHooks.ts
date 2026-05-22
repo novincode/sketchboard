@@ -17,6 +17,8 @@ class Hook<T = void> {
   }
 }
 
+export type DrawBlockedReason = 'layer-hidden' | 'wrong-layer-type' | 'no-active-layer'
+
 /** Typed event hooks exposed by Board to plugins and tools */
 export class BoardHooks {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -30,6 +32,8 @@ export class BoardHooks {
   readonly activeLayerChanged = new Hook<{ id: string | null }>()
   /** Fired by EyedropperTool (or any plugin) when a color is sampled */
   readonly colorPicked = new Hook<{ color: Color }>()
+  /** Fired when a tool attempts to draw but is blocked (e.g. hidden/wrong layer) */
+  readonly drawBlocked = new Hook<{ reason: DrawBlockedReason }>()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly destroy = new Hook<any>()
 }

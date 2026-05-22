@@ -37,7 +37,14 @@ export class VectorBrushTool extends Tool {
   onPointerDown(e: PointerData): void {
     if (!this.board) return
     const layer = this.board.getActiveLayer() as VectorLayer | undefined
-    if (!layer || layer.type !== 'vector') return
+    if (!layer || layer.type !== 'vector') {
+      this.board.hooks.drawBlocked.call({ reason: 'wrong-layer-type' })
+      return
+    }
+    if (!layer.visible) {
+      this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' })
+      return
+    }
     this.activeLayer = layer
     this.isDrawing = true
     this.points = []

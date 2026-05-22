@@ -55,6 +55,10 @@ export class BrushTool extends Tool {
     if (!this.board) return
     const layer = this.board.getActiveLayer() as RasterLayer | undefined
     if (!layer?.ctx) return
+    if (!layer.visible) {
+      this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' })
+      return
+    }
 
     this.activeLayer = layer
     this.isDrawing = true

@@ -1,5 +1,5 @@
 export type ToolId =
-  | 'pen'
+  | 'pen'        // raster pen (kept for keyboard shortcut P, hidden from toolbar)
   | 'brush'
   | 'eraser'
   | 'vector'
@@ -21,9 +21,9 @@ export interface ToolMeta {
   icon: string
 }
 
+/** Tools shown in the toolbar (pen is hidden — activated via P shortcut only) */
 export const TOOLS: ToolMeta[] = [
   { id: 'select',     label: 'Select',      shortcut: 'V', icon: 'select' },
-  { id: 'pen',        label: 'Pen',         shortcut: 'P', icon: 'pen' },
   { id: 'brush',      label: 'Brush',       shortcut: 'B', icon: 'brush' },
   { id: 'eraser',     label: 'Eraser',      shortcut: 'E', icon: 'eraser' },
   { id: 'vector',     label: 'Vector Brush',shortcut: 'W', icon: 'vector' },

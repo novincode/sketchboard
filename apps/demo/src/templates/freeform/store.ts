@@ -38,6 +38,10 @@ interface FreeformState {
 
   layers: LayerMeta[]
   activeLayerId: string | null
+
+  /** The special "Background" layer id — always at index 0 */
+  backgroundLayerId: string | null
+  backgroundLayerColor: string
 }
 
 interface FreeformActions {
@@ -62,11 +66,14 @@ interface FreeformActions {
 
   addLayer(type?: LayerType): void
   removeLayer(id: string): void
+  duplicateLayer(id: string): void
+  clearLayer(id: string): void
   setActiveLayerId(id: string): void
   setLayerVisibility(id: string, visible: boolean): void
   setLayerOpacity(id: string, opacity: number): void
   setLayerName(id: string, name: string): void
   setLayerBlendMode(id: string, blendMode: string): void
+  setBackgroundColor(hex: string): void
 
   exportPng(filename?: string): void
 }
@@ -131,7 +138,9 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     eraserMode: 'pixel',
     vectorSize: 4,
     vectorOpacity: 1,
-    background: 'dots',
+    background: 'dots' as Background,
+    backgroundLayerId: null,
+    backgroundLayerColor: '#ffffff',
     showColorPicker: false,
     showLayerPanel: false,
     layers: [],
@@ -289,6 +298,41 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       ;(layer as any).blendMode = blendMode
       board?.markDirty()
       set((s) => ({ layers: s.layers.map((l) => (l.id === id ? { ...l, blendMode } : l)) }))
+    },
+
+    duplicateLayer(id) {
+      const { board } = get()
+      if (!board) return
+      const original = board.getLayerById(id)
+      if (!original) return
+      const copy = original.clone()
+      copy.name = `${original.name} copy`
+      board.addLayer(copy)
+      board.setActiveLayer(copy.id)
+    },
+
+    clearLayer(id) {
+      const { board } = get()
+      const layer = board?.getLayerById(id)
+      if (!layer) return
+      if (layer instanceof RasterLayer) {
+        layer.clear()
+        board?.markDirty()
+      } else if (layer instanceof VectorLayer) {
+        layer.strokes = []
+        layer.paths = []
+        board?.markDirty()
+      }
+    },
+
+    setBackgroundColor(hex) {
+      const { board, backgroundLayerId } = get()
+      if (!backgroundLayerId) return
+      const layer = board?.getLayerById(backgroundLayerId)
+      if (!(layer instanceof RasterLayer)) return
+      layer.backgroundColor = hex
+      board?.markDirty()
+      set({ backgroundLayerColor: hex })
     },
 
     // ── Export ────────────────────────────────────────────────────────────

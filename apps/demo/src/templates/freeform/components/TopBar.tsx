@@ -46,10 +46,11 @@ function IconBtn({
       title={label}
       aria-label={label}
       className={[
-        'flex h-8 w-8 items-center justify-center rounded-xl border transition-all duration-100 focus:outline-none',
+        'flex h-8 w-8 items-center justify-center rounded-xl transition-all duration-100 focus:outline-none',
+        // Always has a visible dark pill — readable on any background
         active
-          ? 'border-blue-500/40 bg-blue-500/20 text-blue-400'
-          : 'border-white/10 bg-black/60 text-white/55 hover:bg-white/10 hover:text-white backdrop-blur-lg',
+          ? 'bg-blue-500/25 text-blue-300 ring-1 ring-blue-500/50 shadow-lg'
+          : 'bg-black/50 text-white/65 ring-1 ring-white/10 hover:bg-black/70 hover:text-white shadow-md backdrop-blur-lg',
       ].join(' ')}
     >
       {children}

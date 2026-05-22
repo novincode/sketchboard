@@ -1,5 +1,13 @@
 // Core
 export { Board } from './Board'
+
+// Brushes
+export { BrushRegistry } from './brushes/BrushRegistry'
+export type { RasterBrushDefinition, VectorBrushDefinition, PressureCurvePoint } from './brushes/BrushDefinition'
+export {
+  DEFAULT_RASTER_BRUSH, DEFAULT_INK_BRUSH, DEFAULT_SOFT_BRUSH,
+  DEFAULT_VECTOR_BRUSH, DEFAULT_VECTOR_CALLIGRAPHY,
+} from './brushes/BrushDefinition'
 export { Camera } from './Camera'
 export { Transform } from './Transform'
 
@@ -48,6 +56,7 @@ export type { HistoryEntry } from './history/HistoryManager'
 
 // Hooks
 export { BoardHooks } from './hooks/BoardHooks'
+export type { DrawBlockedReason } from './hooks/BoardHooks'
 
 // Gestures
 export { GestureManager } from './gestures/GestureManager'
