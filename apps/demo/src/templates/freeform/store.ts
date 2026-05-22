@@ -36,6 +36,10 @@ interface FreeformState {
   showColorPicker: boolean
   showLayerPanel: boolean
 
+  /** Toolbar dock position — shared so ToolOptionsPanel can align itself */
+  toolbarSnap: 'bottom' | 'left' | 'right' | 'top'
+  toolbarEdgeOffset: number  // position along the edge (fraction 0–1)
+
   layers: LayerMeta[]
   activeLayerId: string | null
 
@@ -63,6 +67,7 @@ interface FreeformActions {
   toggleColorPicker(): void
   closePanels(): void
   toggleLayerPanel(): void
+  setToolbarSnap(snap: 'bottom' | 'left' | 'right' | 'top', offset?: number): void
 
   addLayer(type?: LayerType): void
   removeLayer(id: string): void
@@ -141,6 +146,8 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     background: 'dots' as Background,
     backgroundLayerId: null,
     backgroundLayerColor: '#ffffff',
+    toolbarSnap: 'bottom' as const,
+    toolbarEdgeOffset: 0.5,
     showColorPicker: false,
     showLayerPanel: false,
     layers: [],
@@ -225,6 +232,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
 
     // ── UI ────────────────────────────────────────────────────────────────
     setBackground: (bg) => set({ background: bg }),
+    setToolbarSnap: (snap, offset = 0.5) => set({ toolbarSnap: snap, toolbarEdgeOffset: offset }),
     toggleColorPicker: () =>
       set((s) => ({ showColorPicker: !s.showColorPicker, showLayerPanel: false })),
     closePanels: () => set({ showColorPicker: false, showLayerPanel: false }),

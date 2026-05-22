@@ -178,6 +178,25 @@ export class VectorLayer extends Layer {
     return null
   }
 
+  /** Scale a stroke or path from an origin point in layer-local coords. */
+  scaleElement(id: string, sx: number, sy: number, originX: number, originY: number): void {
+    const scaleX = (x: number) => originX + (x - originX) * sx
+    const scaleY = (y: number) => originY + (y - originY) * sy
+    const stroke = this.strokes.find((s) => s.id === id)
+    if (stroke) {
+      for (const p of stroke.points) { p.x = scaleX(p.x); p.y = scaleY(p.y) }
+      return
+    }
+    const path = this.paths.find((p) => p.id === id)
+    if (path) {
+      for (const a of path.anchors) {
+        a.x = scaleX(a.x); a.y = scaleY(a.y)
+        if (a.handleIn) { a.handleIn.x = scaleX(a.handleIn.x); a.handleIn.y = scaleY(a.handleIn.y) }
+        if (a.handleOut) { a.handleOut.x = scaleX(a.handleOut.x); a.handleOut.y = scaleY(a.handleOut.y) }
+      }
+    }
+  }
+
   /** Move a stroke or path by (dx, dy) in layer-local coords. */
   translateElement(id: string, dx: number, dy: number): void {
     const stroke = this.strokes.find((s) => s.id === id)

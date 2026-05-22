@@ -12,7 +12,7 @@ export class EraserTool extends BrushTool {
       ...this.settings,
       size: 24,
       opacity: 1,
-      hardness: 0.7,
+      hardness: 1.0,  // hard eraser edge (blur on destination-out causes feathering + lag)
       color: Color.black(),
       compositeOperation: 'destination-out',
     }

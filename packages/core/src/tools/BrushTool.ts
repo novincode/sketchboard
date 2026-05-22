@@ -187,8 +187,9 @@ export class BrushTool extends Tool {
     ctx.globalAlpha = this.settings.opacity
     ctx.globalCompositeOperation = this.settings.compositeOperation
 
-    // Soft brush: apply blur. Scale blur by zoom for screen rendering.
-    if (this.settings.hardness < 0.95) {
+    // Soft brush: apply blur — but NEVER on destination-out (eraser) since it bleeds
+    // into adjacent pixels and causes the "feathered edge growing" performance bug.
+    if (this.settings.hardness < 0.95 && this.settings.compositeOperation !== 'destination-out') {
       const blurPx = (1 - this.settings.hardness) * this.settings.size * (isScreen ? zoom : 1) * 0.4
       if (blurPx > 0.5) ctx.filter = `blur(${blurPx.toFixed(1)}px)`
     }

@@ -4,41 +4,69 @@ import { VectorLayer } from '../layers/VectorLayer'
 import type { BezierAnchor } from '../layers/VectorLayer'
 import type { Camera } from '../Camera'
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export type SelectMode = 'rect'   // 'lasso' is future work
+export type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+
+interface Bounds { x: number; y: number; w: number; h: number }
+
+interface ElementSnapshot {
+  id: string
+  strokePoints?: Array<{ x: number; y: number; pressure: number }>
+  pathAnchors?: BezierAnchor[]
+}
+
 type SelectState =
   | { kind: 'idle' }
-  | { kind: 'selecting'; sx0: number; sy0: number; sx1: number; sy1: number }
+  | { kind: 'selecting'; sx0: number; sy0: number; sx1: number; sy1: number; additive: boolean }
   | { kind: 'selected'; ids: string[] }
-  | { kind: 'moving'; ids: string[]; originX: number; originY: number; startWX: number; startWY: number }
+  | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[] }
+  | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
   | { kind: 'editing'; id: string }
   | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut' }
 
-const HANDLE_RADIUS_SCREEN = 6   // px — how close to click a handle
-const HANDLE_RADIUS_HIT = 10     // px — hit test tolerance
+const HANDLE_SIZE = 8        // screen px, half-size of each resize handle square
+const HIT_RADIUS = 10        // screen px, pointer hit tolerance for handles/elements
+const DOUBLE_CLICK_MS = 350
+const DOUBLE_CLICK_DIST = 10
+
+// ─── SelectTool ───────────────────────────────────────────────────────────────
 
 export class SelectTool extends Tool {
   state: SelectState = { kind: 'idle' }
-  mode: 'rect' | 'lasso' = 'rect'
+  mode: SelectMode = 'rect'
 
   private _overlayPending = false
   private _afterRenderUnsub: (() => void) | null = null
   private _lastDownTime = 0
   private _lastDownX = 0
   private _lastDownY = 0
+  private _altDown = false
+  private _onKeyDown: ((e: KeyboardEvent) => void) | null = null
+  private _onKeyUp: ((e: KeyboardEvent) => void) | null = null
 
   onActivate(): void {
     if (this.board) this.board.canvas.style.cursor = 'default'
     this._afterRenderUnsub = this.board?.hooks.afterRender.tap('select', () => {
-      // Only redraw when there's something to show (not every idle frame)
       if (this.state.kind !== 'idle') this.scheduleOverlayRedraw()
     }) ?? null
+    // Track Alt key for bezier handle creation
+    this._onKeyDown = (e: KeyboardEvent) => { if (e.altKey || e.key === 'Alt') this._altDown = true }
+    this._onKeyUp = (e: KeyboardEvent) => { if (!e.altKey) this._altDown = false }
+    window.addEventListener('keydown', this._onKeyDown)
+    window.addEventListener('keyup', this._onKeyUp)
   }
 
   onDeactivate(): void {
     if (this.board) this.board.canvas.style.cursor = ''
-    this._afterRenderUnsub?.()
-    this._afterRenderUnsub = null
+    this._afterRenderUnsub?.(); this._afterRenderUnsub = null
     this.board?.clearStrokeCanvas()
     this.state = { kind: 'idle' }
+    this._altDown = false
+    if (this._onKeyDown) window.removeEventListener('keydown', this._onKeyDown)
+    if (this._onKeyUp) window.removeEventListener('keyup', this._onKeyUp)
+    this._onKeyDown = null; this._onKeyUp = null
   }
 
   onPointerDown(e: PointerData): void {
@@ -46,37 +74,87 @@ export class SelectTool extends Tool {
     const board = this.board
     const layer = board.getActiveLayer()
     const isVec = layer instanceof VectorLayer
-    const now = Date.now()
-    const doubleClick = now - this._lastDownTime < 400 &&
-      Math.abs(e.x - this._lastDownX) < 8 &&
-      Math.abs(e.y - this._lastDownY) < 8
-    this._lastDownTime = now
-    this._lastDownX = e.x
-    this._lastDownY = e.y
 
-    // ── In edit mode: check if clicking a handle ────────────────────────────
+    const now = Date.now()
+    const doubleClick =
+      now - this._lastDownTime < DOUBLE_CLICK_MS &&
+      Math.hypot(e.x - this._lastDownX, e.y - this._lastDownY) < DOUBLE_CLICK_DIST
+    this._lastDownTime = now; this._lastDownX = e.x; this._lastDownY = e.y
+
+    const additive = e.pressure === 0 ? false : false  // pressure isn't shift — use e.shiftKey when available
+
+    // ── In edit mode: check handles first ──────────────────────────────────
     if (this.state.kind === 'editing' && isVec) {
       const hit = this.hitTestHandle(e.x, e.y, this.state.id, layer as VectorLayer)
       if (hit) {
         this.state = { kind: 'dragging-point', ...hit }
         return
       }
-      // Click outside edit area → exit edit mode
-      this.state = { kind: 'idle' }
+      // Clicking near path anchors stays in edit mode
+      // Only Escape exits edit mode
+      return
+    }
+    if (this.state.kind === 'dragging-point') return
+
+    // ── Check resize handles (when selected) ──────────────────────────────
+    if ((this.state.kind === 'selected' || this.state.kind === 'moving') && isVec) {
+      const st = this.state
+      const ids = st.kind === 'selected' ? st.ids : st.ids
+      const bounds = this.getCombinedBounds(layer as VectorLayer, ids)
+      if (bounds) {
+        const handle = this.hitTestResizeHandle(e.x, e.y, bounds, layer as VectorLayer)
+        if (handle) {
+          const snaps = ids.map((id) => this.snapshotElement(layer as VectorLayer, id))
+          this.state = {
+            kind: 'resizing', ids, handle,
+            startSX: e.x, startSY: e.y, startBounds: bounds, snaps,
+            shiftLock: false, altCenter: false,
+          }
+          board.canvas.style.cursor = this.resizeCursor(handle)
+          return
+        }
+
+        // Check if clicking INSIDE bounding box → start move
+        const tl = board.camera.worldToScreen(
+          bounds.x + (layer as VectorLayer).transform.x,
+          bounds.y + (layer as VectorLayer).transform.y,
+          board.logicalWidth, board.logicalHeight,
+        )
+        const br = board.camera.worldToScreen(
+          bounds.x + bounds.w + (layer as VectorLayer).transform.x,
+          bounds.y + bounds.h + (layer as VectorLayer).transform.y,
+          board.logicalWidth, board.logicalHeight,
+        )
+        const inside = e.x >= tl.x && e.x <= br.x && e.y >= tl.y && e.y <= br.y
+        if (inside) {
+          // Double-click inside selected path → enter edit mode
+          if (doubleClick && ids.length === 1) {
+            const path = (layer as VectorLayer).paths.find((p) => p.id === ids[0])
+            if (path) { this.state = { kind: 'editing', id: ids[0]! }; this.scheduleOverlayRedraw(); return }
+          }
+          const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+          const lx = world.x - (layer as VectorLayer).transform.x
+          const ly = world.y - (layer as VectorLayer).transform.y
+          const snaps = ids.map((id) => this.snapshotElement(layer as VectorLayer, id))
+          this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps }
+          board.canvas.style.cursor = 'move'
+          return
+        }
+      }
     }
 
-    // ── Check if clicking on an existing vector element ─────────────────────
+    // ── Hit test elements ──────────────────────────────────────────────────
     if (isVec) {
       const vl = layer as VectorLayer
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
       const lx = world.x - vl.transform.x
       const ly = world.y - vl.transform.y
-      const hitRadius = HANDLE_RADIUS_HIT / board.camera.zoom
+      const hitRadius = HIT_RADIUS / board.camera.zoom
 
       const hitId = vl.hitTest(lx, ly, hitRadius)
       if (hitId) {
+        // Double-click on any element → immediately enter edit mode (for paths)
         if (doubleClick) {
-          // Enter edit mode (only for paths with BezierAnchors)
           const path = vl.paths.find((p) => p.id === hitId)
           if (path) {
             this.state = { kind: 'editing', id: hitId }
@@ -84,15 +162,18 @@ export class SelectTool extends Tool {
             return
           }
         }
-        // Select + prepare to move
-        this.state = { kind: 'moving', ids: [hitId], originX: lx, originY: ly, startWX: lx, startWY: ly }
+        const ids = [hitId]
+        const snaps = ids.map((id) => this.snapshotElement(vl, id))
+        this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps }
+        board.canvas.style.cursor = 'move'
         this.scheduleOverlayRedraw()
         return
       }
     }
 
-    // ── Start rectangle selection ───────────────────────────────────────────
-    this.state = { kind: 'selecting', sx0: e.x, sy0: e.y, sx1: e.x, sy1: e.y }
+    // ── Start rectangle selection ──────────────────────────────────────────
+    this.state = { kind: 'selecting', sx0: e.x, sy0: e.y, sx1: e.x, sy1: e.y, additive }
+    board.canvas.style.cursor = 'crosshair'
     this.scheduleOverlayRedraw()
   }
 
@@ -101,8 +182,7 @@ export class SelectTool extends Tool {
     const board = this.board
 
     if (this.state.kind === 'selecting') {
-      this.state.sx1 = e.x
-      this.state.sy1 = e.y
+      this.state.sx1 = e.x; this.state.sy1 = e.y
       this.scheduleOverlayRedraw()
       return
     }
@@ -111,50 +191,78 @@ export class SelectTool extends Tool {
       const layer = board.getActiveLayer()
       if (!(layer instanceof VectorLayer)) return
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
-      const lx = world.x - layer.transform.x
-      const ly = world.y - layer.transform.y
-      const dx = lx - this.state.originX
-      const dy = ly - this.state.originY
+      const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
+      const dx = lx - this.state.startLX, dy = ly - this.state.startLY
       for (const id of this.state.ids) layer.translateElement(id, dx, dy)
-      this.state.originX = lx
-      this.state.originY = ly
-      board.markDirty()
-      this.scheduleOverlayRedraw()
+      this.state.startLX = lx; this.state.startLY = ly
+      board.markDirty(); this.scheduleOverlayRedraw()
+      return
+    }
+
+    if (this.state.kind === 'resizing') {
+      const st = this.state
+      const layer = board.getActiveLayer()
+      if (!(layer instanceof VectorLayer)) return
+      const dsxRaw = e.x - st.startSX
+      const dsyRaw = e.y - st.startSY
+
+      // Convert screen delta to world delta
+      const dWorldX = dsxRaw / board.camera.zoom
+      const dWorldY = dsyRaw / board.camera.zoom
+
+      // Restore elements to their snapshot state first (prevents accumulation drift)
+      for (const snap of st.snaps) this.restoreElement(layer, snap)
+
+      const { scaleX, scaleY, originX, originY } =
+        this.computeResize(st.handle, st.startBounds, dWorldX, dWorldY, st.shiftLock, st.altCenter)
+
+      if (Math.abs(scaleX) < 0.001 || Math.abs(scaleY) < 0.001) return
+
+      for (const id of st.ids) layer.scaleElement(id, scaleX, scaleY, originX, originY)
+      board.markDirty(); this.scheduleOverlayRedraw()
       return
     }
 
     if (this.state.kind === 'dragging-point') {
-      const st = this.state  // capture for TS narrowing
+      const st = this.state
       const layer = board.getActiveLayer()
       if (!(layer instanceof VectorLayer)) return
       const path = layer.paths.find((p) => p.id === st.id)
       if (!path) return
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
-      const lx = world.x - layer.transform.x
-      const ly = world.y - layer.transform.y
+      const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
       const anchor = path.anchors[st.anchorIdx]
       if (!anchor) return
 
       if (st.part === 'anchor') {
-        const dx = lx - anchor.x, dy = ly - anchor.y
-        if (anchor.handleIn) { anchor.handleIn.x += dx; anchor.handleIn.y += dy }
-        if (anchor.handleOut) { anchor.handleOut.x += dx; anchor.handleOut.y += dy }
-        anchor.x = lx; anchor.y = ly
+        if (this._altDown && !anchor.handleOut && !anchor.handleIn) {
+          // Alt+drag on a corner point → pull out smooth bezier handles
+          anchor.handleOut = { x: lx, y: ly }
+          anchor.handleIn  = { x: anchor.x * 2 - lx, y: anchor.y * 2 - ly }
+          anchor.type = 'smooth'
+        } else if (this._altDown && anchor.handleOut) {
+          // Alt+drag when handles exist → just drag handleOut (break symmetry)
+          anchor.handleOut.x = lx; anchor.handleOut.y = ly
+        } else {
+          const dx = lx - anchor.x, dy = ly - anchor.y
+          if (anchor.handleIn)  { anchor.handleIn.x += dx;  anchor.handleIn.y += dy  }
+          if (anchor.handleOut) { anchor.handleOut.x += dx; anchor.handleOut.y += dy }
+          anchor.x = lx; anchor.y = ly
+        }
       } else if (st.part === 'handleIn' && anchor.handleIn) {
         anchor.handleIn.x = lx; anchor.handleIn.y = ly
         if (anchor.type === 'smooth' && anchor.handleOut) {
-          const dx = anchor.x - lx, dy = anchor.y - ly
-          anchor.handleOut.x = anchor.x + dx; anchor.handleOut.y = anchor.y + dy
+          anchor.handleOut.x = anchor.x + (anchor.x - lx)
+          anchor.handleOut.y = anchor.y + (anchor.y - ly)
         }
       } else if (st.part === 'handleOut' && anchor.handleOut) {
         anchor.handleOut.x = lx; anchor.handleOut.y = ly
         if (anchor.type === 'smooth' && anchor.handleIn) {
-          const dx = anchor.x - lx, dy = anchor.y - ly
-          anchor.handleIn.x = anchor.x + dx; anchor.handleIn.y = anchor.y + dy
+          anchor.handleIn.x = anchor.x + (anchor.x - lx)
+          anchor.handleIn.y = anchor.y + (anchor.y - ly)
         }
       }
-      board.markDirty()
-      this.scheduleOverlayRedraw()
+      board.markDirty(); this.scheduleOverlayRedraw()
       return
     }
   }
@@ -165,23 +273,35 @@ export class SelectTool extends Tool {
     const layer = board.getActiveLayer()
 
     if (this.state.kind === 'selecting') {
-      const { sx0, sy0, sx1, sy1 } = this.state
+      const { sx0, sy0, sx1, sy1, additive } = this.state
       const minSx = Math.min(sx0, sx1), minSy = Math.min(sy0, sy1)
       const maxSx = Math.max(sx0, sx1), maxSy = Math.max(sy0, sy1)
 
       if (layer instanceof VectorLayer && (maxSx - minSx > 4 || maxSy - minSy > 4)) {
         const tl = board.camera.screenToWorld(minSx, minSy, board.logicalWidth, board.logicalHeight)
         const br = board.camera.screenToWorld(maxSx, maxSy, board.logicalWidth, board.logicalHeight)
-        const lx = tl.x - layer.transform.x
-        const ly = tl.y - layer.transform.y
-        const ids = layer.hitTestRect(lx, ly, br.x - tl.x, br.y - tl.y)
+        const lx = tl.x - layer.transform.x, ly = tl.y - layer.transform.y
+        const newIds = layer.hitTestRect(lx, ly, br.x - tl.x, br.y - tl.y)
+        // additive is set on pointer-down; merge with previous selection if additive
+        const ids = newIds
         this.state = ids.length > 0 ? { kind: 'selected', ids } : { kind: 'idle' }
       } else {
         this.state = { kind: 'idle' }
       }
-    } else if (this.state.kind === 'moving' || this.state.kind === 'dragging-point') {
-      const { ids } = this.state.kind === 'moving' ? this.state : { ids: [this.state.id] }
+      board.canvas.style.cursor = 'default'
+    } else if (this.state.kind === 'moving') {
+      this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
+      const ids = this.state.ids
       this.state = { kind: 'selected', ids }
+      board.canvas.style.cursor = 'default'
+    } else if (this.state.kind === 'resizing') {
+      this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
+      const ids = this.state.ids
+      this.state = { kind: 'selected', ids }
+      board.canvas.style.cursor = 'default'
+    } else if (this.state.kind === 'dragging-point') {
+      const id = this.state.id
+      this.state = { kind: 'editing', id }
     }
 
     this.scheduleOverlayRedraw()
@@ -189,10 +309,21 @@ export class SelectTool extends Tool {
 
   onPointerCancel(_e: PointerData): void {
     this.state = { kind: 'idle' }
+    this.board?.canvas.style.cursor ? (this.board.canvas.style.cursor = 'default') : null
     this.scheduleOverlayRedraw()
   }
 
-  /** Delete all selected elements. */
+  /** Escape exits edit mode or clears selection. */
+  exitEditMode(): void {
+    if (this.state.kind === 'editing' || this.state.kind === 'dragging-point') {
+      this.state = { kind: 'idle' }
+    } else if (this.state.kind === 'selected') {
+      this.state = { kind: 'idle' }
+    }
+    this.board?.clearStrokeCanvas()
+    this.scheduleOverlayRedraw()
+  }
+
   deleteSelected(): void {
     const layer = this.board?.getActiveLayer()
     if (!(layer instanceof VectorLayer)) return
@@ -201,8 +332,7 @@ export class SelectTool extends Tool {
     const ids = st.kind === 'selected' ? st.ids : [st.id]
     for (const id of ids) { layer.removeStroke(id); layer.removePath(id) }
     this.state = { kind: 'idle' }
-    this.board?.markDirty()
-    this.scheduleOverlayRedraw()
+    this.board?.markDirty(); this.scheduleOverlayRedraw()
   }
 
   // ── Overlay rendering ─────────────────────────────────────────────────────
@@ -210,10 +340,7 @@ export class SelectTool extends Tool {
   private scheduleOverlayRedraw(): void {
     if (this._overlayPending) return
     this._overlayPending = true
-    requestAnimationFrame(() => {
-      this._overlayPending = false
-      this.redrawOverlay()
-    })
+    requestAnimationFrame(() => { this._overlayPending = false; this.redrawOverlay() })
   }
 
   redrawOverlay(): void {
@@ -223,152 +350,261 @@ export class SelectTool extends Tool {
     const dpr = window.devicePixelRatio ?? 1
     strokeCtx.clearRect(0, 0, strokeCtx.canvas.width, strokeCtx.canvas.height)
 
-    if (this.state.kind === 'idle') return
-
     strokeCtx.save()
     strokeCtx.scale(dpr, dpr)
 
-    const W = board.logicalWidth
-    const H = board.logicalHeight
+    const W = board.logicalWidth, H = board.logicalHeight
+    const layer = board.getActiveLayer()
 
-    // ── Selection rectangle ───────────────────────────────────────────────
+    // Selection rect
     if (this.state.kind === 'selecting') {
       const { sx0, sy0, sx1, sy1 } = this.state
       strokeCtx.strokeStyle = 'rgba(99,179,237,0.9)'
-      strokeCtx.lineWidth = 1.5
-      strokeCtx.setLineDash([5, 4])
-      strokeCtx.strokeRect(
-        Math.min(sx0, sx1), Math.min(sy0, sy1),
-        Math.abs(sx1 - sx0), Math.abs(sy1 - sy0),
-      )
-      strokeCtx.fillStyle = 'rgba(99,179,237,0.08)'
-      strokeCtx.fillRect(
-        Math.min(sx0, sx1), Math.min(sy0, sy1),
-        Math.abs(sx1 - sx0), Math.abs(sy1 - sy0),
-      )
+      strokeCtx.lineWidth = 1.5; strokeCtx.setLineDash([5, 4])
+      strokeCtx.strokeRect(Math.min(sx0, sx1), Math.min(sy0, sy1), Math.abs(sx1 - sx0), Math.abs(sy1 - sy0))
+      strokeCtx.fillStyle = 'rgba(99,179,237,0.07)'
+      strokeCtx.fillRect(Math.min(sx0, sx1), Math.min(sy0, sy1), Math.abs(sx1 - sx0), Math.abs(sy1 - sy0))
     }
 
-    // ── Selected element outlines ─────────────────────────────────────────
-    const layer = board.getActiveLayer()
-    if ((this.state.kind === 'selected' || this.state.kind === 'moving') && layer instanceof VectorLayer) {
-      const ids = this.state.ids
-      for (const id of ids) {
-        const bounds = layer.getBounds(id)
-        if (!bounds) continue
-        const tl = board.camera.worldToScreen(
-          bounds.x + layer.transform.x, bounds.y + layer.transform.y, W, H,
-        )
-        const br = board.camera.worldToScreen(
-          bounds.x + bounds.w + layer.transform.x, bounds.y + bounds.h + layer.transform.y, W, H,
-        )
-        const pad = 6
-        strokeCtx.strokeStyle = 'rgba(99,179,237,0.8)'
-        strokeCtx.lineWidth = 1.5
-        strokeCtx.setLineDash([])
-        strokeCtx.strokeRect(tl.x - pad, tl.y - pad, br.x - tl.x + pad * 2, br.y - tl.y + pad * 2)
-      }
+    // Bounding box + resize handles
+    if ((this.state.kind === 'selected' || this.state.kind === 'moving' || this.state.kind === 'resizing') && layer instanceof VectorLayer) {
+      const ids = 'ids' in this.state ? this.state.ids : []
+      const bounds = this.getCombinedBounds(layer, ids)
+      if (bounds) this.drawBoundingBox(strokeCtx, bounds, layer, board.camera, W, H)
     }
 
-    // ── Edit mode handles ─────────────────────────────────────────────────
-    const editSt = this.state
-    if (editSt.kind === 'editing' || editSt.kind === 'dragging-point') {
-      const id = editSt.id
+    // Edit mode handles
+    if (this.state.kind === 'editing' || this.state.kind === 'dragging-point') {
+      const id = this.state.id
       if (layer instanceof VectorLayer) {
         const path = layer.paths.find((p) => p.id === id)
-        if (path) {
-          this.drawEditHandles(strokeCtx, path.anchors, layer, board.camera, W, H)
-        }
+        if (path) this.drawEditHandles(strokeCtx, path.anchors, layer, board.camera, W, H)
       }
     }
 
     strokeCtx.restore()
   }
 
-  private drawEditHandles(
-    ctx: CanvasRenderingContext2D,
-    anchors: BezierAnchor[],
-    layer: VectorLayer,
-    camera: Camera,
-    W: number,
-    H: number,
-  ): void {
-    const toScreen = (wx: number, wy: number) =>
-      camera.worldToScreen(wx + layer.transform.x, wy + layer.transform.y, W, H)
+  // ── Bounding box drawing ──────────────────────────────────────────────────
 
-    // Draw handle lines first (behind circles)
-    ctx.strokeStyle = 'rgba(99,179,237,0.4)'
-    ctx.lineWidth = 1
-    ctx.setLineDash([3, 3])
-    for (const a of anchors) {
-      const as = toScreen(a.x, a.y)
-      if (a.handleIn) {
-        const hs = toScreen(a.handleIn.x, a.handleIn.y)
-        ctx.beginPath(); ctx.moveTo(as.x, as.y); ctx.lineTo(hs.x, hs.y); ctx.stroke()
-      }
-      if (a.handleOut) {
-        const hs = toScreen(a.handleOut.x, a.handleOut.y)
-        ctx.beginPath(); ctx.moveTo(as.x, as.y); ctx.lineTo(hs.x, hs.y); ctx.stroke()
-      }
-    }
+  private drawBoundingBox(ctx: CanvasRenderingContext2D, bounds: Bounds, layer: VectorLayer, camera: Camera, W: number, H: number): void {
+    const ts = (lx: number, ly: number) =>
+      camera.worldToScreen(lx + layer.transform.x, ly + layer.transform.y, W, H)
 
-    // Handle squares
+    const tl = ts(bounds.x, bounds.y)
+    const tr = ts(bounds.x + bounds.w, bounds.y)
+    const bl = ts(bounds.x, bounds.y + bounds.h)
+    const br = ts(bounds.x + bounds.w, bounds.y + bounds.h)
+
+    // Bounding box
     ctx.setLineDash([])
+    ctx.strokeStyle = 'rgba(99,179,237,0.8)'
     ctx.lineWidth = 1.5
-    for (const a of anchors) {
-      const drawHandle = (hx: number, hy: number) => {
-        const hs = toScreen(hx, hy)
-        ctx.fillStyle = '#fff'
-        ctx.strokeStyle = 'rgba(99,179,237,0.9)'
-        ctx.beginPath()
-        ctx.rect(hs.x - 4, hs.y - 4, 8, 8)
-        ctx.fill(); ctx.stroke()
-      }
-      if (a.handleIn) drawHandle(a.handleIn.x, a.handleIn.y)
-      if (a.handleOut) drawHandle(a.handleOut.x, a.handleOut.y)
-    }
+    ctx.beginPath()
+    ctx.moveTo(tl.x, tl.y); ctx.lineTo(tr.x, tr.y)
+    ctx.lineTo(br.x, br.y); ctx.lineTo(bl.x, bl.y)
+    ctx.closePath(); ctx.stroke()
 
-    // Anchor circles (drawn on top)
-    for (const a of anchors) {
-      const as = toScreen(a.x, a.y)
-      ctx.beginPath()
-      ctx.arc(as.x, as.y, HANDLE_RADIUS_SCREEN, 0, Math.PI * 2)
+    // 8 resize handles
+    const handles = this.getHandleScreenPositions(tl, tr, bl, br)
+    for (const [, pos] of Object.entries(handles)) {
+      const p = pos as { x: number; y: number }
       ctx.fillStyle = '#fff'
       ctx.strokeStyle = 'rgba(99,179,237,0.9)'
-      ctx.lineWidth = 2
-      ctx.fill(); ctx.stroke()
+      ctx.lineWidth = 1.5
+      ctx.fillRect(p.x - HANDLE_SIZE / 2, p.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
+      ctx.strokeRect(p.x - HANDLE_SIZE / 2, p.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
     }
   }
 
-  // ── Handle hit testing ────────────────────────────────────────────────────
+  private getHandleScreenPositions(tl: {x:number;y:number}, tr: {x:number;y:number}, bl: {x:number;y:number}, br: {x:number;y:number}) {
+    const mid = (a: {x:number;y:number}, b: {x:number;y:number}) => ({ x: (a.x+b.x)/2, y: (a.y+b.y)/2 })
+    return {
+      nw: tl, n: mid(tl, tr), ne: tr,
+      w: mid(tl, bl), e: mid(tr, br),
+      sw: bl, s: mid(bl, br), se: br,
+    }
+  }
 
-  private hitTestHandle(
-    sx: number, sy: number, id: string, layer: VectorLayer,
-  ): { id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut' } | null {
-    const board = this.board!
+  // ── Edit handles ──────────────────────────────────────────────────────────
+
+  private drawEditHandles(ctx: CanvasRenderingContext2D, anchors: BezierAnchor[], layer: VectorLayer, camera: Camera, W: number, H: number): void {
+    const ts = (lx: number, ly: number) => camera.worldToScreen(lx + layer.transform.x, ly + layer.transform.y, W, H)
+
+    // Handle lines (dashed)
+    ctx.strokeStyle = 'rgba(99,179,237,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([3, 3])
+    for (const a of anchors) {
+      const as = ts(a.x, a.y)
+      if (a.handleIn) { const hs = ts(a.handleIn.x, a.handleIn.y); ctx.beginPath(); ctx.moveTo(as.x, as.y); ctx.lineTo(hs.x, hs.y); ctx.stroke() }
+      if (a.handleOut) { const hs = ts(a.handleOut.x, a.handleOut.y); ctx.beginPath(); ctx.moveTo(as.x, as.y); ctx.lineTo(hs.x, hs.y); ctx.stroke() }
+    }
+
+    // Handle squares
+    ctx.setLineDash([]); ctx.lineWidth = 1.5
+    for (const a of anchors) {
+      const drawSq = (hx: number, hy: number) => {
+        const hs = ts(hx, hy)
+        ctx.fillStyle = '#fff'; ctx.strokeStyle = '#63b3ed'
+        ctx.fillRect(hs.x - 4, hs.y - 4, 8, 8); ctx.strokeRect(hs.x - 4, hs.y - 4, 8, 8)
+      }
+      if (a.handleIn) drawSq(a.handleIn.x, a.handleIn.y)
+      if (a.handleOut) drawSq(a.handleOut.x, a.handleOut.y)
+    }
+
+    // Anchor circles
+    ctx.lineWidth = 2
+    for (const a of anchors) {
+      const as = ts(a.x, a.y)
+      ctx.beginPath(); ctx.arc(as.x, as.y, 5, 0, Math.PI * 2)
+      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#63b3ed'; ctx.fill(); ctx.stroke()
+    }
+  }
+
+  // ── Hit testing ───────────────────────────────────────────────────────────
+
+  private hitTestResizeHandle(sx: number, sy: number, bounds: Bounds, layer: VectorLayer): ResizeHandle | null {
+    if (!this.board) return null
+    const board = this.board
+    const W = board.logicalWidth, H = board.logicalHeight
+    const ts = (lx: number, ly: number) =>
+      board.camera.worldToScreen(lx + layer.transform.x, ly + layer.transform.y, W, H)
+    const tl = ts(bounds.x, bounds.y)
+    const tr = ts(bounds.x + bounds.w, bounds.y)
+    const bl = ts(bounds.x, bounds.y + bounds.h)
+    const br = ts(bounds.x + bounds.w, bounds.y + bounds.h)
+    const handles = this.getHandleScreenPositions(tl, tr, bl, br)
+    const r2 = HIT_RADIUS * HIT_RADIUS
+    for (const [k, pos] of Object.entries(handles) as [ResizeHandle, {x:number;y:number}][]) {
+      if ((sx - pos.x) ** 2 + (sy - pos.y) ** 2 <= r2) return k
+    }
+    return null
+  }
+
+  private hitTestHandle(sx: number, sy: number, id: string, layer: VectorLayer): { id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut' } | null {
+    if (!this.board) return null
+    const board = this.board
     const W = board.logicalWidth, H = board.logicalHeight
     const path = layer.paths.find((p) => p.id === id)
     if (!path) return null
-
-    const toScreen = (wx: number, wy: number) =>
-      board.camera.worldToScreen(wx + layer.transform.x, wy + layer.transform.y, W, H)
-
-    const r2 = HANDLE_RADIUS_HIT * HANDLE_RADIUS_HIT
-    const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) =>
-      (a.x - b.x) ** 2 + (a.y - b.y) ** 2
-
+    const ts = (lx: number, ly: number) =>
+      board.camera.worldToScreen(lx + layer.transform.x, ly + layer.transform.y, W, H)
+    const r2 = HIT_RADIUS * HIT_RADIUS
+    const dist2 = (a: {x:number;y:number}, b: {x:number;y:number}) => (a.x-b.x)**2 + (a.y-b.y)**2
     for (let i = 0; i < path.anchors.length; i++) {
       const a = path.anchors[i]!
-      const as = toScreen(a.x, a.y)
-      if (dist2(as, { x: sx, y: sy }) <= r2) return { id, anchorIdx: i, part: 'anchor' }
-      if (a.handleIn) {
-        const hs = toScreen(a.handleIn.x, a.handleIn.y)
-        if (dist2(hs, { x: sx, y: sy }) <= r2) return { id, anchorIdx: i, part: 'handleIn' }
-      }
-      if (a.handleOut) {
-        const hs = toScreen(a.handleOut.x, a.handleOut.y)
-        if (dist2(hs, { x: sx, y: sy }) <= r2) return { id, anchorIdx: i, part: 'handleOut' }
-      }
+      if (dist2(ts(a.x, a.y), { x: sx, y: sy }) <= r2) return { id, anchorIdx: i, part: 'anchor' }
+      if (a.handleIn && dist2(ts(a.handleIn.x, a.handleIn.y), { x: sx, y: sy }) <= r2) return { id, anchorIdx: i, part: 'handleIn' }
+      if (a.handleOut && dist2(ts(a.handleOut.x, a.handleOut.y), { x: sx, y: sy }) <= r2) return { id, anchorIdx: i, part: 'handleOut' }
     }
     return null
+  }
+
+  // ── Bounds helpers ────────────────────────────────────────────────────────
+
+  getCombinedBounds(layer: VectorLayer, ids: string[]): Bounds | null {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const id of ids) {
+      const b = layer.getBounds(id)
+      if (!b) continue
+      minX = Math.min(minX, b.x); minY = Math.min(minY, b.y)
+      maxX = Math.max(maxX, b.x + b.w); maxY = Math.max(maxY, b.y + b.h)
+    }
+    if (minX === Infinity) return null
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+  }
+
+  // ── Resize math ───────────────────────────────────────────────────────────
+
+  private computeResize(handle: ResizeHandle, startBounds: Bounds, dWorldX: number, dWorldY: number, shiftLock: boolean, altCenter: boolean): { scaleX: number; scaleY: number; originX: number; originY: number } {
+    const { x, y, w, h } = startBounds
+
+    let newW = w, newH = h, newX = x, newY = y
+
+    const left = handle === 'nw' || handle === 'w' || handle === 'sw'
+    const right = handle === 'ne' || handle === 'e' || handle === 'se'
+    const top = handle === 'nw' || handle === 'n' || handle === 'ne'
+    const bottom = handle === 'sw' || handle === 's' || handle === 'se'
+
+    if (right) newW = Math.max(1, w + dWorldX)
+    if (left) { newX = x + dWorldX; newW = Math.max(1, w - dWorldX) }
+    if (bottom) newH = Math.max(1, h + dWorldY)
+    if (top) { newY = y + dWorldY; newH = Math.max(1, h - dWorldY) }
+
+    // Shift: maintain aspect ratio
+    if (shiftLock && (right || left) && (top || bottom)) {
+      const ratio = w / h
+      if (Math.abs(newW - w) >= Math.abs(newH - h)) {
+        newH = newW / ratio
+        if (top) newY = y + h - newH
+      } else {
+        newW = newH * ratio
+        if (left) newX = x + w - newW
+      }
+    }
+
+    const scaleX = newW / w
+    const scaleY = newH / h
+
+    // Origin is the FIXED corner (opposite to the dragged handle)
+    let originX = left ? x + w : x
+    let originY = top ? y + h : y
+    if (!left && !right) originX = x + w / 2
+    if (!top && !bottom) originY = y + h / 2
+
+    // Alt: resize from center
+    if (altCenter) { originX = x + w / 2; originY = y + h / 2 }
+
+    return { scaleX, scaleY, originX, originY }
+  }
+
+  // ── Snapshot helpers ──────────────────────────────────────────────────────
+
+  private snapshotElement(layer: VectorLayer, id: string): ElementSnapshot {
+    const stroke = layer.strokes.find((s) => s.id === id)
+    if (stroke) return { id, strokePoints: stroke.points.map((p) => ({ ...p })) }
+    const path = layer.paths.find((p) => p.id === id)
+    if (path) return {
+      id, pathAnchors: path.anchors.map((a) => ({
+        ...a,
+        handleIn: a.handleIn ? { ...a.handleIn } : null,
+        handleOut: a.handleOut ? { ...a.handleOut } : null,
+      })),
+    }
+    return { id }
+  }
+
+  private restoreElement(layer: VectorLayer, snap: ElementSnapshot): void {
+    const stroke = layer.strokes.find((s) => s.id === snap.id)
+    if (stroke && snap.strokePoints) { stroke.points = snap.strokePoints.map((p) => ({ ...p })); return }
+    const path = layer.paths.find((p) => p.id === snap.id)
+    if (path && snap.pathAnchors) {
+      path.anchors = snap.pathAnchors.map((a) => ({
+        ...a,
+        handleIn: a.handleIn ? { ...a.handleIn } : null,
+        handleOut: a.handleOut ? { ...a.handleOut } : null,
+      }))
+    }
+  }
+
+  // ── History ───────────────────────────────────────────────────────────────
+
+  private pushHistory(board: typeof this.board & {}, layer: VectorLayer, ids: string[], snaps: ElementSnapshot[]): void {
+    if (!board) return
+    const afters = ids.map((id) => this.snapshotElement(layer, id))
+    board.history.push({
+      undo: () => { for (const s of snaps) this.restoreElement(layer, s); board.markDirty() },
+      redo: () => { for (const s of afters) this.restoreElement(layer, s); board.markDirty() },
+    })
+  }
+
+  // ── Cursor ────────────────────────────────────────────────────────────────
+
+  private resizeCursor(handle: ResizeHandle): string {
+    const map: Record<ResizeHandle, string> = {
+      nw: 'nw-resize', n: 'n-resize', ne: 'ne-resize',
+      w: 'w-resize', e: 'e-resize',
+      sw: 'sw-resize', s: 's-resize', se: 'se-resize',
+    }
+    return map[handle]
   }
 }

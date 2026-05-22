@@ -11,13 +11,13 @@ import { useBoard } from '@sketchboard/react'
 import { useFreeformStore } from './store'
 import { TopBar } from './components/TopBar'
 import { Toolbar } from './components/Toolbar'
-import { ToolOptionsPanel } from './components/ToolOptionsPanel'
 import { ColorPickerPopup } from './components/ColorPickerPopup'
 import { LayerPanel } from './components/LayerPanel'
 import { BrushCursor } from './components/BrushCursor'
 import { CanvasBackground } from './components/Background'
 import { LayerMismatchPrompt } from './components/LayerMismatchPrompt'
 import { DrawBlockedToast } from './components/DrawBlockedToast'
+import { EyedropperMagnifier } from './components/EyedropperMagnifier'
 import type { ToolId } from './types'
 
 const LAYER_W = 3840
@@ -53,7 +53,10 @@ function useFreeformSetup(board: Board | null) {
       deleteEl:    { key: 'Delete',    description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       deleteElBS:  { key: 'Backspace', description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       finishPath:  { key: 'Enter',  description: 'Finish vector path', handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.finishPath() },
-      cancelPath:  { key: 'Escape', description: 'Cancel vector path', handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.cancelPath() },
+      cancelPath:  { key: 'Escape', description: 'Cancel path / exit edit', handler: (b) => {
+        b.getTool<VectorPenTool>('vectorpen')?.cancelPath()
+        b.getTool<SelectTool>('select')?.exitEditMode()
+      }},
     }))
 
     // 3. Store hooks — subscribe BEFORE creating layers so events fire correctly
@@ -143,11 +146,11 @@ export function FreeformTemplate() {
 
       <BrushCursor />
       <TopBar />
-      <ToolOptionsPanel />
       <Toolbar />
 
       <LayerMismatchPrompt />
       <DrawBlockedToast />
+      <EyedropperMagnifier />
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>

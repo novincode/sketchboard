@@ -48,9 +48,10 @@ export function ContextMenu({ x, y, entries, onClose }: Props) {
   return createPortal(
     <div
       ref={ref}
-      className="fixed z-[9999] w-48 rounded-xl border border-white/10 bg-[#161616]/95 py-1.5 shadow-2xl backdrop-blur-xl"
+      className="fixed z-9999 w-48 rounded-xl border border-white/10 bg-[#161616]/95 py-1.5 shadow-2xl backdrop-blur-xl"
       style={{ left: sx, top: sy }}
       onContextMenu={(e) => e.preventDefault()}
+      onMouseDown={(e) => e.stopPropagation()}  // prevents LayerPanel's outside-click from firing
     >
       {entries.map((entry, i) => {
         if ('separator' in entry) {

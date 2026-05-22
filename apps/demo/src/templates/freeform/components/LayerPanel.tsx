@@ -1,9 +1,10 @@
 'use client'
 
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, forwardRef, useCallback } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Eye, EyeOff, Plus, Trash2, Layers, PenLine,
-  ChevronDown, ChevronUp, Copy, Eraser, Pipette,
+  ChevronDown, ChevronUp, Copy, Eraser,
 } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import { useFreeformStore } from '../store'
@@ -40,6 +41,7 @@ export function LayerPanel() {
   return (
     <div
       ref={ref}
+      data-layer-panel
       className="fixed right-3 top-14 z-50 flex flex-col rounded-2xl border border-white/10 bg-[#111]/92 shadow-2xl backdrop-blur-xl overflow-hidden"
       style={{ width: 280, maxHeight: 'calc(100vh - 5.5rem)' }}
     >
@@ -154,19 +156,13 @@ function BackgroundLayerRow({
         {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
       </button>
 
-      {/* Color picker popup */}
+      {/* Color picker popup — fixed position to stay in viewport */}
       {showPicker && (
-        <div
+        <PickerPopup
           ref={pickerRef}
-          className="absolute right-0 top-full z-50 mt-2 rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <HexColorPicker color={color} onChange={onColorChange} />
-          <div className="mt-2 flex items-center gap-2">
-            <div className="h-6 w-6 rounded-md border border-white/20" style={{ backgroundColor: color }} />
-            <span className="font-mono text-xs text-white/50">{color}</span>
-          </div>
-        </div>
+          color={color}
+          onChange={onColorChange}
+        />
       )}
     </div>
   )
@@ -303,3 +299,44 @@ function LayerRow({
     </>
   )
 }
+
+// ─── Color picker popup (portalled, always stays in viewport) ──────────────────
+
+const PickerPopup = forwardRef<HTMLDivElement, {
+  color: string
+  onChange: (hex: string) => void
+}>(function PickerPopup({ color, onChange }, ref) {
+  if (typeof document === 'undefined') return null
+
+  // Calculate position synchronously (no useEffect) to avoid the position-jump flash
+  const panel = document.querySelector('[data-layer-panel]') as HTMLElement | null
+  const PICKER_H = 292
+  const PICKER_W = 260
+  let left = window.innerWidth - PICKER_W - 16
+  let top = 0
+
+  if (panel) {
+    const rect = panel.getBoundingClientRect()
+    left = rect.left
+    const spaceBelow = window.innerHeight - rect.bottom
+    top = spaceBelow >= PICKER_H + 8 ? rect.bottom + 4 : rect.top - PICKER_H - 4
+  }
+
+  return createPortal(
+    <div
+      ref={ref}
+      className="fixed z-9999 rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
+      style={{ left, top, width: PICKER_W }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <p className="mb-2 text-[10px] uppercase tracking-widest text-white/30 font-semibold">Background Color</p>
+      <HexColorPicker color={color} onChange={onChange} style={{ width: '100%' }} />
+      <div className="mt-2.5 flex items-center gap-2">
+        <div className="h-7 flex-1 rounded-lg border border-white/10" style={{ backgroundColor: color }} />
+        <span className="font-mono text-xs text-white/40">{color.toUpperCase()}</span>
+      </div>
+    </div>,
+    document.body,
+  )
+})
