@@ -17,8 +17,12 @@ interface ElementSnapshot {
   pathAnchors?: BezierAnchor[]
 }
 
+const DRAG_THRESHOLD = 4   // px of movement before rect-select activates
+
 type SelectState =
   | { kind: 'idle' }
+  // Pointer is down on empty space — deselect on release, begin rect-select on drag
+  | { kind: 'pending-select'; sx: number; sy: number }
   | { kind: 'selecting'; sx0: number; sy0: number; sx1: number; sy1: number; additive: boolean }
   | { kind: 'selected'; ids: string[] }
   | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[] }
@@ -171,15 +175,24 @@ export class SelectTool extends Tool {
       }
     }
 
-    // ── Start rectangle selection ──────────────────────────────────────────
-    this.state = { kind: 'selecting', sx0: e.x, sy0: e.y, sx1: e.x, sy1: e.y, additive }
-    board.canvas.style.cursor = 'crosshair'
+    // ── Click on empty space: deselect now, start rect-select only if user drags ─
+    this.state = { kind: 'pending-select', sx: e.x, sy: e.y }
+    board.canvas.style.cursor = 'default'
     this.scheduleOverlayRedraw()
   }
 
   onPointerMove(e: PointerData): void {
     if (!this.board) return
     const board = this.board
+
+    if (this.state.kind === 'pending-select') {
+      if (Math.hypot(e.x - this.state.sx, e.y - this.state.sy) > DRAG_THRESHOLD) {
+        this.state = { kind: 'selecting', sx0: this.state.sx, sy0: this.state.sy, sx1: e.x, sy1: e.y, additive: false }
+        board.canvas.style.cursor = 'crosshair'
+        this.scheduleOverlayRedraw()
+      }
+      return
+    }
 
     if (this.state.kind === 'selecting') {
       this.state.sx1 = e.x; this.state.sy1 = e.y
@@ -272,6 +285,14 @@ export class SelectTool extends Tool {
     const board = this.board
     const layer = board.getActiveLayer()
 
+    if (this.state.kind === 'pending-select') {
+      // Released without dragging → deselect
+      this.state = { kind: 'idle' }
+      board.canvas.style.cursor = 'default'
+      this.scheduleOverlayRedraw()
+      return
+    }
+
     if (this.state.kind === 'selecting') {
       const { sx0, sy0, sx1, sy1, additive } = this.state
       const minSx = Math.min(sx0, sx1), minSy = Math.min(sy0, sy1)
@@ -308,6 +329,7 @@ export class SelectTool extends Tool {
   }
 
   onPointerCancel(_e: PointerData): void {
+    if (this.state.kind === 'pending-select') { this.state = { kind: 'idle' }; this.scheduleOverlayRedraw(); return }
     this.state = { kind: 'idle' }
     this.board?.canvas.style.cursor ? (this.board.canvas.style.cursor = 'default') : null
     this.scheduleOverlayRedraw()

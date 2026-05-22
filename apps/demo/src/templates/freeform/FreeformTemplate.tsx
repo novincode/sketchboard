@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import type { Board } from '@sketchboard/core'
 import {
   PenTool, BrushTool, EraserTool,
@@ -42,8 +42,8 @@ function useFreeformSetup(board: Board | null) {
     board.registerTool('eyedropper', new EyedropperTool())
     board.setActiveTool('brush')
 
-    // 2. Keyboard shortcuts via plugin
-    board.use(new KeyboardPlugin({
+    // 2. Keyboard shortcuts via plugin (guard against hot-reload double-registration)
+    if (!board.plugins.has('keyboard')) board.use(new KeyboardPlugin({
       pencil:      null,  // not registered
       pen:         { key: 'p', description: 'Raster pen', handler: (b) => b.setActiveTool('pen') },
       brush:       { key: 'b', description: 'Raster brush', handler: (b) => b.setActiveTool('brush') },
@@ -110,6 +110,46 @@ function useFreeformSetup(board: Board | null) {
   }, [board, _setBoard, setBrushColor])
 }
 
+// Tracks the artboard screen rect via afterRender — no React re-renders, pure DOM
+function ArtboardCheckerboard({ board }: { board: Board }) {
+  const divRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const update = () => {
+      const el = divRef.current
+      if (!el) return
+      const W = board.logicalWidth, H = board.logicalHeight
+      const tl = board.camera.worldToScreen(0, 0, W, H)
+      const br = board.camera.worldToScreen(LAYER_W, LAYER_H, W, H)
+      el.style.left = `${tl.x}px`
+      el.style.top = `${tl.y}px`
+      el.style.width = `${br.x - tl.x}px`
+      el.style.height = `${br.y - tl.y}px`
+    }
+    const unsub = board.hooks.afterRender.tap('artboard-checker', update)
+    update()
+    return () => unsub()
+  }, [board])
+
+  return (
+    <div
+      ref={divRef}
+      className="absolute pointer-events-none"
+      style={{
+        backgroundImage: `
+          linear-gradient(45deg, #1e1e1e 25%, transparent 25%),
+          linear-gradient(-45deg, #1e1e1e 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, #1e1e1e 75%),
+          linear-gradient(-45deg, transparent 75%, #1e1e1e 75%)
+        `,
+        backgroundSize: '16px 16px',
+        backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0',
+        backgroundColor: '#141414',
+      }}
+    />
+  )
+}
+
 export function FreeformTemplate() {
   const { background, showColorPicker, showLayerPanel, activeToolId, backgroundLayerId, layers } = useFreeformStore()
   const [board, setBoard] = useState<Board | null>(null)
@@ -126,23 +166,34 @@ export function FreeformTemplate() {
 
   useFreeformSetup(board)
 
+  // Prevent Ctrl/Cmd+A from selecting all browser text while canvas is focused
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'a') e.preventDefault()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
   const hideCursor = HIDE_CURSOR_TOOLS.has(activeToolId)
 
-  // Show transparent checker when background layer is hidden
+  // Show transparent checker only in artboard area when background layer is hidden
   const bgLayer = layers.find((l) => l.id === backgroundLayerId)
   const bgHidden = bgLayer && !bgLayer.visible
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#0d0d0d]">
-      {bgHidden
-        ? <TransparentPattern />
-        : <CanvasBackground type={background} />}
+      {/* Canvas background pattern (dots/grid etc.) always shown for the outer area */}
+      <CanvasBackground type={background} />
 
       <div
         ref={containerRef}
         className="absolute inset-0"
         style={hideCursor ? { cursor: 'none' } : undefined}
       />
+
+      {/* Checkerboard overlay clipped to artboard area when bg layer is hidden */}
+      {bgHidden && board && <ArtboardCheckerboard board={board} />}
 
       <BrushCursor />
       <TopBar />
@@ -154,25 +205,5 @@ export function FreeformTemplate() {
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>
-  )
-}
-
-/** Modern transparent checkerboard shown when background is hidden */
-function TransparentPattern() {
-  return (
-    <div
-      className="absolute inset-0"
-      style={{
-        backgroundImage: `
-          linear-gradient(45deg, #1a1a1a 25%, transparent 25%),
-          linear-gradient(-45deg, #1a1a1a 25%, transparent 25%),
-          linear-gradient(45deg, transparent 75%, #1a1a1a 75%),
-          linear-gradient(-45deg, transparent 75%, #1a1a1a 75%)
-        `,
-        backgroundSize: '20px 20px',
-        backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0',
-        backgroundColor: '#141414',
-      }}
-    />
   )
 }

@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useRef, useCallback } from 'react'
+import React, { useRef, useCallback, useEffect } from 'react'
 import {
   Paintbrush, Pen, Eraser, Hand, Pipette, Spline,
   PenTool as PenToolIcon, MousePointer2, type LucideIcon,
@@ -9,8 +9,6 @@ import type { ToolId } from '../types'
 import { TOOLS } from '../types'
 import { useFreeformStore } from '../store'
 import { DraggableInput } from './DraggableInput'
-import { ContextMenu } from './ContextMenu'
-import type { ContextMenuAction } from './ContextMenu'
 import type { EraserMode } from '../types'
 
 // ─── Icon map ─────────────────────────────────────────────────────────────────
@@ -18,7 +16,7 @@ import type { EraserMode } from '../types'
 const ICON_MAP: Record<string, LucideIcon> = {
   select: MousePointer2,
   brush:  Paintbrush,
-  pen:    Pen,          // used when 'pen' is the active sub-tool of brush
+  pen:    Pen,
   eraser: Eraser,
   vector: Spline,
   vectorpen: PenToolIcon,
@@ -26,18 +24,14 @@ const ICON_MAP: Record<string, LucideIcon> = {
   hand:   Hand,
 }
 
-// Sub-tools for right-click menus
+// Sub-tools shown in the long-press / right-click popup
 const SUB_TOOLS: Partial<Record<string, Array<{ id: ToolId; label: string; shortcut: string }>>> = {
   brush:  [
     { id: 'brush', label: 'Raster Brush', shortcut: 'B' },
     { id: 'pen',   label: 'Raster Pen',   shortcut: 'P' },
   ],
-  select: [
-    { id: 'select', label: 'Rectangle Select', shortcut: 'V' },
-  ],
 }
 
-// Which toolbar slot owns a sub-tool
 const SUB_TOOL_PARENT: Partial<Record<ToolId, ToolId>> = { pen: 'brush' }
 
 // ─── Snap geometry ────────────────────────────────────────────────────────────
@@ -45,6 +39,12 @@ const SUB_TOOL_PARENT: Partial<Record<ToolId, ToolId>> = { pen: 'brush' }
 type SnapEdge = 'bottom' | 'left' | 'right' | 'top'
 const SNAP_THRESHOLD = 80
 const EDGE_MARGIN = 12
+const TOP_BAR_H = 52   // reserved for the top bar
+
+// Estimated toolbar pixel sizes — used for clamping. Generous so toolbar never clips.
+const TOOLBAR_CROSS_AXIS = 52   // thickness of toolbar perpendicular to snap edge
+const TOOLBAR_MAIN_ESTIMATED_H = 340  // vertical toolbar height estimate
+const TOOLBAR_MAIN_ESTIMATED_W = 310  // horizontal toolbar width estimate
 
 function computeSnap(pointerX: number, pointerY: number): { snap: SnapEdge; offset: number } {
   const vw = window.innerWidth, vh = window.innerHeight
@@ -56,7 +56,20 @@ function computeSnap(pointerX: number, pointerY: number): { snap: SnapEdge; offs
   return { snap: 'bottom', offset: relX }
 }
 
-// ─── FloatingToolbar (toolbar + tool options, always co-located) ──────────────
+function clampOffset(snap: SnapEdge, raw: number): number {
+  const vw = window.innerWidth, vh = window.innerHeight
+  if (snap === 'bottom' || snap === 'top') {
+    const half = TOOLBAR_MAIN_ESTIMATED_W / 2
+    const margin = EDGE_MARGIN + half
+    return Math.max(margin / vw, Math.min(1 - margin / vw, raw))
+  }
+  // left / right
+  const topEdge = (TOP_BAR_H + EDGE_MARGIN + TOOLBAR_MAIN_ESTIMATED_H / 2) / vh
+  const botEdge = 1 - (EDGE_MARGIN + TOOLBAR_MAIN_ESTIMATED_H / 2) / vh
+  return Math.max(topEdge, Math.min(botEdge, raw))
+}
+
+// ─── FloatingToolbar ──────────────────────────────────────────────────────────
 
 export function Toolbar() {
   const {
@@ -69,8 +82,9 @@ export function Toolbar() {
 
   const dragRef = useRef<{ startPX: number; startPY: number } | null>(null)
   const [subMenu, setSubMenu] = React.useState<{ x: number; y: number; toolId: string } | null>(null)
+  const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // ── Drag handling ────────────────────────────────────────────────────────────
+  // ── Drag handling ─────────────────────────────────────────────────────────
   const onGripDown = useCallback((e: React.PointerEvent) => {
     e.currentTarget.setPointerCapture(e.pointerId)
     dragRef.current = { startPX: e.clientX, startPY: e.clientY }
@@ -80,12 +94,25 @@ export function Toolbar() {
   const onGripMove = useCallback((e: React.PointerEvent) => {
     if (!e.currentTarget.hasPointerCapture(e.pointerId) || !dragRef.current) return
     const { snap, offset } = computeSnap(e.clientX, e.clientY)
-    setToolbarSnap(snap, offset)
+    setToolbarSnap(snap, clampOffset(snap, offset))
   }, [setToolbarSnap])
 
   const onGripUp = useCallback((e: React.PointerEvent) => {
     e.currentTarget.releasePointerCapture(e.pointerId)
     dragRef.current = null
+  }, [])
+
+  // ── Long-press / right-click for sub-tool menu ────────────────────────────
+  const startLongPress = useCallback((e: React.PointerEvent, toolId: string) => {
+    if (!SUB_TOOLS[toolId]) return
+    longPressRef.current = setTimeout(() => {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+      setSubMenu({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, toolId })
+    }, 500)
+  }, [])
+
+  const cancelLongPress = useCallback(() => {
+    if (longPressRef.current) { clearTimeout(longPressRef.current); longPressRef.current = null }
   }, [])
 
   const onToolRightClick = useCallback((e: React.MouseEvent, toolId: string) => {
@@ -94,32 +121,35 @@ export function Toolbar() {
     setSubMenu({ x: e.clientX, y: e.clientY, toolId })
   }, [])
 
+  // Close sub-menu on outside click
+  useEffect(() => {
+    if (!subMenu) return
+    const handler = () => setSubMenu(null)
+    window.addEventListener('pointerdown', handler, true)
+    return () => window.removeEventListener('pointerdown', handler, true)
+  }, [subMenu])
+
   const isVertical = toolbarSnap === 'left' || toolbarSnap === 'right'
-  const vw = typeof window !== 'undefined' ? window.innerWidth : 1440
-  const vh = typeof window !== 'undefined' ? window.innerHeight : 900
 
-  // Compute toolbar position
+  // ── Position calculation (clamped) ────────────────────────────────────────
+  const offset = clampOffset(toolbarSnap, toolbarEdgeOffset)
+
   let toolbarStyle: React.CSSProperties = {}
-  if (toolbarSnap === 'bottom') {
-    toolbarStyle = { position: 'fixed', bottom: EDGE_MARGIN, left: `${toolbarEdgeOffset * 100}%`, transform: 'translateX(-50%)' }
-  } else if (toolbarSnap === 'top') {
-    toolbarStyle = { position: 'fixed', top: EDGE_MARGIN + 40, left: `${toolbarEdgeOffset * 100}%`, transform: 'translateX(-50%)' }
-  } else if (toolbarSnap === 'left') {
-    toolbarStyle = { position: 'fixed', left: EDGE_MARGIN, top: `${toolbarEdgeOffset * 100}%`, transform: 'translateY(-50%)' }
-  } else {
-    toolbarStyle = { position: 'fixed', right: EDGE_MARGIN, top: `${toolbarEdgeOffset * 100}%`, transform: 'translateY(-50%)' }
-  }
-
-  // Compute options panel position (always adjacent to toolbar, on the "canvas" side)
   let optionsStyle: React.CSSProperties = {}
+
   if (toolbarSnap === 'bottom') {
-    optionsStyle = { position: 'fixed', bottom: `calc(${EDGE_MARGIN}px + 56px)`, left: `${toolbarEdgeOffset * 100}%`, transform: 'translateX(-50%)' }
+    toolbarStyle = { position: 'fixed', bottom: EDGE_MARGIN, left: `${offset * 100}%`, transform: 'translateX(-50%)' }
+    optionsStyle = { position: 'fixed', bottom: EDGE_MARGIN + TOOLBAR_CROSS_AXIS + 6, left: `${offset * 100}%`, transform: 'translateX(-50%)' }
   } else if (toolbarSnap === 'top') {
-    optionsStyle = { position: 'fixed', top: `calc(${EDGE_MARGIN + 40}px + 56px)`, left: `${toolbarEdgeOffset * 100}%`, transform: 'translateX(-50%)' }
+    const topPx = TOP_BAR_H + EDGE_MARGIN
+    toolbarStyle = { position: 'fixed', top: topPx, left: `${offset * 100}%`, transform: 'translateX(-50%)' }
+    optionsStyle = { position: 'fixed', top: topPx + TOOLBAR_CROSS_AXIS + 6, left: `${offset * 100}%`, transform: 'translateX(-50%)' }
   } else if (toolbarSnap === 'left') {
-    optionsStyle = { position: 'fixed', left: `calc(${EDGE_MARGIN}px + 60px)`, top: `${toolbarEdgeOffset * 100}%`, transform: 'translateY(-50%)' }
+    toolbarStyle = { position: 'fixed', left: EDGE_MARGIN, top: `${offset * 100}%`, transform: 'translateY(-50%)' }
+    optionsStyle = { position: 'fixed', left: EDGE_MARGIN + TOOLBAR_CROSS_AXIS + 6, top: `${offset * 100}%`, transform: 'translateY(-50%)' }
   } else {
-    optionsStyle = { position: 'fixed', right: `calc(${EDGE_MARGIN}px + 60px)`, top: `${toolbarEdgeOffset * 100}%`, transform: 'translateY(-50%)' }
+    toolbarStyle = { position: 'fixed', right: EDGE_MARGIN, top: `${offset * 100}%`, transform: 'translateY(-50%)' }
+    optionsStyle = { position: 'fixed', right: EDGE_MARGIN + TOOLBAR_CROSS_AXIS + 6, top: `${offset * 100}%`, transform: 'translateY(-50%)' }
   }
 
   // Icon for the brush slot: changes when 'pen' sub-tool is active
@@ -128,20 +158,18 @@ export function Toolbar() {
     return ICON_MAP[toolId] ?? Paintbrush
   }
 
-  // Highlight: the button highlights for its own id AND its sub-tools
   const isToolActive = (toolId: string): boolean => {
     if (activeToolId === toolId) return true
     return SUB_TOOL_PARENT[activeToolId] === toolId
   }
 
-  // Show options for pen as well (it's a brush sub-tool)
   const showOptions = !['pan', 'eyedropper', 'select'].includes(activeToolId)
 
   return (
     <>
-      {/* Tool options panel — adjacent to toolbar */}
+      {/* Tool options panel */}
       {showOptions && (
-        <div style={optionsStyle} className="z-40">
+        <div style={{ ...optionsStyle, zIndex: 40 }}>
           <div className={[
             'flex items-center gap-3 rounded-2xl border border-white/10 bg-black/82 px-4 py-3 shadow-xl backdrop-blur-xl',
             isVertical ? 'flex-col' : 'flex-row',
@@ -202,10 +230,13 @@ export function Toolbar() {
                 key={tool.id}
                 onClick={() => setActiveToolId(tool.id as ToolId)}
                 onContextMenu={(e) => onToolRightClick(e, tool.id)}
-                title={`${tool.label} (${tool.shortcut})${hasSubs ? ' · right-click for variants' : ''}`}
+                onPointerDown={(e) => startLongPress(e, tool.id)}
+                onPointerUp={cancelLongPress}
+                onPointerLeave={cancelLongPress}
+                title={`${tool.label} (${tool.shortcut})${hasSubs ? ' · hold for variants' : ''}`}
                 aria-pressed={active}
                 className={[
-                  'relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-100 focus:outline-none',
+                  'relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-100 focus:outline-none select-none',
                   active
                     ? 'bg-white/15 text-white ring-1 ring-white/35'
                     : 'text-white/40 hover:bg-white/8 hover:text-white/75',
@@ -224,19 +255,49 @@ export function Toolbar() {
         </div>
       </div>
 
-      {/* Sub-tool context menu */}
-      {subMenu && (
-        <ContextMenu
-          x={subMenu.x} y={subMenu.y}
-          entries={(SUB_TOOLS[subMenu.toolId] ?? []).map((sub) => ({
-            label: sub.label,
-            shortcut: sub.shortcut,
-            onClick: () => { setActiveToolId(sub.id) },
-          } satisfies ContextMenuAction))}
-          onClose={() => setSubMenu(null)}
-        />
-      )}
+      {/* Sub-tool popup — styled to match toolbar (not a context menu) */}
+      {subMenu && <SubToolPopup x={subMenu.x} y={subMenu.y} toolId={subMenu.toolId} snap={toolbarSnap} onSelect={(id) => { setActiveToolId(id); setSubMenu(null) }} />}
     </>
+  )
+}
+
+// ─── Sub-tool popup ───────────────────────────────────────────────────────────
+
+function SubToolPopup({ x, y, toolId, snap, onSelect }: {
+  x: number; y: number; toolId: string; snap: SnapEdge
+  onSelect: (id: ToolId) => void
+}) {
+  const subs = SUB_TOOLS[toolId] ?? []
+  const isVertical = snap === 'left' || snap === 'right'
+
+  // Position the popup on the "canvas" side of the toolbar
+  let style: React.CSSProperties = {}
+  if (snap === 'bottom')      style = { bottom: window.innerHeight - y + 10, left: x, transform: 'translateX(-50%)' }
+  else if (snap === 'top')    style = { top: y + 10, left: x, transform: 'translateX(-50%)' }
+  else if (snap === 'left')   style = { left: x + 10, top: y, transform: 'translateY(-50%)' }
+  else                        style = { right: window.innerWidth - x + 10, top: y, transform: 'translateY(-50%)' }
+
+  return (
+    <div
+      className={[
+        'fixed z-200 flex items-center gap-1 rounded-2xl border border-white/12 bg-black/92 p-1.5 shadow-2xl backdrop-blur-xl',
+        isVertical ? 'flex-col' : 'flex-row',
+      ].join(' ')}
+      style={style}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      {/* Arrow indicator */}
+      {subs.map((sub) => (
+        <button
+          key={sub.id}
+          onClick={() => onSelect(sub.id)}
+          className="flex items-center gap-2 rounded-xl px-3 py-2 text-xs text-white/70 hover:bg-white/10 hover:text-white transition whitespace-nowrap"
+        >
+          <span className="font-medium">{sub.label}</span>
+          <kbd className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] font-mono text-white/35">{sub.shortcut}</kbd>
+        </button>
+      ))}
+    </div>
   )
 }
 
@@ -264,7 +325,6 @@ function ToolOptions({
   vertical: boolean
 }) {
   const d = vertical ? 'flex flex-col gap-2 items-center' : 'flex flex-row gap-3 items-end'
-  const div = (key: string, content: React.ReactNode) => <div key={key} className={d}>{content}</div>
 
   if (activeToolId === 'pen' || activeToolId === 'brush') {
     return (

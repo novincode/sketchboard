@@ -10,6 +10,7 @@ import { HexColorPicker } from 'react-colorful'
 import { useFreeformStore } from '../store'
 import type { LayerType } from '../types'
 import { ContextMenu, useContextMenu } from './ContextMenu'
+import { DraggableInput } from './DraggableInput'
 
 const BLEND_MODES = [
   'normal', 'multiply', 'screen', 'overlay',
@@ -27,6 +28,7 @@ export function LayerPanel() {
   } = useFreeformStore()
 
   const ref = useRef<HTMLDivElement>(null)
+  const [showAddMenu, setShowAddMenu] = useState(false)
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -46,16 +48,44 @@ export function LayerPanel() {
       style={{ width: 280, maxHeight: 'calc(100vh - 5.5rem)' }}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-white/8">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-white/8 shrink-0">
         <span className="text-xs font-semibold text-white/70 tracking-wide">Layers</span>
-        <div className="flex items-center gap-1">
-          <AddBtn onClick={() => addLayer('raster')} label="Add Raster Layer" icon={<Layers size={12} />} />
-          <AddBtn onClick={() => addLayer('vector')} label="Add Vector Layer" icon={<PenLine size={12} />} />
+        <div className="relative">
+          <button
+            onClick={() => setShowAddMenu((p) => !p)}
+            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/45 hover:bg-white/10 hover:text-white/80 transition"
+            title="Add layer"
+          >
+            <Plus size={12} />
+          </button>
+          {showAddMenu && (
+            <div
+              className="absolute right-0 top-full mt-1.5 z-10 flex flex-col rounded-xl border border-white/10 bg-[#1a1a1a]/98 overflow-hidden shadow-2xl backdrop-blur-xl"
+              onMouseDown={(e) => e.stopPropagation()}
+            >
+              <button
+                onClick={() => { addLayer('raster'); setShowAddMenu(false) }}
+                className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition whitespace-nowrap"
+              >
+                <Layers size={13} className="text-blue-400/70" />
+                <span>Raster Layer</span>
+                <kbd className="ml-auto rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/25">PX</kbd>
+              </button>
+              <button
+                onClick={() => { addLayer('vector'); setShowAddMenu(false) }}
+                className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition whitespace-nowrap"
+              >
+                <PenLine size={13} className="text-purple-400/70" />
+                <span>Vector Layer</span>
+                <kbd className="ml-auto rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/25">VEC</kbd>
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Layer list */}
-      <div className="flex flex-col overflow-y-auto p-2 gap-0.5">
+      {/* Layer list — scrollable */}
+      <div className="flex flex-col overflow-y-auto p-2 gap-0.5 min-h-0">
         {reversed.map((layer) => {
           const isBg = layer.id === backgroundLayerId
           return isBg ? (
@@ -93,18 +123,6 @@ export function LayerPanel() {
         })}
       </div>
     </div>
-  )
-}
-
-function AddBtn({ onClick, label, icon }: { onClick: () => void; label: string; icon: React.ReactNode }) {
-  return (
-    <button
-      onClick={onClick}
-      title={label}
-      className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/45 hover:bg-white/10 hover:text-white/80 transition"
-    >
-      {icon}
-    </button>
   )
 }
 
@@ -156,7 +174,6 @@ function BackgroundLayerRow({
         {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
       </button>
 
-      {/* Color picker popup — fixed position to stay in viewport */}
       {showPicker && (
         <PickerPopup
           ref={pickerRef}
@@ -264,16 +281,16 @@ function LayerRow({
 
         {/* Expanded options */}
         {isActive && expanded && (
-          <div className="flex flex-col gap-2 px-4 pb-3 border-t border-white/6" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-2 pt-2">
-              <span className="text-[10px] text-white/35 w-14 shrink-0">Opacity</span>
-              <input
-                type="range" min={0} max={100}
+          <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1 border-t border-white/6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-2">
+              <DraggableInput
+                label="Opacity"
                 value={Math.round(opacity * 100)}
-                onChange={(e) => onOpacityChange(Number(e.target.value) / 100)}
-                className="flex-1 accent-white h-1"
+                min={0}
+                max={100}
+                unit="%"
+                onChange={(v) => onOpacityChange(v / 100)}
               />
-              <span className="font-mono text-[10px] text-white/30 w-8 text-right">{Math.round(opacity * 100)}%</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-[10px] text-white/35 w-14 shrink-0">Blend</span>
@@ -308,7 +325,6 @@ const PickerPopup = forwardRef<HTMLDivElement, {
 }>(function PickerPopup({ color, onChange }, ref) {
   if (typeof document === 'undefined') return null
 
-  // Calculate position synchronously (no useEffect) to avoid the position-jump flash
   const panel = document.querySelector('[data-layer-panel]') as HTMLElement | null
   const PICKER_H = 292
   const PICKER_W = 260
@@ -325,7 +341,7 @@ const PickerPopup = forwardRef<HTMLDivElement, {
   return createPortal(
     <div
       ref={ref}
-      className="fixed z-9999 rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
+      className="fixed z-[9999] rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
       style={{ left, top, width: PICKER_W }}
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}

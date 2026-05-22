@@ -164,16 +164,22 @@ export class VectorLayer extends Layer {
         if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x
         if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y
       }
-      return { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+      const r = stroke.lineWidth / 2
+      return { x: minX - r, y: minY - r, w: maxX - minX + stroke.lineWidth, h: maxY - minY + stroke.lineWidth }
     }
     const path = this.paths.find((p) => p.id === id)
     if (path && path.anchors.length > 0) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
       for (const a of path.anchors) {
-        if (a.x < minX) minX = a.x; if (a.x > maxX) maxX = a.x
-        if (a.y < minY) minY = a.y; if (a.y > maxY) maxY = a.y
+        // Include handles in bounds so the selection box contains bezier curves
+        for (const pt of [{ x: a.x, y: a.y }, a.handleIn, a.handleOut]) {
+          if (!pt) continue
+          if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x
+          if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y
+        }
       }
-      return { x: minX, y: minY, w: maxX - minX, h: maxY - minY }
+      const r = path.strokeWidth / 2
+      return { x: minX - r, y: minY - r, w: maxX - minX + path.strokeWidth, h: maxY - minY + path.strokeWidth }
     }
     return null
   }

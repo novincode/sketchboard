@@ -3,15 +3,17 @@
 import React, { useEffect, useRef } from 'react'
 import { useFreeformStore } from '../store'
 
-const MAGNIFIER_SIZE = 120   // diameter of the magnifier circle
-const ZOOM_FACTOR = 8        // how many times to magnify
-const CAPTURE_SIZE = Math.ceil(MAGNIFIER_SIZE / ZOOM_FACTOR)  // source pixels to sample
+const SIZE = 96           // diameter of loupe
+const ZOOM = 9            // magnification factor
+const CAPTURE = Math.ceil(SIZE / ZOOM)  // source pixel count
 
 export function EyedropperMagnifier() {
   const board = useFreeformStore((s) => s.board)
   const activeToolId = useFreeformStore((s) => s.activeToolId)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const hexRef = useRef<HTMLSpanElement>(null)
+  const swatchRef = useRef<HTMLSpanElement>(null)
   const posRef = useRef({ x: -999, y: -999 })
   const rafRef = useRef<number | null>(null)
 
@@ -22,15 +24,22 @@ export function EyedropperMagnifier() {
     const el = board.canvas.parentElement
     if (!el) return
 
-    const renderMagnifier = () => {
+    const render = () => {
       const canvas = canvasRef.current
       const container = containerRef.current
       if (!canvas || !container) return
       const { x, y } = posRef.current
       if (x < 0) return
 
-      container.style.left = `${x + 24}px`
-      container.style.top = `${y - MAGNIFIER_SIZE / 2}px`
+      // Position loupe: follow pointer, biased above-right, clamped to viewport
+      const margin = 16
+      let lx = x + 24
+      let ly = y - SIZE / 2
+      if (lx + SIZE > window.innerWidth - margin)  lx = x - SIZE - 24
+      if (ly < margin)                              ly = margin
+      if (ly + SIZE > window.innerHeight - margin)  ly = window.innerHeight - SIZE - margin
+      container.style.left = `${lx}px`
+      container.style.top  = `${ly}px`
 
       const dpr = window.devicePixelRatio ?? 1
       const boardCanvas = board.canvas
@@ -39,60 +48,58 @@ export function EyedropperMagnifier() {
 
       const physX = Math.round(x * dpr)
       const physY = Math.round(y * dpr)
-      const physCapture = Math.round(CAPTURE_SIZE * dpr)
+      const physCapture = Math.round(CAPTURE * dpr)
 
-      // Clear with a neutral background
-      ctx.clearRect(0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE)
-
-      // Clip to circle
+      // Draw magnified region
+      ctx.clearRect(0, 0, SIZE, SIZE)
       ctx.save()
       ctx.beginPath()
-      ctx.arc(MAGNIFIER_SIZE / 2, MAGNIFIER_SIZE / 2, MAGNIFIER_SIZE / 2, 0, Math.PI * 2)
+      ctx.arc(SIZE / 2, SIZE / 2, SIZE / 2, 0, Math.PI * 2)
       ctx.clip()
-
-      // Draw the magnified region
       ctx.imageSmoothingEnabled = false
       ctx.drawImage(
         boardCanvas,
         physX - physCapture / 2, physY - physCapture / 2,
         physCapture, physCapture,
-        0, 0,
-        MAGNIFIER_SIZE, MAGNIFIER_SIZE,
+        0, 0, SIZE, SIZE,
       )
       ctx.restore()
 
-      // Crosshair
-      const cx = MAGNIFIER_SIZE / 2
+      // Pixel grid lines — subtle, 1px
+      const cellPx = SIZE / CAPTURE
+      ctx.save()
+      ctx.beginPath()
+      ctx.arc(SIZE / 2, SIZE / 2, SIZE / 2, 0, Math.PI * 2)
+      ctx.clip()
+      ctx.strokeStyle = 'rgba(0,0,0,0.12)'
+      ctx.lineWidth = 0.5
+      for (let i = 0; i <= CAPTURE; i++) {
+        const p = i * cellPx
+        ctx.beginPath(); ctx.moveTo(p, 0); ctx.lineTo(p, SIZE); ctx.stroke()
+        ctx.beginPath(); ctx.moveTo(0, p); ctx.lineTo(SIZE, p); ctx.stroke()
+      }
+      ctx.restore()
+
+      // Center cell highlight
+      const cx = SIZE / 2 - cellPx / 2
+      const cy = SIZE / 2 - cellPx / 2
       ctx.strokeStyle = 'rgba(255,255,255,0.9)'
-      ctx.lineWidth = 1
-      ctx.beginPath()
-      ctx.moveTo(cx - 8, cx); ctx.lineTo(cx + 8, cx)
-      ctx.moveTo(cx, cx - 8); ctx.lineTo(cx, cx + 8)
-      ctx.stroke()
-
-      // Outer ring
-      ctx.strokeStyle = 'rgba(255,255,255,0.5)'
       ctx.lineWidth = 1.5
-      ctx.beginPath()
-      ctx.arc(cx, cx, MAGNIFIER_SIZE / 2 - 1, 0, Math.PI * 2)
-      ctx.stroke()
+      ctx.strokeRect(cx, cy, cellPx, cellPx)
 
-      // Center pixel highlight
-      const centerPixelSize = ZOOM_FACTOR
-      ctx.strokeStyle = 'rgba(255,255,255,0.8)'
-      ctx.lineWidth = 1
-      ctx.strokeRect(
-        cx - centerPixelSize / 2, cx - centerPixelSize / 2,
-        centerPixelSize, centerPixelSize,
-      )
+      // Sample the center pixel color
+      const px = ctx.getImageData(SIZE / 2, SIZE / 2, 1, 1).data
+      const hex = '#' + [px[0]!, px[1]!, px[2]!].map((c) => c.toString(16).padStart(2, '0')).join('')
+      if (hexRef.current) hexRef.current.textContent = hex.toUpperCase()
+      if (swatchRef.current) swatchRef.current.style.backgroundColor = hex
     }
 
     const onMove = (e: PointerEvent) => {
       const rect = el.getBoundingClientRect()
       posRef.current = { x: e.clientX - rect.left, y: e.clientY - rect.top }
-      if (containerRef.current) containerRef.current.style.display = 'block'
+      if (containerRef.current) containerRef.current.style.display = 'flex'
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
-      rafRef.current = requestAnimationFrame(renderMagnifier)
+      rafRef.current = requestAnimationFrame(render)
     }
 
     const onLeave = () => {
@@ -113,22 +120,31 @@ export function EyedropperMagnifier() {
   return (
     <div
       ref={containerRef}
-      className="pointer-events-none fixed z-200"
-      style={{
-        display: 'none',
-        width: MAGNIFIER_SIZE,
-        height: MAGNIFIER_SIZE,
-        borderRadius: '50%',
-        overflow: 'hidden',
-        boxShadow: '0 4px 24px rgba(0,0,0,0.5), 0 0 0 2px rgba(255,255,255,0.15)',
-      }}
+      className="pointer-events-none fixed z-200 flex flex-col items-center gap-1.5"
+      style={{ display: 'none', width: SIZE }}
     >
-      <canvas
-        ref={canvasRef}
-        width={MAGNIFIER_SIZE}
-        height={MAGNIFIER_SIZE}
-        style={{ display: 'block' }}
-      />
+      {/* Loupe */}
+      <div
+        style={{
+          width: SIZE,
+          height: SIZE,
+          borderRadius: '50%',
+          overflow: 'hidden',
+          border: '1px solid rgba(255,255,255,0.18)',
+          boxShadow: '0 2px 12px rgba(0,0,0,0.4), inset 0 0 0 1px rgba(0,0,0,0.3)',
+        }}
+      >
+        <canvas ref={canvasRef} width={SIZE} height={SIZE} style={{ display: 'block' }} />
+      </div>
+
+      {/* Hex label */}
+      <div className="flex items-center gap-1.5 rounded-lg bg-black/70 px-2.5 py-1 backdrop-blur-sm border border-white/10">
+        <span
+          ref={swatchRef}
+          className="inline-block h-2.5 w-2.5 rounded-sm border border-white/20"
+        />
+        <span ref={hexRef} className="font-mono text-[11px] text-white/75 tracking-wider">#000000</span>
+      </div>
     </div>
   )
 }
