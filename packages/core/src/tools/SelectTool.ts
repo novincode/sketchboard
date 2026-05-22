@@ -26,12 +26,15 @@ export class SelectTool extends Tool {
   private _lastDownY = 0
 
   onActivate(): void {
+    if (this.board) this.board.canvas.style.cursor = 'default'
     this._afterRenderUnsub = this.board?.hooks.afterRender.tap('select', () => {
-      this.scheduleOverlayRedraw()
+      // Only redraw when there's something to show (not every idle frame)
+      if (this.state.kind !== 'idle') this.scheduleOverlayRedraw()
     }) ?? null
   }
 
   onDeactivate(): void {
+    if (this.board) this.board.canvas.style.cursor = ''
     this._afterRenderUnsub?.()
     this._afterRenderUnsub = null
     this.board?.clearStrokeCanvas()

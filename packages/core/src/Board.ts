@@ -205,6 +205,10 @@ export class Board {
     return this.toolRegistry.get(name) as T | undefined
   }
 
+  hasTool(name: string): boolean {
+    return this.toolRegistry.has(name)
+  }
+
   // ─── Render ────────────────────────────────────────────────────────────────
 
   markDirty(): void {

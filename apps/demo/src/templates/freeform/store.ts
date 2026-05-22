@@ -163,7 +163,9 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     // ── Tool ──────────────────────────────────────────────────────────────
     setActiveToolId(id) {
       const { board } = get()
-      board?.setActiveTool(id)
+      if (board && board.hasTool(id)) {
+        board.setActiveTool(id)
+      }
       set({ activeToolId: id })
     },
 
@@ -221,7 +223,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       set((s) => ({ showLayerPanel: !s.showLayerPanel, showColorPicker: false })),
 
     // ── Layer management ──────────────────────────────────────────────────
-    addLayer(type = 'raster') {
+    addLayer(type: LayerType = 'raster') {
       const { board } = get()
       if (!board) return
       const n = board.getLayers().length + 1

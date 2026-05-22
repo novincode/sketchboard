@@ -22,6 +22,9 @@ import type { ToolId } from './types'
 const LAYER_W = 3840
 const LAYER_H = 2160
 
+/** Tools that hide the OS cursor and show the custom BrushCursor instead */
+const HIDE_CURSOR_TOOLS = new Set<ToolId>(['pen', 'brush', 'eraser', 'vector', 'vectorpen'])
+
 function useFreeformSetup(board: Board | null) {
   const { _setBoard, setBrushColor } = useFreeformStore()
 
@@ -39,30 +42,21 @@ function useFreeformSetup(board: Board | null) {
     board.registerTool('eyedropper', new EyedropperTool())
     board.setActiveTool('pen')
 
-    board.use(new KeyboardPlugin())
-
-    // Keyboard shortcuts for new tools
-    const onKeyDown = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName ?? ''
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
-      const map: Record<string, string> = {
-        v: 'select', p: 'pen', b: 'brush', e: 'eraser',
-        w: 'vector', q: 'vectorpen', h: 'pan', i: 'eyedropper',
-      }
-      const toolId = map[e.key.toLowerCase()]
-      if (toolId && !e.metaKey && !e.ctrlKey) {
-        board.setActiveTool(toolId)
-      }
-      // Delete selected (when SelectTool is active)
-      if ((e.key === 'Delete' || e.key === 'Backspace') && !e.metaKey) {
-        const selectTool = board.getTool<SelectTool>('select')
-        selectTool?.deleteSelected()
-      }
-      // Finish vectorpen path on Enter, cancel on Escape
-      if (e.key === 'Enter') board.getTool<VectorPenTool>('vectorpen')?.finishPath()
-      if (e.key === 'Escape') board.getTool<VectorPenTool>('vectorpen')?.cancelPath()
-    }
-    window.addEventListener('keydown', onKeyDown)
+    // Single keyboard plugin handles ALL shortcuts
+    board.use(new KeyboardPlugin({
+      // Disable pencil (not registered)
+      pencil: null,
+      // New tools
+      selectTool:  { key: 'v', description: 'Select',       handler: (b) => b.setActiveTool('select') },
+      vectorBrush: { key: 'w', description: 'Vector brush', handler: (b) => b.setActiveTool('vector') },
+      vectorPen:   { key: 'q', description: 'Vector pen',   handler: (b) => b.setActiveTool('vectorpen') },
+      // Delete selected vector elements
+      deleteEl:    { key: 'Delete',    description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
+      deleteElBS:  { key: 'Backspace', description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
+      // Pen path control
+      finishPath:  { key: 'Enter',  description: 'Finish path',  handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.finishPath() },
+      cancelPath:  { key: 'Escape', description: 'Cancel path',  handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.cancelPath() },
+    }))
 
     // CRITICAL: use setState directly — calling setActiveToolId loops back through board
     const unsubColor = board.hooks.colorPicked.tap('freeform', ({ color }) => {
@@ -85,17 +79,16 @@ function useFreeformSetup(board: Board | null) {
     return () => {
       unsubColor()
       unsubTool()
-      window.removeEventListener('keydown', onKeyDown)
       _setBoard(null)
     }
   }, [board, _setBoard, setBrushColor])
 }
 
 export function FreeformTemplate() {
-  const { background, showColorPicker, showLayerPanel } = useFreeformStore()
+  const { background, showColorPicker, showLayerPanel, activeToolId } = useFreeformStore()
   const [board, setBoard] = useState<Board | null>(null)
 
-  const handleReady = useCallback((b: Board) => setBoard(b), [])
+  const handleReady  = useCallback((b: Board) => setBoard(b), [])
   const handleDestroy = useCallback(() => setBoard(null), [])
 
   const { containerRef } = useBoard({
@@ -107,15 +100,18 @@ export function FreeformTemplate() {
 
   useFreeformSetup(board)
 
+  // Only hide OS cursor for drawing tools so Select/Pan/Eyedropper work normally
+  const hideCursor = HIDE_CURSOR_TOOLS.has(activeToolId)
+
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-[#0d0d0d]">
       <CanvasBackground type={background} />
 
-      {/* Board canvas + stroke overlay injected into this div */}
+      {/* Board canvas + stroke overlay injected by Board into this div */}
       <div
         ref={containerRef}
         className="absolute inset-0"
-        style={{ cursor: 'none' }}
+        style={hideCursor ? { cursor: 'none' } : undefined}
       />
 
       <BrushCursor />
