@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool } from '@sketchboard/core'
+import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool, FillTool, FillPlacement } from '@sketchboard/core'
 import { Color, RasterLayer, VectorLayer } from '@sketchboard/core'
 import type { ToolId, Background, EraserMode, LayerType } from './types'
 import { RASTER_BRUSH_PRESETS, DEFAULT_BRUSH_PRESET_ID } from './brushPresets'
@@ -34,6 +34,9 @@ interface FreeformState {
   vectorSize: number
   vectorOpacity: number
   vectorBrushMerge: boolean
+
+  fillTolerance: number
+  fillPlacement: FillPlacement
 
   /** Active raster brush preset id */
   activeBrushPresetId: string
@@ -72,6 +75,9 @@ interface FreeformActions {
   setVectorOpacity(opacity: number): void
   setVectorBrushMerge(merge: boolean): void
 
+  setFillTolerance(tolerance: number): void
+  setFillPlacement(placement: FillPlacement): void
+
   setActiveBrushPreset(id: string): void
 
   setBackground(bg: Background): void
@@ -106,6 +112,8 @@ function applyBrushColor(board: Board, hex: string) {
   if (vec) vec.settings.color = color
   const pen = board.getTool<VectorPenTool>('vectorpen')
   if (pen) pen.settings.strokeColor = hex
+  const fill = board.getTool<FillTool>('fill')
+  if (fill) fill.settings.color = hex
 }
 
 function applyBrushSize(board: Board, size: number) {
@@ -156,7 +164,7 @@ function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
 export const useFreeformStore = create<FreeformState & FreeformActions>()(
   subscribeWithSelector((set, get) => ({
     board: null,
-    activeToolId: 'pen',
+    activeToolId: 'brush',
     brushSize: 8,
     brushOpacity: 1,
     brushHardness: 0.85,
@@ -166,6 +174,8 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     vectorSize: 4,
     vectorOpacity: 1,
     vectorBrushMerge: false,
+    fillTolerance: 32,
+    fillPlacement: 'back' as FillPlacement,
     activeBrushPresetId: DEFAULT_BRUSH_PRESET_ID,
     brushPressureSize: true,
     brushPressureOpacity: false,
@@ -280,6 +290,20 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const tool = board?.getTool<VectorBrushTool>('vector')
       if (tool) tool.settings.merge = merge
       set({ vectorBrushMerge: merge })
+    },
+
+    // ── Fill tool ─────────────────────────────────────────────────────────
+    setFillTolerance(tolerance) {
+      const { board } = get()
+      const tool = board?.getTool<FillTool>('fill')
+      if (tool) tool.settings.tolerance = tolerance
+      set({ fillTolerance: tolerance })
+    },
+    setFillPlacement(placement) {
+      const { board } = get()
+      const tool = board?.getTool<FillTool>('fill')
+      if (tool) tool.settings.placement = placement
+      set({ fillPlacement: placement })
     },
 
     // ── UI ────────────────────────────────────────────────────────────────

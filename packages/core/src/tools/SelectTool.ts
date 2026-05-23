@@ -408,6 +408,19 @@ export class SelectTool extends Tool {
     this.scheduleOverlayRedraw()
   }
 
+  /**
+   * Externally set a selection (e.g. from LassoSelectTool after polygon selection).
+   * Puts the tool into 'selected' state with the given ids.
+   */
+  setSelectedIds(ids: string[]): void {
+    if (ids.length === 0) {
+      this.state = { kind: 'idle' }
+    } else {
+      this.state = { kind: 'selected', ids }
+    }
+    this.scheduleOverlayRedraw()
+  }
+
   /** Escape exits edit mode or clears selection. */
   exitEditMode(): void {
     const k = this.state.kind

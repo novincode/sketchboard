@@ -1,44 +1,120 @@
 'use client'
 
-import React from 'react'
-import { Undo2, Redo2, Layers, Download } from 'lucide-react'
+import React, { useRef, useState, useEffect } from 'react'
+import { MoreHorizontal, Undo2, Redo2, Layers, Download, type LucideIcon } from 'lucide-react'
 import { useFreeformStore } from '../store'
+import { TOOL_DEFS } from '../toolDefs'
+
+const TOP_BAR_H = 48  // px — must match CLAUDE constant used elsewhere
+
+// ─── TopBar ───────────────────────────────────────────────────────────────────
 
 export function TopBar() {
-  const { board, showLayerPanel, toggleLayerPanel, exportPng } = useFreeformStore()
+  const { board, activeToolId, showLayerPanel, toggleLayerPanel, exportPng } = useFreeformStore()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!menuOpen) return
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [menuOpen])
+
+  const def = TOOL_DEFS[activeToolId]
+  const OptionsPanel = def?.OptionsPanel ?? null
 
   return (
-    <div className="fixed top-3 left-0 right-0 z-50 flex items-center justify-between px-4 pointer-events-none">
-      {/* Left: undo / redo */}
-      <div className="flex items-center gap-1 pointer-events-auto">
-        <IconBtn onClick={() => board?.history.undo()} label="Undo (⌘Z)">
-          <Undo2 size={15} strokeWidth={1.8} />
-        </IconBtn>
-        <IconBtn onClick={() => board?.history.redo()} label="Redo (⌘⇧Z)">
-          <Redo2 size={15} strokeWidth={1.8} />
-        </IconBtn>
-      </div>
+    <div
+      className="fixed top-0 left-0 right-0 z-50 flex items-center"
+      style={{ height: TOP_BAR_H, paddingLeft: 12, paddingRight: 12 }}
+    >
+      {/* Frosted pill that spans the full top bar */}
+      <div className="flex flex-1 items-center gap-3 rounded-2xl border border-white/10 bg-black/75 px-3 shadow-xl backdrop-blur-xl" style={{ height: 38 }}>
 
-      {/* Right: layers + export */}
-      <div className="flex items-center gap-1.5 pointer-events-auto">
-        <IconBtn onClick={toggleLayerPanel} label="Layers" active={showLayerPanel}>
-          <Layers size={15} strokeWidth={1.8} />
-        </IconBtn>
-        <IconBtn onClick={() => exportPng()} label="Export PNG">
-          <Download size={15} strokeWidth={1.8} />
-        </IconBtn>
+        {/* Left: ··· menu */}
+        <div className="relative shrink-0" ref={menuRef}>
+          <button
+            onClick={() => setMenuOpen((o) => !o)}
+            title="Menu"
+            className={[
+              'flex h-7 w-7 items-center justify-center rounded-lg transition-all focus:outline-none',
+              menuOpen
+                ? 'bg-white/15 text-white ring-1 ring-white/25'
+                : 'text-white/45 hover:bg-white/8 hover:text-white/80',
+            ].join(' ')}
+          >
+            <MoreHorizontal size={15} strokeWidth={1.8} />
+          </button>
+
+          {menuOpen && (
+            <div className="absolute left-0 top-full mt-1.5 z-200 flex flex-col overflow-hidden rounded-xl border border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur-xl min-w-40">
+              <MenuAction Icon={Undo2} label="Undo" shortcut="⌘Z" onClick={() => { board?.history.undo(); setMenuOpen(false) }} />
+              <MenuAction Icon={Redo2} label="Redo" shortcut="⌘⇧Z" onClick={() => { board?.history.redo(); setMenuOpen(false) }} />
+            </div>
+          )}
+        </div>
+
+        <div className="h-5 w-px rounded bg-white/10 shrink-0" />
+
+        {/* Center: active tool name + dynamic options */}
+        <div className="flex flex-1 items-center gap-3 min-w-0 overflow-hidden">
+          {def && (
+            <span className="text-[10px] font-semibold uppercase tracking-widest text-white/35 shrink-0">
+              {def.label}
+            </span>
+          )}
+          {def && OptionsPanel && (
+            <>
+              <div className="h-5 w-px rounded bg-white/10 shrink-0" />
+              <div className="flex items-center min-w-0 overflow-x-auto scrollbar-hide">
+                <OptionsPanel />
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="h-5 w-px rounded bg-white/10 shrink-0" />
+
+        {/* Right: layers + export */}
+        <div className="flex items-center gap-1 shrink-0">
+          <IconBtn onClick={toggleLayerPanel} label="Layers" active={showLayerPanel}>
+            <Layers size={14} strokeWidth={1.8} />
+          </IconBtn>
+          <IconBtn onClick={() => exportPng()} label="Export PNG">
+            <Download size={14} strokeWidth={1.8} />
+          </IconBtn>
+        </div>
       </div>
     </div>
   )
 }
 
+// ─── Menu action ──────────────────────────────────────────────────────────────
+
+function MenuAction({ Icon, label, shortcut, onClick }: {
+  Icon: LucideIcon; label: string; shortcut?: string; onClick: () => void
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition"
+    >
+      <Icon size={13} strokeWidth={1.8} className="text-white/40" />
+      <span className="flex-1 text-left">{label}</span>
+      {shortcut && <kbd className="ml-4 rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/30">{shortcut}</kbd>}
+    </button>
+  )
+}
+
+// ─── Icon button ──────────────────────────────────────────────────────────────
+
 function IconBtn({
   onClick, label, active = false, children,
 }: {
-  onClick: () => void
-  label: string
-  active?: boolean
-  children: React.ReactNode
+  onClick: () => void; label: string; active?: boolean; children: React.ReactNode
 }) {
   return (
     <button
@@ -46,11 +122,10 @@ function IconBtn({
       title={label}
       aria-label={label}
       className={[
-        'flex h-8 w-8 items-center justify-center rounded-xl transition-all duration-100 focus:outline-none',
-        // Always has a visible dark pill — readable on any background
+        'flex h-7 w-7 items-center justify-center rounded-lg transition-all duration-100 focus:outline-none',
         active
-          ? 'bg-blue-500/25 text-blue-300 ring-1 ring-blue-500/50 shadow-lg'
-          : 'bg-black/50 text-white/65 ring-1 ring-white/10 hover:bg-black/70 hover:text-white shadow-md backdrop-blur-lg',
+          ? 'bg-blue-500/20 text-blue-300 ring-1 ring-blue-500/40'
+          : 'text-white/50 hover:bg-white/8 hover:text-white/80',
       ].join(' ')}
     >
       {children}

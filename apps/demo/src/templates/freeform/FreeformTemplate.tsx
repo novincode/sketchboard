@@ -6,6 +6,7 @@ import {
   PenTool, BrushTool, EraserTool,
   PanTool, EyedropperTool, KeyboardPlugin,
   RasterLayer, VectorBrushTool, VectorPenTool, SelectTool,
+  FillTool, LassoSelectTool,
 } from '@sketchboard/core'
 import { useBoard } from '@sketchboard/react'
 import { useFreeformStore } from './store'
@@ -23,7 +24,7 @@ import type { ToolId } from './types'
 const LAYER_W = 3840
 const LAYER_H = 2160
 
-const HIDE_CURSOR_TOOLS = new Set<ToolId>(['pen', 'brush', 'eraser', 'vector', 'vectorpen'])
+const HIDE_CURSOR_TOOLS = new Set<ToolId>(['pen', 'brush', 'eraser', 'fill', 'vector', 'vectorpen'])
 
 function useFreeformSetup(board: Board | null) {
   const { _setBoard, setBrushColor } = useFreeformStore()
@@ -33,9 +34,11 @@ function useFreeformSetup(board: Board | null) {
 
     // 1. Register all tools
     board.registerTool('select',     new SelectTool())
+    board.registerTool('lasso',      new LassoSelectTool())
     board.registerTool('pen',        new PenTool())
     board.registerTool('brush',      new BrushTool())
     board.registerTool('eraser',     new EraserTool())
+    board.registerTool('fill',       new FillTool())
     board.registerTool('vector',     new VectorBrushTool())
     board.registerTool('vectorpen',  new VectorPenTool())
     board.registerTool('pan',        new PanTool())
@@ -45,11 +48,17 @@ function useFreeformSetup(board: Board | null) {
     // 2. Keyboard shortcuts via plugin (guard against hot-reload double-registration)
     if (!board.plugins.has('keyboard')) board.use(new KeyboardPlugin({
       pencil:      null,  // not registered
-      pen:         { key: 'p', description: 'Raster pen', handler: (b) => b.setActiveTool('pen') },
+      // Raster: B = brush, Shift+B = raster pen (cycles sibling)
+      pen:         null,  // raster pen no longer has its own shortcut key
       brush:       { key: 'b', description: 'Raster brush', handler: (b) => b.setActiveTool('brush') },
+      rasterPen:   { key: 'b', shift: true, description: 'Raster pen (Shift+B)', handler: (b) => b.setActiveTool('pen') },
+      // Select: V = rect select, Shift+V = lasso
       selectTool:  { key: 'v', description: 'Select',       handler: (b) => b.setActiveTool('select') },
+      lassoTool:   { key: 'v', shift: true, description: 'Lasso select (Shift+V)', handler: (b) => b.setActiveTool('lasso') },
+      // Other tools
       vectorBrush: { key: 'w', description: 'Vector brush', handler: (b) => b.setActiveTool('vector') },
-      vectorPen:   { key: 'q', description: 'Vector pen',   handler: (b) => b.setActiveTool('vectorpen') },
+      vectorPen:   { key: 'p', description: 'Vector pen',   handler: (b) => b.setActiveTool('vectorpen') },
+      fillTool:    { key: 'f', description: 'Fill',         handler: (b) => b.setActiveTool('fill') },
       deleteEl:    { key: 'Delete',    description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       deleteElBS:  { key: 'Backspace', description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       finishPath:  { key: 'Enter',  description: 'Finish vector path', handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.finishPath() },
@@ -186,14 +195,14 @@ export function FreeformTemplate() {
       {/* Canvas background pattern (dots/grid etc.) always shown for the outer area */}
       <CanvasBackground type={background} />
 
+      {/* Checkerboard behind the canvas — shows through transparent areas when bg layer is hidden */}
+      {bgHidden && board && <ArtboardCheckerboard board={board} />}
+
       <div
         ref={containerRef}
         className="absolute inset-0"
         style={hideCursor ? { cursor: 'none' } : undefined}
       />
-
-      {/* Checkerboard overlay clipped to artboard area when bg layer is hidden */}
-      {bgHidden && board && <ArtboardCheckerboard board={board} />}
 
       <BrushCursor />
       <TopBar />
