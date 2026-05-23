@@ -94,8 +94,18 @@ export class SelectTool extends Tool {
         this.state = { kind: 'dragging-point', ...hit }
         return
       }
-      // Clicking near path anchors stays in edit mode
-      // Only Escape exits edit mode
+      // Clicking outside handles: check if hitting a different element or empty space
+      const vl = layer as VectorLayer
+      const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+      const lx = world.x - vl.transform.x, ly = world.y - vl.transform.y
+      const hitId = vl.hitTest(lx, ly, HIT_RADIUS / board.camera.zoom)
+      if (hitId && hitId !== this.state.id) {
+        this.state = { kind: 'selected', ids: [hitId] }
+      } else {
+        this.state = { kind: 'idle' }
+      }
+      board.canvas.style.cursor = 'default'
+      this.scheduleOverlayRedraw()
       return
     }
     if (this.state.kind === 'dragging-point') return
@@ -248,14 +258,12 @@ export class SelectTool extends Tool {
       if (!anchor) return
 
       if (st.part === 'anchor') {
-        if (this._altDown && !anchor.handleOut && !anchor.handleIn) {
-          // Alt+drag on a corner point → pull out smooth bezier handles
+        if (this._altDown) {
+          // Alt+drag anchor: always create/update symmetric smooth handles
+          // This creates a curve from what was a corner point
           anchor.handleOut = { x: lx, y: ly }
           anchor.handleIn  = { x: anchor.x * 2 - lx, y: anchor.y * 2 - ly }
           anchor.type = 'smooth'
-        } else if (this._altDown && anchor.handleOut) {
-          // Alt+drag when handles exist → just drag handleOut (break symmetry)
-          anchor.handleOut.x = lx; anchor.handleOut.y = ly
         } else {
           const dx = lx - anchor.x, dy = ly - anchor.y
           if (anchor.handleIn)  { anchor.handleIn.x += dx;  anchor.handleIn.y += dy  }

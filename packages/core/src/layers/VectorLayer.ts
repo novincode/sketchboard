@@ -171,12 +171,9 @@ export class VectorLayer extends Layer {
     if (path && path.anchors.length > 0) {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
       for (const a of path.anchors) {
-        // Include handles in bounds so the selection box contains bezier curves
-        for (const pt of [{ x: a.x, y: a.y }, a.handleIn, a.handleOut]) {
-          if (!pt) continue
-          if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x
-          if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y
-        }
+        // Only use anchor points (not handles) so the selection box matches the visible path
+        if (a.x < minX) minX = a.x; if (a.x > maxX) maxX = a.x
+        if (a.y < minY) minY = a.y; if (a.y > maxY) maxY = a.y
       }
       const r = path.strokeWidth / 2
       return { x: minX - r, y: minY - r, w: maxX - minX + path.strokeWidth, h: maxY - minY + path.strokeWidth }
