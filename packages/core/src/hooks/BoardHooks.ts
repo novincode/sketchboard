@@ -34,6 +34,13 @@ export class BoardHooks {
   readonly colorPicked = new Hook<{ color: Color }>()
   /** Fired when a tool attempts to draw but is blocked (e.g. hidden/wrong layer) */
   readonly drawBlocked = new Hook<{ reason: DrawBlockedReason }>()
+  /**
+   * Generic tool preview hook — fired by tools that have transient state
+   * worth showing in the UI (e.g. FillTool drag-to-adjust tolerance).
+   * `tool` is the registered tool name, `data` is tool-specific.
+   * Use `kind` to discriminate. UI listeners filter on it.
+   */
+  readonly toolPreview = new Hook<{ tool: string; kind: string; data: Record<string, number | string | boolean> }>()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly destroy = new Hook<any>()
 }

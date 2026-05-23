@@ -1,14 +1,23 @@
 'use client'
 
-import React, { useEffect, useRef, useState, forwardRef, useCallback } from 'react'
+import React, { useEffect, useRef, useState, forwardRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Eye, EyeOff, Plus, Trash2, Layers, PenLine,
-  ChevronDown, ChevronUp, Copy, Eraser, Bookmark,
+  ChevronDown, ChevronRight, Copy, Eraser, Bookmark,
+  GripVertical, Folder, FolderOpen,
 } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
+import {
+  DndContext, PointerSensor, useSensor, useSensors,
+  DragOverlay, closestCenter,
+  type DragStartEvent, type DragEndEvent, type DragOverEvent,
+} from '@dnd-kit/core'
+import {
+  SortableContext, useSortable, verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import { useFreeformStore } from '../store'
-import type { LayerType } from '../types'
 import { ContextMenu, useContextMenu } from './ContextMenu'
 import { DraggableInput } from './DraggableInput'
 
@@ -18,19 +27,28 @@ const BLEND_MODES = [
   'hard-light', 'soft-light', 'difference', 'exclusion',
 ]
 
+const INDENT_PX = 14
+
+// ─── LayerPanel ───────────────────────────────────────────────────────────────
+
 export function LayerPanel() {
   const {
     layers, activeLayerId, backgroundLayerId, backgroundLayerColor,
-    referenceLayerId,
+    referenceLayerId, selectedLayerIds,
     addLayer, removeLayer, duplicateLayer, clearLayer,
-    setActiveLayerId, setLayerVisibility, setLayerOpacity,
+    selectLayer, selectRange,
+    setLayerVisibility, setLayerOpacity,
     setLayerBlendMode, setLayerName, setBackgroundColor,
     setReferenceLayerId,
+    groupSelectedLayers, ungroupLayer, toggleGroupCollapsed,
+    moveLayer, reorderSiblings,
     toggleLayerPanel,
   } = useFreeformStore()
 
   const ref = useRef<HTMLDivElement>(null)
   const [showAddMenu, setShowAddMenu] = useState(false)
+  const [activeDragId, setActiveDragId] = useState<string | null>(null)
+  const [overGroupId, setOverGroupId] = useState<string | null>(null)
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -40,92 +58,297 @@ export function LayerPanel() {
     return () => document.removeEventListener('mousedown', handler)
   }, [toggleLayerPanel])
 
-  const reversed = [...layers].reverse()
+  // Display the layer tree top-down (rendering: last layer in array = topmost,
+  // shown at the top of the panel). We keep groups together by reversing the
+  // siblings within each parent group while preserving the tree.
+  const displayOrder = reverseSiblings(layers)
+  const sortableIds = displayOrder.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+  )
+
+  const onDragStart = (e: DragStartEvent) => {
+    setActiveDragId(String(e.active.id))
+  }
+  const onDragOver = (e: DragOverEvent) => {
+    const over = e.over
+    if (!over) { setOverGroupId(null); return }
+    const overMeta = layers.find((l) => l.id === over.id)
+    if (overMeta?.type === 'group') {
+      setOverGroupId(overMeta.id)
+    } else {
+      setOverGroupId(null)
+    }
+  }
+  const onDragEnd = (e: DragEndEvent) => {
+    const activeId = String(e.active.id)
+    const over = e.over
+    setActiveDragId(null)
+    setOverGroupId(null)
+    if (!over || over.id === activeId) return
+
+    const overId = String(over.id)
+    const overMeta = layers.find((l) => l.id === overId)
+    const activeMeta = layers.find((l) => l.id === activeId)
+    if (!overMeta || !activeMeta) return
+
+    // Drop onto a group header => move INTO that group as last child (top of group)
+    if (overMeta.type === 'group' && activeId !== overMeta.id) {
+      moveLayer(activeId, overMeta.id, /* end of children = topmost in panel */
+        Number.MAX_SAFE_INTEGER)
+      return
+    }
+
+    // Otherwise: reorder relative to overMeta within its parent.
+    // We work in tree order. Panel index → tree index: invert.
+    const parentId = overMeta.parentId
+    const parentLayers = layers.filter((l) => l.parentId === parentId)
+    const treeOrderIds = parentLayers.map((l) => l.id)
+    const filtered = treeOrderIds.filter((id) => id !== activeId)
+    const overIdx = filtered.indexOf(overId)
+
+    // Panel renders parents reversed — so dragging "above over" in panel
+    // means inserting AFTER over in tree order; "below over" means BEFORE.
+    const sortableIdx = sortableIds.indexOf(activeId)
+    const overSortableIdx = sortableIds.indexOf(overId)
+    const draggingDown = sortableIdx < overSortableIdx
+    const insertAt = draggingDown ? overIdx : overIdx + 1
+
+    // If active was in a different parent, reparent
+    if (activeMeta.parentId !== parentId) {
+      // Convert "tree-index in new parent" — same number
+      moveLayer(activeId, parentId, insertAt)
+    } else {
+      // Same parent — pure reorder
+      const newOrder = [...filtered]
+      newOrder.splice(insertAt, 0, activeId)
+      reorderSiblings(newOrder, parentId)
+    }
+  }
+
+  const activeMeta = activeDragId ? layers.find((l) => l.id === activeDragId) : null
 
   return (
     <div
       ref={ref}
       data-layer-panel
-      className="fixed right-3 top-14 z-50 flex flex-col rounded-2xl border border-white/10 bg-[#111]/92 shadow-2xl backdrop-blur-xl overflow-hidden"
-      style={{ width: 280, maxHeight: 'calc(100vh - 5.5rem)' }}
+      className="fixed right-3 top-14 z-50 flex flex-col rounded-2xl border border-white/10 bg-[#111]/92 shadow-2xl backdrop-blur-xl overflow-hidden layer-panel-enter"
+      style={{ width: 296, maxHeight: 'calc(100vh - 5.5rem)' }}
     >
+      <PanelStyles />
+
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/8 shrink-0">
         <span className="text-xs font-semibold text-white/70 tracking-wide">Layers</span>
-        <div className="relative">
+        <div className="flex items-center gap-1">
           <button
-            onClick={() => setShowAddMenu((p) => !p)}
-            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/45 hover:bg-white/10 hover:text-white/80 transition"
-            title="Add layer"
+            onClick={groupSelectedLayers}
+            disabled={selectedLayerIds.filter((id) => id !== backgroundLayerId).length === 0}
+            className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/45 hover:bg-white/10 hover:text-white/80 disabled:opacity-30 disabled:hover:bg-white/5 disabled:cursor-default transition"
+            title="Group selected (⌘G)"
           >
-            <Plus size={12} />
+            <Folder size={12} />
           </button>
-          {showAddMenu && (
-            <div
-              className="absolute right-0 top-full mt-1.5 z-10 flex flex-col rounded-xl border border-white/10 bg-[#1a1a1a]/98 overflow-hidden shadow-2xl backdrop-blur-xl"
-              onMouseDown={(e) => e.stopPropagation()}
+          <div className="relative">
+            <button
+              onClick={() => setShowAddMenu((p) => !p)}
+              className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-2 py-1 text-[10px] text-white/45 hover:bg-white/10 hover:text-white/80 transition"
+              title="Add layer"
             >
-              <button
-                onClick={() => { addLayer('raster'); setShowAddMenu(false) }}
-                className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition whitespace-nowrap"
+              <Plus size={12} />
+            </button>
+            {showAddMenu && (
+              <div
+                className="absolute right-0 top-full mt-1.5 z-10 flex flex-col rounded-xl border border-white/10 bg-[#1a1a1a]/98 overflow-hidden shadow-2xl backdrop-blur-xl"
+                onMouseDown={(e) => e.stopPropagation()}
               >
-                <Layers size={13} className="text-blue-400/70" />
-                <span>Raster Layer</span>
-                <kbd className="ml-auto rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/25">PX</kbd>
-              </button>
-              <button
-                onClick={() => { addLayer('vector'); setShowAddMenu(false) }}
-                className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition whitespace-nowrap"
-              >
-                <PenLine size={13} className="text-purple-400/70" />
-                <span>Vector Layer</span>
-                <kbd className="ml-auto rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/25">VEC</kbd>
-              </button>
-            </div>
-          )}
+                <button
+                  onClick={() => { addLayer('raster'); setShowAddMenu(false) }}
+                  className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition whitespace-nowrap"
+                >
+                  <Layers size={13} className="text-blue-400/70" />
+                  <span>Raster Layer</span>
+                  <kbd className="ml-auto rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/25">PX</kbd>
+                </button>
+                <button
+                  onClick={() => { addLayer('vector'); setShowAddMenu(false) }}
+                  className="flex items-center gap-2.5 px-3.5 py-2.5 text-xs text-white/60 hover:bg-white/8 hover:text-white/90 transition whitespace-nowrap"
+                >
+                  <PenLine size={13} className="text-purple-400/70" />
+                  <span>Vector Layer</span>
+                  <kbd className="ml-auto rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-mono text-white/25">VEC</kbd>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
       {/* Layer list — scrollable */}
       <div className="flex flex-col overflow-y-auto p-2 gap-0.5 min-h-0">
-        {reversed.map((layer) => {
-          const isBg = layer.id === backgroundLayerId
-          return isBg ? (
-            <BackgroundLayerRow
-              key={layer.id}
-              id={layer.id}
-              color={backgroundLayerColor}
-              visible={layer.visible}
-              isActive={layer.id === activeLayerId}
-              onSelect={() => setActiveLayerId(layer.id)}
-              onVisibilityToggle={() => setLayerVisibility(layer.id, !layer.visible)}
-              onColorChange={setBackgroundColor}
-            />
-          ) : (
-            <LayerRow
-              key={layer.id}
-              id={layer.id}
-              name={layer.name}
-              visible={layer.visible}
-              opacity={layer.opacity}
-              blendMode={layer.blendMode}
-              layerType={layer.type}
-              isActive={layer.id === activeLayerId}
-              isReference={layer.id === referenceLayerId}
-              canDelete={layers.filter((l) => l.id !== backgroundLayerId).length > 1}
-              onSelect={() => setActiveLayerId(layer.id)}
-              onVisibilityToggle={() => setLayerVisibility(layer.id, !layer.visible)}
-              onDelete={() => removeLayer(layer.id)}
-              onDuplicate={() => duplicateLayer(layer.id)}
-              onClear={() => clearLayer(layer.id)}
-              onOpacityChange={(v) => setLayerOpacity(layer.id, v)}
-              onBlendModeChange={(m) => setLayerBlendMode(layer.id, m)}
-              onRename={(n) => setLayerName(layer.id, n)}
-              onToggleReference={() => setReferenceLayerId(layer.id === referenceLayerId ? null : layer.id)}
-            />
-          )
-        })}
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragStart={onDragStart}
+          onDragOver={onDragOver}
+          onDragEnd={onDragEnd}
+        >
+          <SortableContext items={sortableIds} strategy={verticalListSortingStrategy}>
+            {displayOrder.map((meta) => {
+              const isBg = meta.id === backgroundLayerId
+              if (isBg) {
+                return (
+                  <BackgroundLayerRow
+                    key={meta.id}
+                    color={backgroundLayerColor}
+                    visible={meta.visible}
+                    isActive={meta.id === activeLayerId}
+                    onSelect={() => selectLayer(meta.id, false)}
+                    onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
+                    onColorChange={setBackgroundColor}
+                  />
+                )
+              }
+              if (meta.type === 'group') {
+                return (
+                  <SortableGroupRow
+                    key={meta.id}
+                    id={meta.id}
+                    name={meta.name}
+                    depth={meta.depth}
+                    visible={meta.visible}
+                    opacity={meta.opacity}
+                    collapsed={!!meta.collapsed}
+                    childCount={meta.childCount ?? 0}
+                    isActive={meta.id === activeLayerId}
+                    isSelected={selectedLayerIds.includes(meta.id)}
+                    isDropTarget={overGroupId === meta.id}
+                    onSelect={(e) => onSelect(e, meta.id, selectLayer, selectRange)}
+                    onToggleCollapsed={() => toggleGroupCollapsed(meta.id)}
+                    onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
+                    onUngroup={() => ungroupLayer(meta.id)}
+                    onRename={(n) => setLayerName(meta.id, n)}
+                    onDelete={() => removeLayer(meta.id)}
+                    onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
+                  />
+                )
+              }
+              return (
+                <SortableLayerRow
+                  key={meta.id}
+                  id={meta.id}
+                  name={meta.name}
+                  depth={meta.depth}
+                  visible={meta.visible}
+                  opacity={meta.opacity}
+                  blendMode={meta.blendMode}
+                  layerType={meta.type}
+                  isActive={meta.id === activeLayerId}
+                  isSelected={selectedLayerIds.includes(meta.id)}
+                  isReference={meta.id === referenceLayerId}
+                  canDelete={layers.filter((l) => l.id !== backgroundLayerId && l.type !== 'group').length > 1}
+                  onSelect={(e) => onSelect(e, meta.id, selectLayer, selectRange)}
+                  onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
+                  onDelete={() => removeLayer(meta.id)}
+                  onDuplicate={() => duplicateLayer(meta.id)}
+                  onClear={() => clearLayer(meta.id)}
+                  onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
+                  onBlendModeChange={(m) => setLayerBlendMode(meta.id, m)}
+                  onRename={(n) => setLayerName(meta.id, n)}
+                  onToggleReference={() => setReferenceLayerId(meta.id === referenceLayerId ? null : meta.id)}
+                />
+              )
+            })}
+          </SortableContext>
+          <DragOverlay dropAnimation={null}>
+            {activeMeta ? (
+              <div className="rounded-xl bg-white/10 px-3 py-2 text-xs text-white/90 shadow-2xl ring-1 ring-white/20 backdrop-blur-xl">
+                {activeMeta.type === 'group' ? <Folder size={12} className="inline mr-2 -mt-0.5" /> : null}
+                {activeMeta.name}
+              </div>
+            ) : null}
+          </DragOverlay>
+        </DndContext>
       </div>
+    </div>
+  )
+}
+
+// ─── Multi-select helper ──────────────────────────────────────────────────────
+
+function onSelect(
+  e: React.MouseEvent,
+  id: string,
+  selectLayer: (id: string, additive: boolean) => void,
+  selectRange: (id: string) => void,
+) {
+  if (e.shiftKey) { selectRange(id); return }
+  selectLayer(id, e.metaKey || e.ctrlKey)
+}
+
+// ─── Reverse sibling order for visual display (top-most layer at top) ─────────
+
+function reverseSiblings(flat: ReturnType<typeof useFreeformStore.getState>['layers']) {
+  // Group rows by parent, reverse each group, splice back in. Maintain depth/parent.
+  const byParent = new Map<string | null, typeof flat>()
+  for (const l of flat) {
+    const arr = byParent.get(l.parentId) ?? ([] as typeof flat)
+    arr.push(l)
+    byParent.set(l.parentId, arr)
+  }
+  // Rebuild depth-first using reversed siblings at each level
+  const out: typeof flat = []
+  const walk = (parentId: string | null) => {
+    const children = byParent.get(parentId) ?? []
+    const reversed = [...children].reverse()
+    for (const c of reversed) {
+      out.push(c)
+      if (c.type === 'group' && !c.collapsed) walk(c.id)
+    }
+  }
+  walk(null)
+  return out
+}
+
+// ─── Sortable raster/vector layer row ─────────────────────────────────────────
+
+function SortableLayerRow(props: LayerRowProps) {
+  const {
+    attributes, listeners, setNodeRef, transform, transition, isDragging,
+  } = useSortable({ id: props.id })
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.3 : 1,
+    marginLeft: props.depth * INDENT_PX,
+  }
+
+  return (
+    <div ref={setNodeRef} style={style} {...attributes}>
+      <LayerRow {...props} dragHandleProps={listeners} />
+    </div>
+  )
+}
+
+// ─── Sortable group row ───────────────────────────────────────────────────────
+
+function SortableGroupRow(props: GroupRowProps) {
+  const {
+    attributes, listeners, setNodeRef, transform, transition, isDragging,
+  } = useSortable({ id: props.id })
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.3 : 1,
+    marginLeft: props.depth * INDENT_PX,
+  }
+
+  return (
+    <div ref={setNodeRef} style={style} {...attributes}>
+      <GroupRow {...props} dragHandleProps={listeners} />
     </div>
   )
 }
@@ -133,10 +356,10 @@ export function LayerPanel() {
 // ─── Background layer row ──────────────────────────────────────────────────────
 
 function BackgroundLayerRow({
-  id, color, visible, isActive,
+  color, visible, isActive,
   onSelect, onVisibilityToggle, onColorChange,
 }: {
-  id: string; color: string; visible: boolean; isActive: boolean
+  color: string; visible: boolean; isActive: boolean
   onSelect: () => void; onVisibilityToggle: () => void; onColorChange: (hex: string) => void
 }) {
   const [showPicker, setShowPicker] = useState(false)
@@ -159,7 +382,6 @@ function BackgroundLayerRow({
       ].join(' ')}
       onClick={onSelect}
     >
-      {/* Color swatch */}
       <button
         title="Change background color"
         onClick={(e) => { e.stopPropagation(); setShowPicker((p) => !p) }}
@@ -191,18 +413,24 @@ function BackgroundLayerRow({
 
 // ─── Regular layer row ────────────────────────────────────────────────────────
 
-function LayerRow({
-  id, name, visible, opacity, blendMode, layerType,
-  isActive, isReference, canDelete,
-  onSelect, onVisibilityToggle, onDelete, onDuplicate, onClear,
-  onOpacityChange, onBlendModeChange, onRename, onToggleReference,
-}: {
-  id: string; name: string; visible: boolean; opacity: number; blendMode: string; layerType: LayerType
-  isActive: boolean; isReference: boolean; canDelete: boolean
-  onSelect: () => void; onVisibilityToggle: () => void; onDelete: () => void
+interface LayerRowProps {
+  id: string; name: string; depth: number
+  visible: boolean; opacity: number; blendMode: string; layerType: 'raster' | 'vector'
+  isActive: boolean; isSelected: boolean; isReference: boolean; canDelete: boolean
+  onSelect: (e: React.MouseEvent) => void
+  onVisibilityToggle: () => void; onDelete: () => void
   onDuplicate: () => void; onClear: () => void; onToggleReference: () => void
   onOpacityChange: (v: number) => void; onBlendModeChange: (m: string) => void; onRename: (n: string) => void
-}) {
+}
+
+function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unknown> }) {
+  const {
+    name, visible, opacity, blendMode, layerType,
+    isActive, isSelected, isReference, canDelete,
+    onSelect, onVisibilityToggle, onDelete, onDuplicate, onClear,
+    onOpacityChange, onBlendModeChange, onRename, onToggleReference,
+    dragHandleProps,
+  } = props
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(name)
   const [expanded, setExpanded] = useState(false)
@@ -233,7 +461,7 @@ function LayerRow({
       <div
         className={[
           'group rounded-xl transition-colors overflow-hidden',
-          isActive ? 'bg-white/8 ring-1 ring-white/20' : 'hover:bg-white/4',
+          isActive ? 'bg-white/8 ring-1 ring-white/20' : isSelected ? 'bg-white/5 ring-1 ring-white/10' : 'hover:bg-white/4',
           isReference ? 'ring-1 ring-amber-400/40' : '',
         ].join(' ')}
         onContextMenu={onContextMenu}
@@ -241,7 +469,17 @@ function LayerRow({
         onPointerUp={cancelLongPress}
         onPointerLeave={cancelLongPress}
       >
-        <div className="flex items-center gap-2.5 px-3 py-2.5 cursor-pointer" onClick={onSelect}>
+        <div className="flex items-center gap-1.5 px-2 py-2.5 cursor-pointer" onClick={onSelect}>
+          {/* Drag handle */}
+          <button
+            {...(dragHandleProps ?? {})}
+            onClick={(e) => e.stopPropagation()}
+            className="text-white/15 hover:text-white/55 transition p-0.5 cursor-grab active:cursor-grabbing touch-none"
+            title="Drag to reorder"
+          >
+            <GripVertical size={13} />
+          </button>
+
           {/* Layer type badge */}
           <span className={[
             'shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider',
@@ -302,7 +540,7 @@ function LayerRow({
             </button>
             {isActive && (
               <button onClick={() => setExpanded((x) => !x)} className="text-white/25 hover:text-white/60 transition p-0.5">
-                {expanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
               </button>
             )}
           </div>
@@ -310,7 +548,7 @@ function LayerRow({
 
         {/* Expanded options */}
         {isActive && expanded && (
-          <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1 border-t border-white/6" onClick={(e) => e.stopPropagation()}>
+          <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2">
               <DraggableInput
                 label="Opacity"
@@ -346,7 +584,168 @@ function LayerRow({
   )
 }
 
-// ─── Color picker popup (portalled, always stays in viewport) ──────────────────
+// ─── Group row ────────────────────────────────────────────────────────────────
+
+interface GroupRowProps {
+  id: string; name: string; depth: number
+  visible: boolean; opacity: number; collapsed: boolean; childCount: number
+  isActive: boolean; isSelected: boolean; isDropTarget: boolean
+  onSelect: (e: React.MouseEvent) => void
+  onToggleCollapsed: () => void
+  onVisibilityToggle: () => void
+  onUngroup: () => void
+  onRename: (n: string) => void
+  onDelete: () => void
+  onOpacityChange: (v: number) => void
+}
+
+function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unknown> }) {
+  const {
+    name, visible, opacity, collapsed, childCount,
+    isActive, isSelected, isDropTarget,
+    onSelect, onToggleCollapsed, onVisibilityToggle, onUngroup, onRename, onDelete, onOpacityChange,
+    dragHandleProps,
+  } = props
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(name)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const { menu, close, onContextMenu, onPointerDown, cancelLongPress } = useContextMenu()
+
+  const commitRename = () => {
+    setEditing(false)
+    if (draft.trim()) onRename(draft.trim())
+    else setDraft(name)
+  }
+
+  useEffect(() => {
+    if (editing) { setDraft(name); inputRef.current?.focus(); inputRef.current?.select() }
+  }, [editing, name])
+
+  const contextEntries = [
+    { label: 'Rename', icon: null, onClick: () => setEditing(true) },
+    { label: 'Ungroup', icon: <FolderOpen size={13} />, onClick: onUngroup },
+    { separator: true as const },
+    { label: 'Delete group', icon: <Trash2 size={13} />, danger: true, onClick: onDelete },
+  ]
+
+  return (
+    <>
+      <div
+        className={[
+          'group rounded-xl transition-all overflow-hidden',
+          isActive ? 'bg-amber-500/10 ring-1 ring-amber-400/30' : isSelected ? 'bg-white/5 ring-1 ring-white/10' : 'hover:bg-white/4',
+          isDropTarget ? 'ring-2 ring-blue-400/60 bg-blue-500/8' : '',
+        ].join(' ')}
+        onContextMenu={onContextMenu}
+        onPointerDown={onPointerDown}
+        onPointerUp={cancelLongPress}
+        onPointerLeave={cancelLongPress}
+      >
+        <div className="flex items-center gap-1.5 px-2 py-2.5 cursor-pointer" onClick={onSelect}>
+          {/* Drag handle */}
+          <button
+            {...(dragHandleProps ?? {})}
+            onClick={(e) => e.stopPropagation()}
+            className="text-white/15 hover:text-white/55 transition p-0.5 cursor-grab active:cursor-grabbing touch-none"
+            title="Drag group"
+          >
+            <GripVertical size={13} />
+          </button>
+
+          {/* Collapse chevron */}
+          <button
+            onClick={(e) => { e.stopPropagation(); onToggleCollapsed() }}
+            className="text-white/45 hover:text-white/80 transition p-0.5"
+            title={collapsed ? 'Expand' : 'Collapse'}
+          >
+            {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+          </button>
+
+          {collapsed ? <Folder size={13} className="text-amber-400/80" /> : <FolderOpen size={13} className="text-amber-400/90" />}
+
+          {editing ? (
+            <input
+              ref={inputRef}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitRename}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitRename()
+                if (e.key === 'Escape') { setEditing(false); setDraft(name) }
+                e.stopPropagation()
+              }}
+              onClick={(e) => e.stopPropagation()}
+              className="flex-1 rounded-lg bg-white/10 px-2 py-0.5 text-xs text-white outline-none"
+            />
+          ) : (
+            <span
+              className="flex-1 text-sm text-white/85 truncate font-medium"
+              onDoubleClick={(e) => { e.stopPropagation(); setEditing(true) }}
+            >
+              {name}
+            </span>
+          )}
+
+          <span className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[9px] font-mono text-white/45">{childCount}</span>
+
+          <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+            <button onClick={onVisibilityToggle} className="text-white/30 hover:text-white/80 transition p-0.5">
+              {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Group opacity strip — visible when active */}
+        {isActive && (
+          <div className="flex items-center gap-2 px-3 pb-2.5 pt-0.5 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()}>
+            <DraggableInput
+              label="Opacity"
+              value={Math.round(opacity * 100)}
+              min={0}
+              max={100}
+              unit="%"
+              onChange={(v) => onOpacityChange(v / 100)}
+            />
+          </div>
+        )}
+      </div>
+
+      {menu && (
+        <ContextMenu
+          x={menu.x} y={menu.y}
+          entries={contextEntries}
+          onClose={close}
+        />
+      )}
+    </>
+  )
+}
+
+// ─── Panel-scoped animations (in-place keyframes, no extra CSS file) ─────────
+
+function PanelStyles() {
+  return (
+    <style>{`
+      .layer-panel-enter {
+        animation: layerPanelIn 200ms cubic-bezier(0.22, 1, 0.36, 1);
+        transform-origin: top right;
+      }
+      @keyframes layerPanelIn {
+        from { opacity: 0; transform: translateX(8px) scale(0.98); }
+        to   { opacity: 1; transform: translateX(0) scale(1); }
+      }
+      .row-expand {
+        animation: rowExpandIn 180ms ease;
+      }
+      @keyframes rowExpandIn {
+        from { opacity: 0; max-height: 0; }
+        to   { opacity: 1; max-height: 200px; }
+      }
+    `}</style>
+  )
+}
+
+// ─── Color picker popup ──────────────────────────────────────────────────────
 
 const PickerPopup = forwardRef<HTMLDivElement, {
   color: string

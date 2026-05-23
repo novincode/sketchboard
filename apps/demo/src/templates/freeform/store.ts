@@ -3,7 +3,7 @@
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool, FillTool, FillPlacement } from '@sketchboard/core'
-import { Color, RasterLayer, VectorLayer } from '@sketchboard/core'
+import { Color, RasterLayer, VectorLayer, GroupLayer } from '@sketchboard/core'
 import type { ToolId, Background, EraserMode, LayerType } from './types'
 import { RASTER_BRUSH_PRESETS, DEFAULT_BRUSH_PRESET_ID } from './brushPresets'
 import type { BrushPreset } from './brushPresets'
@@ -16,7 +16,15 @@ interface LayerMeta {
   visible: boolean
   opacity: number
   blendMode: string
-  type: LayerType
+  type: LayerType | 'group'
+  /** Tree depth — 0 for root layers, +1 per nested group. */
+  depth: number
+  /** Id of the containing GroupLayer, or null for root. */
+  parentId: string | null
+  /** Group rows only — collapsed in the panel. */
+  collapsed?: boolean
+  /** Group rows only — number of direct children. */
+  childCount?: number
 }
 
 interface FreeformState {
@@ -54,6 +62,12 @@ interface FreeformState {
 
   layers: LayerMeta[]
   activeLayerId: string | null
+
+  /** Multi-select: includes activeLayerId by convention when non-empty. */
+  selectedLayerIds: string[]
+
+  /** Live fill-tool tolerance scrub feedback (Procreate-style drag). */
+  fillPreview: { tolerance: number; x: number; y: number } | null
 
   /** The special "Background" layer id — always at index 0 */
   backgroundLayerId: string | null
@@ -102,6 +116,19 @@ interface FreeformActions {
   setLayerBlendMode(id: string, blendMode: string): void
   setBackgroundColor(hex: string): void
   setReferenceLayerId(id: string | null): void
+
+  // ── Multi-select & tree ops ─────────────────────────────────────────────
+  /** additive=false replaces selection; true toggles. */
+  selectLayer(id: string, additive: boolean): void
+  selectRange(toId: string): void
+  clearLayerSelection(): void
+  groupSelectedLayers(): void
+  ungroupLayer(id: string): void
+  toggleGroupCollapsed(id: string): void
+  /** Move `id` to a new parent (null = root) at the given index. */
+  moveLayer(id: string, parentId: string | null, index: number): void
+  /** Reorder the children of `parentId` (null = root) to the given id sequence. */
+  reorderSiblings(orderedIds: string[], parentId: string | null): void
 
   exportPng(filename?: string): void
 }
@@ -154,15 +181,35 @@ function applyBrushPreset(board: Board, preset: BrushPreset) {
   }
 }
 
+/**
+ * Flatten the layer tree depth-first so the UI can render a single scroll list
+ * with indentation per depth. Collapsed groups skip their descendants.
+ */
 function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
-  return layers.map((l) => ({
-    id: l.id,
-    name: l.name,
-    visible: l.visible,
-    opacity: l.opacity,
-    blendMode: l.blendMode,
-    type: (l as RasterLayer | VectorLayer).type === 'vector' ? 'vector' : 'raster',
-  }))
+  const out: LayerMeta[] = []
+  const walk = (ls: ReadonlyArray<Layer>, depth: number, parentId: string | null) => {
+    for (const l of ls) {
+      if (l instanceof GroupLayer) {
+        out.push({
+          id: l.id, name: l.name,
+          visible: l.visible, opacity: l.opacity, blendMode: l.blendMode,
+          type: 'group', depth, parentId,
+          collapsed: l.collapsed,
+          childCount: l.children.length,
+        })
+        if (!l.collapsed) walk(l.children, depth + 1, l.id)
+      } else {
+        out.push({
+          id: l.id, name: l.name,
+          visible: l.visible, opacity: l.opacity, blendMode: l.blendMode,
+          type: (l as RasterLayer | VectorLayer).type === 'vector' ? 'vector' : 'raster',
+          depth, parentId,
+        })
+      }
+    }
+  }
+  walk(layers, 0, null)
+  return out
 }
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -196,6 +243,8 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     showLayerPanel: false,
     layers: [],
     activeLayerId: null,
+    selectedLayerIds: [],
+    fillPreview: null,
 
     // ── Board ──────────────────────────────────────────────────────────────
     _setBoard(board) {
@@ -219,7 +268,20 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
 
       board.hooks.layerAdded.tap('store', () => set({ layers: layersToMeta(board.getLayers()) }))
       board.hooks.layerRemoved.tap('store', () => set({ layers: layersToMeta(board.getLayers()) }))
-      board.hooks.activeLayerChanged.tap('store', ({ id }) => set({ activeLayerId: id }))
+      board.hooks.activeLayerChanged.tap('store', ({ id }) => {
+        set((s) => ({
+          activeLayerId: id,
+          // Reset multi-select to just the new active layer unless user is mid-shift/cmd op (handled in selectLayer)
+          selectedLayerIds: id ? (s.selectedLayerIds.includes(id) ? s.selectedLayerIds : [id]) : [],
+        }))
+      })
+      board.hooks.toolPreview.tap('store', ({ kind, data }) => {
+        if (kind === 'tolerance') {
+          set({ fillPreview: { tolerance: data.tolerance as number, x: data.x as number, y: data.y as number } })
+        } else if (kind === 'end') {
+          set({ fillPreview: null })
+        }
+      })
     },
 
     // ── Tool ──────────────────────────────────────────────────────────────
@@ -347,13 +409,14 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     },
 
     removeLayer(id) {
-      const { board, activeLayerId } = get()
+      const { board, activeLayerId, selectedLayerIds } = get()
       if (!board) return
       board.removeLayer(id)
       if (activeLayerId === id) {
         const remaining = board.getLayers()
         if (remaining.length > 0) board.setActiveLayer(remaining.at(-1)!.id)
       }
+      set({ selectedLayerIds: selectedLayerIds.filter((x) => x !== id) })
     },
 
     setActiveLayerId(id) {
@@ -437,6 +500,101 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const { board } = get()
       if (board) board.referenceLayerId = id
       set({ referenceLayerId: id })
+    },
+
+    // ── Multi-select & tree ops ──────────────────────────────────────────
+    selectLayer(id, additive) {
+      const { selectedLayerIds, board, backgroundLayerId } = get()
+      if (id === backgroundLayerId) {
+        // Background never participates in multi-select
+        board?.setActiveLayer(id)
+        set({ activeLayerId: id, selectedLayerIds: [] })
+        return
+      }
+      let next: string[]
+      if (additive) {
+        next = selectedLayerIds.includes(id)
+          ? selectedLayerIds.filter((x) => x !== id)
+          : [...selectedLayerIds.filter((x) => x !== backgroundLayerId), id]
+      } else {
+        next = [id]
+      }
+      board?.setActiveLayer(id)
+      set({ activeLayerId: id, selectedLayerIds: next })
+    },
+
+    selectRange(toId) {
+      const { layers, activeLayerId, backgroundLayerId } = get()
+      if (!activeLayerId) return
+      const flatIds = layers.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
+      const a = flatIds.indexOf(activeLayerId)
+      const b = flatIds.indexOf(toId)
+      if (a === -1 || b === -1) return
+      const [lo, hi] = a < b ? [a, b] : [b, a]
+      const range = flatIds.slice(lo, hi + 1)
+      const { board } = get()
+      board?.setActiveLayer(toId)
+      set({ activeLayerId: toId, selectedLayerIds: range })
+    },
+
+    clearLayerSelection() { set({ selectedLayerIds: [] }) },
+
+    groupSelectedLayers() {
+      const { board, selectedLayerIds, activeLayerId, backgroundLayerId } = get()
+      if (!board) return
+      const candidate = selectedLayerIds.length > 0
+        ? selectedLayerIds
+        : (activeLayerId ? [activeLayerId] : [])
+      const ids = candidate.filter((id) => id !== backgroundLayerId)
+      if (ids.length === 0) return
+      const group = board.groupLayers(ids, `Group ${board.getAllLayers().filter((l) => l.id.startsWith('layer-')).length}`)
+      if (!group) return
+      board.setActiveLayer(group.id)
+      set({
+        layers: layersToMeta(board.getLayers()),
+        activeLayerId: group.id,
+        selectedLayerIds: [group.id],
+      })
+    },
+
+    ungroupLayer(id) {
+      const { board } = get()
+      if (!board) return
+      const children = board.ungroupLayer(id)
+      if (!children) return
+      set({
+        layers: layersToMeta(board.getLayers()),
+        selectedLayerIds: children.map((c) => c.id),
+        activeLayerId: children.at(-1)?.id ?? null,
+      })
+    },
+
+    toggleGroupCollapsed(id) {
+      const { board } = get()
+      const layer = board?.getLayerById(id)
+      if (!(layer instanceof GroupLayer)) return
+      layer.collapsed = !layer.collapsed
+      set({ layers: layersToMeta(board!.getLayers()) })
+    },
+
+    moveLayer(id, parentId, index) {
+      const { board, backgroundLayerId } = get()
+      if (!board) return
+      if (id === backgroundLayerId) return
+      // Background must stay at index 0 of the root — clamp moves around it.
+      if (parentId == null && backgroundLayerId) {
+        const bgIdx = board.getLayers().findIndex((l) => l.id === backgroundLayerId)
+        if (bgIdx === 0 && index === 0) index = 1
+      }
+      board.moveLayer(id, parentId, index)
+      set({ layers: layersToMeta(board.getLayers()) })
+    },
+
+    reorderSiblings(orderedIds, parentId) {
+      const { board } = get()
+      if (!board) return
+      board.reorderLayers(orderedIds, parentId)
+      set({ layers: layersToMeta(board.getLayers()) })
     },
 
     // ── Export ────────────────────────────────────────────────────────────

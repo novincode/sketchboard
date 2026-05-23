@@ -7,7 +7,8 @@ import { Canvas2DRenderer } from './renderer/Canvas2DRenderer'
 import { GestureManager } from './gestures/GestureManager'
 import type { Layer } from './layers/Layer'
 import { RasterLayer } from './layers/RasterLayer'
-import { VectorLayer } from './layers/VectorLayer'
+import { GroupLayer } from './layers/GroupLayer'
+import { rasterizeLayer } from './renderer/rasterizeLayer'
 import type { Tool } from './tools/Tool'
 import type { Renderer } from './renderer/Renderer'
 import type { Plugin } from './plugins/Plugin'
@@ -120,28 +121,88 @@ export class Board {
   // ─── Layer API ─────────────────────────────────────────────────────────────
 
   addLayer<T extends Layer>(layer: T): T {
+    if (layer.parent) (layer.parent as GroupLayer).remove(layer.id)
     this.layers.push(layer)
+    layer.parent = null
     this.hooks.layerAdded.call(layer)
     this.markDirty()
     return layer
   }
 
+  /**
+   * Recursively removes the layer with the given id, whether it sits at the
+   * root or nested inside a GroupLayer. Returns true if found and removed.
+   */
   removeLayer(id: string): boolean {
-    const idx = this.layers.findIndex((l) => l.id === id)
-    if (idx === -1) return false
-    this.layers.splice(idx, 1)
+    const removed = this._detachLayer(id)
+    if (!removed) return false
     if (this._activeLayerId === id) this._activeLayerId = null
+    if (this.referenceLayerId === id) this.referenceLayerId = null
     this.hooks.layerRemoved.call({ id })
     this.markDirty()
     return true
   }
 
+  /** Detach (don't fire hooks) — used by removeLayer / moveLayer. */
+  private _detachLayer(id: string): Layer | null {
+    const idx = this.layers.findIndex((l) => l.id === id)
+    if (idx !== -1) {
+      const [layer] = this.layers.splice(idx, 1)
+      if (layer) layer.parent = null
+      return layer ?? null
+    }
+    for (const l of this.layers) {
+      if (l instanceof GroupLayer) {
+        const removed = this._detachFromGroup(l, id)
+        if (removed) return removed
+      }
+    }
+    return null
+  }
+
+  private _detachFromGroup(group: GroupLayer, id: string): Layer | null {
+    const direct = group.remove(id)
+    if (direct) return direct
+    for (const child of group.children) {
+      if (child instanceof GroupLayer) {
+        const r = this._detachFromGroup(child, id)
+        if (r) return r
+      }
+    }
+    return null
+  }
+
+  /** Top-level layers, as added. Children of groups are NOT included here. */
   getLayers(): ReadonlyArray<Layer> {
     return this.layers
   }
 
+  /** Flat list of every layer in the tree (depth-first), including group children. */
+  getAllLayers(): Layer[] {
+    const out: Layer[] = []
+    const walk = (ls: ReadonlyArray<Layer>) => {
+      for (const l of ls) {
+        out.push(l)
+        if (l instanceof GroupLayer) walk(l.children)
+      }
+    }
+    walk(this.layers)
+    return out
+  }
+
+  /** Recursive lookup by id across the full layer tree. */
   getLayerById(id: string): Layer | undefined {
-    return this.layers.find((l) => l.id === id)
+    const find = (ls: ReadonlyArray<Layer>): Layer | undefined => {
+      for (const l of ls) {
+        if (l.id === id) return l
+        if (l instanceof GroupLayer) {
+          const hit = find(l.children)
+          if (hit) return hit
+        }
+      }
+      return undefined
+    }
+    return find(this.layers)
   }
 
   setActiveLayer(id: string): void {
@@ -154,10 +215,134 @@ export class Board {
     return this.layers.at(-1)
   }
 
-  reorderLayers(ids: string[]): void {
-    const map = new Map(this.layers.map((l) => [l.id, l]))
-    this.layers = ids.map((id) => map.get(id)).filter(Boolean) as Layer[]
+  /**
+   * Reorder a sibling list (top-level by default, or the children of a group)
+   * to match the given id sequence. Ids not present in the target list are skipped.
+   */
+  reorderLayers(ids: string[], parentId: string | null = null): void {
+    const siblings = parentId == null
+      ? this.layers
+      : ((this.getLayerById(parentId) as GroupLayer | undefined)?.children ?? null)
+    if (!siblings) return
+    const map = new Map(siblings.map((l) => [l.id, l]))
+    const reordered = ids.map((id) => map.get(id)).filter(Boolean) as Layer[]
+    // Preserve any siblings the caller forgot about — append at end in their original order.
+    for (const l of siblings) if (!ids.includes(l.id)) reordered.push(l)
+    siblings.length = 0
+    siblings.push(...reordered)
     this.markDirty()
+  }
+
+  /**
+   * Move a layer to a new parent (null = root) at the given index.
+   * Reparents safely and fires no extra hooks beyond a render mark.
+   */
+  moveLayer(id: string, parentId: string | null, index: number): boolean {
+    const layer = this.getLayerById(id)
+    if (!layer) return false
+
+    // Prevent inserting a group into itself or its own descendants.
+    if (parentId != null && layer instanceof GroupLayer) {
+      const target = this.getLayerById(parentId)
+      if (!target || this._isAncestor(layer, target)) return false
+    }
+
+    this._detachLayer(id)
+
+    if (parentId == null) {
+      const clamped = Math.max(0, Math.min(index, this.layers.length))
+      this.layers.splice(clamped, 0, layer)
+      layer.parent = null
+    } else {
+      const parent = this.getLayerById(parentId)
+      if (!(parent instanceof GroupLayer)) {
+        // Parent vanished — fall back to root append rather than losing the layer.
+        this.layers.push(layer)
+        layer.parent = null
+        this.markDirty()
+        return false
+      }
+      parent.insert(layer, index)
+    }
+    this.markDirty()
+    return true
+  }
+
+  private _isAncestor(ancestor: GroupLayer, descendant: Layer): boolean {
+    let cur: Layer | null = descendant
+    while (cur) {
+      if (cur === ancestor) return true
+      cur = cur.parent as Layer | null
+    }
+    return false
+  }
+
+  /**
+   * Group the given layers into a new GroupLayer. The group is inserted in
+   * the position of the topmost (last in tree order) selected layer, in that
+   * layer's parent. The original layers become the group's children, preserving
+   * their relative order. Returns the new group, or null if no valid layers.
+   */
+  groupLayers(ids: string[], name?: string): GroupLayer | null {
+    // De-dupe and resolve in tree order
+    const flat = this.getAllLayers()
+    const set = new Set(ids)
+    const ordered = flat.filter((l) => set.has(l.id))
+    if (ordered.length === 0) return null
+
+    // Anchor: parent + index of the topmost (last) selected layer
+    const anchor = ordered[ordered.length - 1]!
+    const anchorParent = anchor.parent as GroupLayer | null
+    const anchorSiblings = anchorParent ? anchorParent.children : this.layers
+    const anchorIndex = anchorSiblings.indexOf(anchor)
+
+    // Detach all selected layers (deepest first so indices stay valid)
+    const detached: Layer[] = []
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const d = this._detachLayer(ordered[i]!.id)
+      if (d) detached.unshift(d)
+    }
+
+    const group = new GroupLayer(name ?? 'Group')
+    for (const l of detached) {
+      group.children.push(l)
+      l.parent = group
+    }
+
+    // Insert group where the anchor used to be (clamped)
+    const targetSiblings = anchorParent ? anchorParent.children : this.layers
+    const insertAt = Math.max(0, Math.min(anchorIndex, targetSiblings.length))
+    targetSiblings.splice(insertAt, 0, group)
+    group.parent = anchorParent ?? null
+
+    this.hooks.layerAdded.call(group)
+    this.markDirty()
+    return group
+  }
+
+  /**
+   * Dissolve a group, splicing its children back into the group's parent at
+   * the group's position. The group itself is removed. Returns the freed
+   * children, or null if `id` is not a group.
+   */
+  ungroupLayer(id: string): Layer[] | null {
+    const group = this.getLayerById(id)
+    if (!(group instanceof GroupLayer)) return null
+
+    const parent = group.parent as GroupLayer | null
+    const siblings = parent ? parent.children : this.layers
+    const idx = siblings.indexOf(group)
+    if (idx === -1) return null
+
+    const children = group.children.slice()
+    siblings.splice(idx, 1, ...children)
+    for (const c of children) c.parent = parent ?? null
+    group.children.length = 0
+    group.parent = null
+
+    this.hooks.layerRemoved.call({ id: group.id })
+    this.markDirty()
+    return children
   }
 
   // ─── Reference layer ───────────────────────────────────────────────────────
@@ -172,27 +357,20 @@ export class Board {
   applyReferenceMask(layer: RasterLayer): void {
     if (!this.referenceLayerId) return
     const ref = this.getLayerById(this.referenceLayerId)
-    if (!ref) return
+    if (!ref || ref === layer) return
 
+    // Sample the reference layer into the active layer's pixel space.
+    // For raster references at matching resolution we read directly;
+    // anything else (vector, mismatched size, group) is rasterized.
     let refData: ImageData | null = null
-
-    if (ref instanceof RasterLayer) {
-      if (ref.width !== layer.width || ref.height !== layer.height) return
+    if (ref instanceof RasterLayer && ref.width === layer.width && ref.height === layer.height
+        && ref.transform.x === layer.transform.x && ref.transform.y === layer.transform.y) {
       refData = ref.getImageData()
-    } else if (ref instanceof VectorLayer) {
-      // Rasterize vector reference at the active layer's resolution
-      const offscreen = document.createElement('canvas')
-      offscreen.width = layer.width
-      offscreen.height = layer.height
-      const ctx = offscreen.getContext('2d')!
-      // VectorLayer.render ignores the camera and uses transform.applyToContext
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      ref.render(ctx, null as any)
-      refData = ctx.getImageData(0, 0, layer.width, layer.height)
+    } else {
+      refData = rasterizeLayer(ref, layer.width, layer.height, layer.transform.x, layer.transform.y)
     }
 
     if (!refData) return
-
     const activeData = layer.getImageData()
     const ad = activeData.data
     const rd = refData.data

@@ -5,7 +5,7 @@ import type { Board } from '@sketchboard/core'
 import {
   PenTool, BrushTool, EraserTool,
   PanTool, EyedropperTool, KeyboardPlugin,
-  RasterLayer, VectorBrushTool, VectorPenTool, SelectTool,
+  RasterLayer, VectorLayer, VectorBrushTool, VectorPenTool, SelectTool,
   FillTool, LassoSelectTool,
 } from '@sketchboard/core'
 import { useBoard } from '@sketchboard/react'
@@ -19,6 +19,7 @@ import { CanvasBackground } from './components/Background'
 import { LayerMismatchPrompt } from './components/LayerMismatchPrompt'
 import { DrawBlockedToast } from './components/DrawBlockedToast'
 import { EyedropperMagnifier } from './components/EyedropperMagnifier'
+import { FillToleranceHud } from './components/FillToleranceHud'
 import type { ToolId } from './types'
 
 const LAYER_W = 3840
@@ -80,6 +81,24 @@ function useFreeformSetup(board: Board | null) {
       copy:  { key: 'c', cmdOrCtrl: true, description: 'Copy selected',  handler: (b) => b.getTool<SelectTool>('select')?.copySelected() },
       cut:   { key: 'x', cmdOrCtrl: true, description: 'Cut selected',   handler: (b) => b.getTool<SelectTool>('select')?.cutSelected() },
       paste: { key: 'v', cmdOrCtrl: true, description: 'Paste',          handler: (b) => b.getTool<SelectTool>('select')?.pasteClipboard() },
+      // Cmd/Ctrl+A — select all elements on the active vector layer (otherwise no-op)
+      selectAll: { key: 'a', cmdOrCtrl: true, description: 'Select all on vector layer', handler: (b) => {
+        const layer = b.getActiveLayer()
+        if (!(layer instanceof VectorLayer)) return
+        const ids = [...layer.strokes.map((s) => s.id), ...layer.paths.map((p) => p.id)]
+        if (ids.length === 0) return
+        b.setActiveTool('select')
+        b.getTool<SelectTool>('select')?.setSelectedIds(ids)
+      }},
+      // Cmd/Ctrl+G — group currently-selected layers
+      groupLayers: { key: 'g', cmdOrCtrl: true, description: 'Group selected layers', handler: () => {
+        useFreeformStore.getState().groupSelectedLayers()
+      }},
+      // Cmd/Ctrl+Shift+G — ungroup active group
+      ungroupLayer: { key: 'g', cmdOrCtrl: true, shift: true, description: 'Ungroup', handler: () => {
+        const id = useFreeformStore.getState().activeLayerId
+        if (id) useFreeformStore.getState().ungroupLayer(id)
+      }},
     }))
 
     // 3. Store hooks — subscribe BEFORE creating layers so events fire correctly
@@ -229,6 +248,7 @@ export function FreeformTemplate() {
       <LayerMismatchPrompt />
       <DrawBlockedToast />
       <EyedropperMagnifier />
+      <FillToleranceHud />
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>

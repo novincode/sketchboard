@@ -3,6 +3,7 @@ import type { PointerData } from '../types'
 import { RasterLayer } from '../layers/RasterLayer'
 import { VectorLayer } from '../layers/VectorLayer'
 import type { VectorPath } from '../layers/VectorLayer'
+import { rasterizeLayer } from '../renderer/rasterizeLayer'
 
 export type FillPlacement = 'front' | 'back'
 
@@ -110,17 +111,6 @@ function floodFillWithRef(
   }
 }
 
-// Rasterize a VectorLayer to ImageData at the given dimensions.
-function rasterizeVectorLayer(vecLayer: VectorLayer, width: number, height: number): ImageData {
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const ctx = canvas.getContext('2d')!
-  // VectorLayer.render ignores the camera — draws in world space via transform.applyToContext
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  vecLayer.render(ctx, null as any)
-  return ctx.getImageData(0, 0, width, height)
-}
 
 // ─── Point-in-path (ray casting on sampled bezier segments) ──────────────────
 
@@ -167,12 +157,40 @@ function raycastPolygon(pts: Array<{ x: number; y: number }>, px: number, py: nu
 
 // ─── FillTool ─────────────────────────────────────────────────────────────────
 
+/**
+ * Procreate-style flood fill:
+ *   - tap to fill at current tolerance
+ *   - drag horizontally while still pressed to scrub tolerance live
+ *     (right = looser fill, left = tighter), the canvas re-floods every move
+ *   - pointer up commits a single undo entry from the original pixels
+ *
+ * Drag scrub is raster-only (vector fills are discrete shapes — nothing to scrub).
+ */
 export class FillTool extends Tool {
   settings: FillSettings = {
     color: '#1a1a1a',
     tolerance: 32,
     placement: 'back',
   }
+
+  /** Pixels of horizontal drag that equal one tolerance unit (0-255). Lower = more sensitive. */
+  dragSensitivity: number = 1.6
+
+  // Active raster scrub session (null when idle or running on a vector layer)
+  private _scrub: {
+    layer: RasterLayer
+    px: number
+    py: number
+    fillR: number; fillG: number; fillB: number; fillA: number
+    /** Untouched copy of layer pixels captured at pointer-down. */
+    before: Uint8ClampedArray
+    width: number
+    height: number
+    refData: ImageData | null
+    startX: number
+    startTolerance: number
+    lastTolerance: number
+  } | null = null
 
   onPointerDown(e: PointerData): void {
     if (!this.board) return
@@ -181,24 +199,51 @@ export class FillTool extends Tool {
     if (!layer.visible) { this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' }); return }
 
     if (layer instanceof RasterLayer) {
-      this._fillRaster(e, layer)
+      this._beginRasterScrub(e, layer)
     } else if (layer instanceof VectorLayer) {
       this._fillVector(e, layer)
     }
   }
 
-  onPointerMove(_e: PointerData): void {}
-  onPointerUp(_e: PointerData): void {}
-  onPointerCancel(_e: PointerData): void {}
+  onPointerMove(e: PointerData): void {
+    if (!this._scrub) return
+    const dx = e.x - this._scrub.startX
+    const next = Math.max(0, Math.min(255, Math.round(this._scrub.startTolerance + dx / this.dragSensitivity)))
+    if (next === this._scrub.lastTolerance) return
+    this._scrub.lastTolerance = next
+    this.settings.tolerance = next
+    this._reflood(next)
+    this.board!.hooks.toolPreview.call({
+      tool: 'fill', kind: 'tolerance',
+      data: { tolerance: next, x: e.x, y: e.y },
+    })
+  }
 
-  // ── Raster flood fill ────────────────────────────────────────────────────
+  onPointerUp(_e: PointerData): void {
+    if (!this._scrub) return
+    this._commitScrub()
+  }
 
-  private _fillRaster(e: PointerData, layer: RasterLayer): void {
+  onPointerCancel(_e: PointerData): void {
+    if (!this._scrub) return
+    // Revert to original pixels — user aborted.
+    const { layer, before, width, height } = this._scrub
+    layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height))
+    this.board?.markDirty()
+    this._scrub = null
+  }
+
+  onDeactivate(): void {
+    if (this._scrub) this._commitScrub()
+  }
+
+  // ── Raster scrub session ─────────────────────────────────────────────────
+
+  private _beginRasterScrub(e: PointerData, layer: RasterLayer): void {
     const board = this.board!
     const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
     const px = Math.floor(world.x - layer.transform.x)
     const py = Math.floor(world.y - layer.transform.y)
-
     if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return
 
     const hex = this.settings.color.replace('#', '')
@@ -207,37 +252,59 @@ export class FillTool extends Tool {
     const fillB = parseInt(hex.substring(4, 6), 16)
     const fillA = 255
 
-    const imageData = layer.getImageData()
-    const beforeBytes = imageData.data.slice()
+    const before = layer.getImageData().data.slice()
 
-    // Use reference layer as boundary source if set (supports both raster and vector reference)
     const refObj = board.referenceLayerId ? board.getLayerById(board.referenceLayerId) : null
-    let refImageData: ImageData | null = null
-
-    if (refObj instanceof RasterLayer && refObj.width === layer.width && refObj.height === layer.height) {
-      refImageData = refObj.getImageData()
-    } else if (refObj instanceof VectorLayer) {
-      refImageData = rasterizeVectorLayer(refObj, layer.width, layer.height)
+    let refData: ImageData | null = null
+    if (refObj && refObj !== layer) {
+      if (refObj instanceof RasterLayer && refObj.width === layer.width && refObj.height === layer.height
+          && refObj.transform.x === layer.transform.x && refObj.transform.y === layer.transform.y) {
+        refData = refObj.getImageData()
+      } else {
+        refData = rasterizeLayer(refObj, layer.width, layer.height, layer.transform.x, layer.transform.y)
+      }
     }
 
-    if (refImageData) {
-      floodFillWithRef(imageData.data, refImageData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
-    } else {
-      floodFill(imageData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
+    this._scrub = {
+      layer, px, py,
+      fillR, fillG, fillB, fillA,
+      before,
+      width: layer.width, height: layer.height,
+      refData,
+      startX: e.x,
+      startTolerance: this.settings.tolerance,
+      lastTolerance: this.settings.tolerance,
     }
-
-    layer.putImageData(imageData)
-    board.markDirty()
-
-    const afterBytes = imageData.data.slice()
-    const w = layer.width, h = layer.height
-    board.history.push({
-      undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(beforeBytes), w, h)); board.markDirty() },
-      redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(afterBytes), w, h)); board.markDirty() },
-    })
+    this._reflood(this.settings.tolerance)
   }
 
-  // ── Vector fill ───────────────────────────────────────────────────────────
+  private _reflood(tolerance: number): void {
+    const s = this._scrub!
+    const fresh = new Uint8ClampedArray(s.before)
+    if (s.refData) {
+      floodFillWithRef(fresh, s.refData.data, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+    } else {
+      floodFill(fresh, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+    }
+    s.layer.putImageData(new ImageData(fresh, s.width, s.height))
+    this.board?.markDirty()
+  }
+
+  private _commitScrub(): void {
+    const s = this._scrub!
+    const after = s.layer.getImageData().data.slice()
+    const before = s.before
+    const { layer, width, height } = s
+    const board = this.board!
+    board.history.push({
+      undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height)); board.markDirty() },
+      redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(after),  width, height)); board.markDirty() },
+    })
+    this._scrub = null
+    board.hooks.toolPreview.call({ tool: 'fill', kind: 'end', data: {} })
+  }
+
+  // ── Vector fill (no drag; one-shot insert of a fill path) ────────────────
 
   private _fillVector(e: PointerData, layer: VectorLayer): void {
     const board = this.board!
@@ -245,7 +312,6 @@ export class FillTool extends Tool {
     const lx = world.x - layer.transform.x
     const ly = world.y - layer.transform.y
 
-    // Find the topmost closed path that contains the click point
     let targetPath: VectorPath | null = null
     for (let i = layer.paths.length - 1; i >= 0; i--) {
       const p = layer.paths[i]!
@@ -272,25 +338,16 @@ export class FillTool extends Tool {
       targetPath.compositeOperation,
     )
 
-    if (this.settings.placement === 'back') {
-      const idx = layer.paths.indexOf(targetPath)
-      layer.paths.splice(idx, 0, fillPath)
-    } else {
-      const idx = layer.paths.indexOf(targetPath)
-      layer.paths.splice(idx + 1, 0, fillPath)
-    }
+    const idx = layer.paths.indexOf(targetPath)
+    const insertIdx = this.settings.placement === 'back' ? idx : idx + 1
+    layer.paths.splice(insertIdx, 0, fillPath)
 
     board.markDirty()
     board.history.push({
       undo: () => { layer.paths = [...beforePaths]; board.markDirty() },
       redo: () => {
-        if (this.settings.placement === 'back') {
-          const i = layer.paths.indexOf(targetPath!)
-          if (i >= 0) layer.paths.splice(i, 0, fillPath)
-        } else {
-          const i = layer.paths.indexOf(targetPath!)
-          if (i >= 0) layer.paths.splice(i + 1, 0, fillPath)
-        }
+        const i = layer.paths.indexOf(targetPath!)
+        if (i >= 0) layer.paths.splice(this.settings.placement === 'back' ? i : i + 1, 0, fillPath)
         board.markDirty()
       },
     })
