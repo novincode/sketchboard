@@ -201,45 +201,80 @@ export class VectorPenTool extends Tool {
     const toScreen = (lx: number, ly: number) =>
       board.camera.worldToScreen(lx + (layer?.transform.x ?? 0), ly + (layer?.transform.y ?? 0), W, H)
 
-    // Draw path so far
-    if (this.anchors.length >= 1) {
-      const allAnchors = [...this.anchors]
-      // Add a "cursor anchor" (no handles, just position) as preview end
-      const cursorAnchor: BezierAnchor = {
-        x: this.mouseWorld.x, y: this.mouseWorld.y,
-        handleIn: null, handleOut: null, type: 'corner',
-      }
-      if (this._pendingAnchor && this._isDragging) {
-        // Show dragging handle preview
-        const world = this.mouseWorld
-        const pa = this._pendingAnchor
-        const dx = world.x - pa.x, dy = world.y - pa.y
-        cursorAnchor.x = pa.x; cursorAnchor.y = pa.y
-        cursorAnchor.handleIn = { x: pa.x - dx, y: pa.y - dy }
-        cursorAnchor.handleOut = { x: pa.x + dx, y: pa.y + dy }
-        cursorAnchor.type = 'smooth'
-      }
+    // Build cursor anchor (pending anchor with handle preview, or just mouse position)
+    const cursorAnchor: BezierAnchor = {
+      x: this.mouseWorld.x, y: this.mouseWorld.y,
+      handleIn: null, handleOut: null, type: 'corner',
+    }
+    if (this._pendingAnchor && this._isDragging) {
+      const world = this.mouseWorld
+      const pa = this._pendingAnchor
+      const dx = world.x - pa.x, dy = world.y - pa.y
+      cursorAnchor.x = pa.x; cursorAnchor.y = pa.y
+      cursorAnchor.handleIn = { x: pa.x - dx, y: pa.y - dy }
+      cursorAnchor.handleOut = { x: pa.x + dx, y: pa.y + dy }
+      cursorAnchor.type = 'smooth'
+    }
 
+    strokeCtx.lineCap = 'round'
+    strokeCtx.lineJoin = 'round'
+
+    // 1. Draw committed segments (stroke color + subtle glow)
+    if (this.anchors.length >= 2) {
       strokeCtx.strokeStyle = this.settings.strokeColor
       strokeCtx.lineWidth = Math.max(1, this.settings.strokeWidth * board.camera.zoom)
-      strokeCtx.lineCap = 'round'
       strokeCtx.setLineDash([])
-      strokeCtx.globalAlpha = this.settings.opacity
-
-      const tempAnchors = [...allAnchors, cursorAnchor]
-      strokeCtx.beginPath()
-      const first = toScreen(tempAnchors[0]!.x, tempAnchors[0]!.y)
-      strokeCtx.moveTo(first.x, first.y)
-      for (let i = 1; i < tempAnchors.length; i++) {
-        const prev = tempAnchors[i - 1]!
-        const curr = tempAnchors[i]!
+      strokeCtx.globalAlpha = this.settings.opacity * 0.72
+      strokeCtx.shadowBlur = 10
+      strokeCtx.shadowColor = 'rgba(96, 205, 255, 0.35)'
+      for (let i = 1; i < this.anchors.length; i++) {
+        const prev = this.anchors[i - 1]!
+        const curr = this.anchors[i]!
         const ps = toScreen(prev.x, prev.y)
         const cs = toScreen(curr.x, curr.y)
         const cp1 = prev.handleOut ? toScreen(prev.handleOut.x, prev.handleOut.y) : ps
         const cp2 = curr.handleIn ? toScreen(curr.handleIn.x, curr.handleIn.y) : cs
+        strokeCtx.beginPath()
+        strokeCtx.moveTo(ps.x, ps.y)
         strokeCtx.bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, cs.x, cs.y)
+        strokeCtx.stroke()
       }
-      strokeCtx.stroke()
+      strokeCtx.shadowBlur = 0
+    }
+
+    // 2. Draw rubber-band: last committed anchor → cursor (dashed gradient tail)
+    if (this.anchors.length >= 1) {
+      const lastA = this.anchors[this.anchors.length - 1]!
+      const lastS = toScreen(lastA.x, lastA.y)
+      const cursorS = toScreen(cursorAnchor.x, cursorAnchor.y)
+      const dx = cursorS.x - lastS.x, dy = cursorS.y - lastS.y
+      if (dx * dx + dy * dy > 4) {
+        const grad = strokeCtx.createLinearGradient(lastS.x, lastS.y, cursorS.x, cursorS.y)
+        grad.addColorStop(0, 'rgba(96, 205, 255, 0.72)')
+        grad.addColorStop(0.55, 'rgba(96, 205, 255, 0.32)')
+        grad.addColorStop(1, 'rgba(96, 205, 255, 0.04)')
+        const cp1 = lastA.handleOut ? toScreen(lastA.handleOut.x, lastA.handleOut.y) : lastS
+        const cp2 = cursorAnchor.handleIn ? toScreen(cursorAnchor.handleIn.x, cursorAnchor.handleIn.y) : cursorS
+        strokeCtx.strokeStyle = grad
+        strokeCtx.lineWidth = 1.5
+        strokeCtx.setLineDash([5, 4])
+        strokeCtx.globalAlpha = 1
+        strokeCtx.beginPath()
+        strokeCtx.moveTo(lastS.x, lastS.y)
+        strokeCtx.bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, cursorS.x, cursorS.y)
+        strokeCtx.stroke()
+        strokeCtx.setLineDash([])
+      }
+    }
+
+    // 3. If no committed anchors yet (first point being placed), draw a soft dot at pending position
+    if (this.anchors.length === 0 && this._pendingAnchor) {
+      const ps = toScreen(this._pendingAnchor.x, this._pendingAnchor.y)
+      strokeCtx.fillStyle = 'rgba(96, 205, 255, 0.6)'
+      strokeCtx.globalAlpha = 1
+      strokeCtx.beginPath()
+      strokeCtx.arc(ps.x, ps.y, 4, 0, Math.PI * 2)
+      strokeCtx.fill()
     }
 
     // Draw handles for committed anchors

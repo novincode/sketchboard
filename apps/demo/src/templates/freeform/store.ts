@@ -5,6 +5,8 @@ import { subscribeWithSelector } from 'zustand/middleware'
 import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool } from '@sketchboard/core'
 import { Color, RasterLayer, VectorLayer } from '@sketchboard/core'
 import type { ToolId, Background, EraserMode, LayerType } from './types'
+import { RASTER_BRUSH_PRESETS, DEFAULT_BRUSH_PRESET_ID } from './brushPresets'
+import type { BrushPreset } from './brushPresets'
 
 // ─── State shape ─────────────────────────────────────────────────────────────
 
@@ -31,6 +33,12 @@ interface FreeformState {
 
   vectorSize: number
   vectorOpacity: number
+  vectorBrushMerge: boolean
+
+  /** Active raster brush preset id */
+  activeBrushPresetId: string
+  brushPressureSize: boolean
+  brushPressureOpacity: boolean
 
   background: Background
   showColorPicker: boolean
@@ -62,6 +70,9 @@ interface FreeformActions {
 
   setVectorSize(size: number): void
   setVectorOpacity(opacity: number): void
+  setVectorBrushMerge(merge: boolean): void
+
+  setActiveBrushPreset(id: string): void
 
   setBackground(bg: Background): void
   toggleColorPicker(): void
@@ -118,6 +129,17 @@ function applyBrushHardness(board: Board, hardness: number) {
   }
 }
 
+function applyBrushPreset(board: Board, preset: BrushPreset) {
+  for (const name of ['pen', 'brush'] as const) {
+    const tool = board.getTool<BrushTool>(name)
+    if (tool) {
+      tool.settings.hardness = preset.hardness
+      tool.settings.pressureAffectsSize = preset.pressureSize
+      tool.settings.pressureAffectsOpacity = preset.pressureOpacity
+    }
+  }
+}
+
 function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
   return layers.map((l) => ({
     id: l.id,
@@ -137,12 +159,16 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     activeToolId: 'pen',
     brushSize: 8,
     brushOpacity: 1,
-    brushHardness: 0.9,
+    brushHardness: 0.85,
     brushColor: '#1a1a1a',
     eraserSize: 24,
     eraserMode: 'pixel',
     vectorSize: 4,
     vectorOpacity: 1,
+    vectorBrushMerge: false,
+    activeBrushPresetId: DEFAULT_BRUSH_PRESET_ID,
+    brushPressureSize: true,
+    brushPressureOpacity: false,
     background: 'dots' as Background,
     backgroundLayerId: null,
     backgroundLayerColor: '#ffffff',
@@ -163,6 +189,8 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       applyBrushSize(board, s.brushSize)
       applyBrushOpacity(board, s.brushOpacity)
       applyBrushHardness(board, s.brushHardness)
+      const defaultPreset = RASTER_BRUSH_PRESETS.find((p) => p.id === s.activeBrushPresetId) ?? RASTER_BRUSH_PRESETS[0]!
+      applyBrushPreset(board, defaultPreset)
 
       const vec = board.getTool<VectorBrushTool>('vector')
       if (vec) {
@@ -183,6 +211,24 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
         board.setActiveTool(id)
       }
       set({ activeToolId: id })
+    },
+
+    // ── Brush presets ─────────────────────────────────────────────────────
+    setActiveBrushPreset(id) {
+      const { board } = get()
+      const preset = RASTER_BRUSH_PRESETS.find((p) => p.id === id)
+      if (!preset) return
+      if (board) {
+        applyBrushPreset(board, preset)
+        if (board.hasTool(preset.toolId)) board.setActiveTool(preset.toolId)
+      }
+      set({
+        activeBrushPresetId: id,
+        activeToolId: preset.toolId,
+        brushHardness: preset.hardness,
+        brushPressureSize: preset.pressureSize,
+        brushPressureOpacity: preset.pressureOpacity,
+      })
     },
 
     // ── Raster brush ──────────────────────────────────────────────────────
@@ -228,6 +274,12 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const tool = board?.getTool<VectorBrushTool>('vector')
       if (tool) tool.settings.opacity = opacity
       set({ vectorOpacity: opacity })
+    },
+    setVectorBrushMerge(merge) {
+      const { board } = get()
+      const tool = board?.getTool<VectorBrushTool>('vector')
+      if (tool) tool.settings.merge = merge
+      set({ vectorBrushMerge: merge })
     },
 
     // ── UI ────────────────────────────────────────────────────────────────

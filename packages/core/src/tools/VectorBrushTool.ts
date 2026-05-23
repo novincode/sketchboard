@@ -9,6 +9,8 @@ export interface VectorBrushSettings {
   opacity: number
   color: Color
   compositeOperation: GlobalCompositeOperation
+  /** When true, new strokes append to the last stroke instead of creating a new one */
+  merge: boolean
 }
 
 interface VPt {
@@ -23,6 +25,7 @@ export class VectorBrushTool extends Tool {
     opacity: 1,
     color: Color.black(),
     compositeOperation: 'source-over',
+    merge: false,
   }
 
   private isDrawing = false
@@ -66,23 +69,33 @@ export class VectorBrushTool extends Tool {
     this.addPoint(e)
 
     const { r, g, b } = this.settings.color
-    const beforeStrokes = this.activeLayer.strokes.slice()
-    const stroke: VectorStroke = this.activeLayer.createStroke(
-      this.points.map((p) => ({ x: p.lx, y: p.ly, pressure: p.pressure })),
-      `rgb(${r},${g},${b})`,
-      this.settings.size,
-      this.settings.opacity,
-      this.settings.compositeOperation,
-    )
-    this.activeLayer.addStroke(stroke)
-
+    const newPts = this.points.map((p) => ({ x: p.lx, y: p.ly, pressure: p.pressure }))
     const layer = this.activeLayer
     const board = this.board
-    board.history.push({
-      // Use spread so undo/redo always replace the array reference — never mutate the captured snapshots
-      undo: () => { layer.strokes = [...beforeStrokes]; board.markDirty() },
-      redo: () => { layer.strokes = [...beforeStrokes, stroke]; board.markDirty() },
-    })
+
+    if (this.settings.merge && layer.strokes.length > 0) {
+      const lastStroke = layer.strokes[layer.strokes.length - 1]!
+      const beforePoints = lastStroke.points.slice()
+      lastStroke.points = [...lastStroke.points, ...newPts]
+      board.history.push({
+        undo: () => { lastStroke.points = [...beforePoints]; board.markDirty() },
+        redo: () => { lastStroke.points = [...beforePoints, ...newPts]; board.markDirty() },
+      })
+    } else {
+      const beforeStrokes = layer.strokes.slice()
+      const stroke: VectorStroke = layer.createStroke(
+        newPts,
+        `rgb(${r},${g},${b})`,
+        this.settings.size,
+        this.settings.opacity,
+        this.settings.compositeOperation,
+      )
+      layer.addStroke(stroke)
+      board.history.push({
+        undo: () => { layer.strokes = [...beforeStrokes]; board.markDirty() },
+        redo: () => { layer.strokes = [...beforeStrokes, stroke]; board.markDirty() },
+      })
+    }
 
     if (this.usesOverlay) board.clearStrokeCanvas()
     this.isDrawing = false

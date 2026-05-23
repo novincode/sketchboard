@@ -11,6 +11,8 @@ import { TOOLS } from '../types'
 import { useFreeformStore } from '../store'
 import { DraggableInput } from './DraggableInput'
 import type { EraserMode } from '../types'
+import { RASTER_BRUSH_PRESETS } from '../brushPresets'
+import type { BrushPreset } from '../brushPresets'
 
 // ─── Icon map ─────────────────────────────────────────────────────────────────
 
@@ -79,7 +81,8 @@ export function Toolbar() {
     toolbarSnap, toolbarEdgeOffset, setToolbarSnap,
     brushSize, setBrushSize, brushOpacity, setBrushOpacity, brushHardness, setBrushHardness,
     eraserSize, setEraserSize, eraserMode, setEraserMode,
-    vectorSize, setVectorSize, vectorOpacity, setVectorOpacity,
+    vectorSize, setVectorSize, vectorOpacity, setVectorOpacity, vectorBrushMerge, setVectorBrushMerge,
+    activeBrushPresetId, setActiveBrushPreset,
   } = useFreeformStore()
 
   const dragRef = useRef<{ startPX: number; startPY: number } | null>(null)
@@ -124,12 +127,12 @@ export function Toolbar() {
     setSubMenu({ x: e.clientX, y: e.clientY, toolId })
   }, [])
 
-  // Close sub-menu on outside click
+  // Close sub-menu on outside click (bubbling so popup's stopPropagation works)
   useEffect(() => {
     if (!subMenu) return
     const handler = () => setSubMenu(null)
-    window.addEventListener('pointerdown', handler, true)
-    return () => window.removeEventListener('pointerdown', handler, true)
+    window.addEventListener('pointerdown', handler)
+    return () => window.removeEventListener('pointerdown', handler)
   }, [subMenu])
 
   const isVertical = toolbarSnap === 'left' || toolbarSnap === 'right'
@@ -179,13 +182,16 @@ export function Toolbar() {
           ].join(' ')}>
             <ToolOptions
               activeToolId={activeToolId}
+              brushColor={brushColor}
               brushSize={brushSize} setBrushSize={setBrushSize}
               brushOpacity={brushOpacity} setBrushOpacity={setBrushOpacity}
               brushHardness={brushHardness} setBrushHardness={setBrushHardness}
+              activeBrushPresetId={activeBrushPresetId} setActiveBrushPreset={setActiveBrushPreset}
               eraserSize={eraserSize} setEraserSize={setEraserSize}
               eraserMode={eraserMode} setEraserMode={setEraserMode}
               vectorSize={vectorSize} setVectorSize={setVectorSize}
               vectorOpacity={vectorOpacity} setVectorOpacity={setVectorOpacity}
+              vectorBrushMerge={vectorBrushMerge} setVectorBrushMerge={setVectorBrushMerge}
               vertical={isVertical}
             />
           </div>
@@ -308,23 +314,29 @@ function SubToolPopup({ x, y, toolId, snap, onSelect }: {
 
 function ToolOptions({
   activeToolId,
+  brushColor,
   brushSize, setBrushSize,
   brushOpacity, setBrushOpacity,
   brushHardness, setBrushHardness,
+  activeBrushPresetId, setActiveBrushPreset,
   eraserSize, setEraserSize,
   eraserMode, setEraserMode,
   vectorSize, setVectorSize,
   vectorOpacity, setVectorOpacity,
+  vectorBrushMerge, setVectorBrushMerge,
   vertical,
 }: {
   activeToolId: ToolId
+  brushColor: string
   brushSize: number; setBrushSize: (n: number) => void
   brushOpacity: number; setBrushOpacity: (n: number) => void
   brushHardness: number; setBrushHardness: (n: number) => void
+  activeBrushPresetId: string; setActiveBrushPreset: (id: string) => void
   eraserSize: number; setEraserSize: (n: number) => void
   eraserMode: EraserMode; setEraserMode: (m: EraserMode) => void
   vectorSize: number; setVectorSize: (n: number) => void
   vectorOpacity: number; setVectorOpacity: (n: number) => void
+  vectorBrushMerge: boolean; setVectorBrushMerge: (m: boolean) => void
   vertical: boolean
 }) {
   const d = vertical ? 'flex flex-col gap-2 items-center' : 'flex flex-row gap-3 items-end'
@@ -332,6 +344,30 @@ function ToolOptions({
   if (activeToolId === 'pen' || activeToolId === 'brush') {
     return (
       <div className={d}>
+        {/* Brush type presets */}
+        <div className={vertical ? 'grid grid-cols-2 gap-1' : 'flex gap-1'}>
+          {RASTER_BRUSH_PRESETS.map((preset) => (
+            <button
+              key={preset.id}
+              onClick={() => setActiveBrushPreset(preset.id)}
+              title={preset.name}
+              className={[
+                'relative overflow-hidden rounded-lg border transition-all',
+                activeBrushPresetId === preset.id
+                  ? 'border-blue-400/70 ring-1 ring-blue-400/30 scale-105'
+                  : 'border-white/12 hover:border-white/30',
+              ].join(' ')}
+              style={{ width: 54, height: 30 }}
+            >
+              <BrushPreviewCanvas preset={preset} color={brushColor} />
+              <span className={[
+                'absolute bottom-0 left-0 right-0 text-center leading-none py-0.5 text-[8px]',
+                activeBrushPresetId === preset.id ? 'text-blue-300' : 'text-white/35',
+              ].join(' ')}>{preset.name}</span>
+            </button>
+          ))}
+        </div>
+        <Divider vertical={vertical} />
         <DraggableInput label="Size" value={brushSize} min={1} max={200} unit="px" onChange={setBrushSize} />
         <Divider vertical={vertical} />
         <DraggableInput label="Opacity" value={Math.round(brushOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setBrushOpacity(v / 100)} />
@@ -370,10 +406,20 @@ function ToolOptions({
         <DraggableInput label="Size" value={vectorSize} min={1} max={100} unit="px" onChange={setVectorSize} />
         <Divider vertical={vertical} />
         <DraggableInput label="Opacity" value={Math.round(vectorOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setVectorOpacity(v / 100)} />
-        {activeToolId === 'vectorpen' && (
+        {activeToolId === 'vector' && (
           <>
             <Divider vertical={vertical} />
-            <span className="text-[10px] text-white/30 whitespace-nowrap">Click · Drag=curve · ↩ done · Esc cancel</span>
+            <button
+              onClick={() => setVectorBrushMerge(!vectorBrushMerge)}
+              className={[
+                'flex flex-col items-center gap-0.5 rounded-lg border px-2.5 py-1 text-[10px] transition select-none',
+                vectorBrushMerge
+                  ? 'border-blue-500/40 bg-blue-500/15 text-blue-300'
+                  : 'border-white/10 text-white/35 hover:border-white/20 hover:text-white/55',
+              ].join(' ')}
+            >
+              <span className="text-[9px] uppercase tracking-widest font-semibold">Merge</span>
+            </button>
           </>
         )}
       </div>
@@ -382,6 +428,66 @@ function ToolOptions({
 
   return null
 }
+
+// ─── Brush preview canvas ─────────────────────────────────────────────────────
+
+const BrushPreviewCanvas = React.memo(function BrushPreviewCanvas({
+  preset, color,
+}: { preset: BrushPreset; color: string }) {
+  const ref = useRef<HTMLCanvasElement>(null)
+
+  useEffect(() => {
+    const canvas = ref.current
+    if (!canvas) return
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return
+    const W = 54, H = 30
+
+    ctx.clearRect(0, 0, W, H)
+
+    // Parse color
+    const hex = color.replace('#', '')
+    const r = parseInt(hex.substring(0, 2), 16)
+    const g = parseInt(hex.substring(2, 4), 16)
+    const b = parseInt(hex.substring(4, 6), 16)
+
+    ctx.strokeStyle = `rgb(${r},${g},${b})`
+    ctx.fillStyle = `rgb(${r},${g},${b})`
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+
+    if (preset.hardness < 0.85) {
+      const blur = (1 - preset.hardness) * 2.5
+      ctx.filter = `blur(${blur.toFixed(1)}px)`
+    }
+
+    const pts = [
+      { x: 4,    y: H * 0.72, p: 0.1 },
+      { x: W * 0.28, y: H * 0.42, p: 0.65 },
+      { x: W * 0.58, y: H * 0.38, p: 1.0  },
+      { x: W * 0.8,  y: H * 0.48, p: 0.55 },
+      { x: W - 4,   y: H * 0.28, p: 0.15 },
+    ]
+
+    const baseSize = 4.5
+    for (let i = 1; i < pts.length; i++) {
+      const p0 = pts[i - 1]!
+      const p1 = pts[i]!
+      const pressure = (p0.p + p1.p) / 2
+      ctx.lineWidth = preset.pressureSize ? baseSize * (0.15 + pressure * 0.85) : baseSize * 0.5
+      ctx.globalAlpha = preset.pressureOpacity ? Math.max(0.2, pressure * 0.9) : 0.88
+
+      const sx = i === 1 ? p0.x : (pts[i - 2]!.x + p0.x) / 2
+      const sy = i === 1 ? p0.y : (pts[i - 2]!.y + p0.y) / 2
+      const ex = i === pts.length - 1 ? p1.x : (p0.x + p1.x) / 2
+      const ey = i === pts.length - 1 ? p1.y : (p0.y + p1.y) / 2
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.quadraticCurveTo(p0.x, p0.y, ex, ey); ctx.stroke()
+    }
+    ctx.filter = 'none'; ctx.globalAlpha = 1
+  }, [preset, color])
+
+  return <canvas ref={ref} width={54} height={30} className="w-full h-full" />
+})
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 

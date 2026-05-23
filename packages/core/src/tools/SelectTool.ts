@@ -1,7 +1,7 @@
 import { Tool } from './Tool'
 import type { PointerData } from '../types'
 import { VectorLayer } from '../layers/VectorLayer'
-import type { BezierAnchor } from '../layers/VectorLayer'
+import type { BezierAnchor, VectorStroke } from '../layers/VectorLayer'
 import type { Camera } from '../Camera'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -29,6 +29,8 @@ type SelectState =
   | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
   | { kind: 'editing'; id: string }
   | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot }
+  | { kind: 'editing-stroke'; id: string }
+  | { kind: 'dragging-stroke-point'; id: string; pointIdx: number; snap: ElementSnapshot }
 
 const HANDLE_SIZE = 8        // screen px, half-size of each resize handle square
 const HIT_RADIUS = 10        // screen px, pointer hit tolerance for handles/elements
@@ -111,6 +113,33 @@ export class SelectTool extends Tool {
     }
     if (this.state.kind === 'dragging-point') return
 
+    // ── In stroke-edit mode: check stroke points ───────────────────────────
+    if (this.state.kind === 'editing-stroke' && isVec) {
+      const vl = layer as VectorLayer
+      const stroke = vl.strokes.find((s) => s.id === (this.state as { kind: 'editing-stroke'; id: string }).id)
+      if (stroke) {
+        const ptIdx = this.hitTestStrokePoint(e.x, e.y, stroke, vl)
+        if (ptIdx !== null) {
+          const snap = this.snapshotElement(vl, stroke.id)
+          this.state = { kind: 'dragging-stroke-point', id: stroke.id, pointIdx: ptIdx, snap }
+          return
+        }
+      }
+      // Click outside stroke points: check if hitting another element or exit
+      const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+      const lx = world.x - (layer as VectorLayer).transform.x, ly = world.y - (layer as VectorLayer).transform.y
+      const hitId = vl.hitTest(lx, ly, HIT_RADIUS / board.camera.zoom)
+      if (hitId && hitId !== (this.state as { kind: 'editing-stroke'; id: string }).id) {
+        this.state = { kind: 'selected', ids: [hitId] }
+      } else {
+        this.state = { kind: 'idle' }
+      }
+      board.canvas.style.cursor = 'default'
+      this.scheduleOverlayRedraw()
+      return
+    }
+    if (this.state.kind === 'dragging-stroke-point') return
+
     // ── Check resize handles (when selected) ──────────────────────────────
     if ((this.state.kind === 'selected' || this.state.kind === 'moving') && isVec) {
       const st = this.state
@@ -142,10 +171,13 @@ export class SelectTool extends Tool {
         )
         const inside = e.x >= tl.x && e.x <= br.x && e.y >= tl.y && e.y <= br.y
         if (inside) {
-          // Double-click inside selected path → enter edit mode
+          // Double-click inside selected element → enter edit mode
           if (doubleClick && ids.length === 1) {
-            const path = (layer as VectorLayer).paths.find((p) => p.id === ids[0])
+            const vl = layer as VectorLayer
+            const path = vl.paths.find((p) => p.id === ids[0])
             if (path) { this.state = { kind: 'editing', id: ids[0]! }; this.scheduleOverlayRedraw(); return }
+            const stroke = vl.strokes.find((s) => s.id === ids[0])
+            if (stroke) { this.state = { kind: 'editing-stroke', id: ids[0]! }; this.scheduleOverlayRedraw(); return }
           }
           const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
           const lx = world.x - (layer as VectorLayer).transform.x
@@ -168,14 +200,12 @@ export class SelectTool extends Tool {
 
       const hitId = vl.hitTest(lx, ly, hitRadius)
       if (hitId) {
-        // Double-click on any element → immediately enter edit mode (for paths)
+        // Double-click on any element → immediately enter edit mode
         if (doubleClick) {
           const path = vl.paths.find((p) => p.id === hitId)
-          if (path) {
-            this.state = { kind: 'editing', id: hitId }
-            this.scheduleOverlayRedraw()
-            return
-          }
+          if (path) { this.state = { kind: 'editing', id: hitId }; this.scheduleOverlayRedraw(); return }
+          const stroke = vl.strokes.find((s) => s.id === hitId)
+          if (stroke) { this.state = { kind: 'editing-stroke', id: hitId }; this.scheduleOverlayRedraw(); return }
         }
         const ids = [hitId]
         const snaps = ids.map((id) => this.snapshotElement(vl, id))
@@ -244,6 +274,20 @@ export class SelectTool extends Tool {
       if (Math.abs(scaleX) < 0.001 || Math.abs(scaleY) < 0.001) return
 
       for (const id of st.ids) layer.scaleElement(id, scaleX, scaleY, originX, originY)
+      board.markDirty(); this.scheduleOverlayRedraw()
+      return
+    }
+
+    if (this.state.kind === 'dragging-stroke-point') {
+      const st = this.state
+      const layer = board.getActiveLayer()
+      if (!(layer instanceof VectorLayer)) return
+      const stroke = layer.strokes.find((s) => s.id === st.id)
+      if (!stroke) return
+      const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+      const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
+      const pt = stroke.points[st.pointIdx]
+      if (pt) { pt.x = lx; pt.y = ly }
       board.markDirty(); this.scheduleOverlayRedraw()
       return
     }
@@ -341,6 +385,17 @@ export class SelectTool extends Tool {
         })
       }
       this.state = { kind: 'editing', id: st.id }
+    } else if (this.state.kind === 'dragging-stroke-point') {
+      const st = this.state
+      if (layer instanceof VectorLayer) {
+        const after = this.snapshotElement(layer, st.id)
+        const before = st.snap
+        board.history.push({
+          undo: () => { this.restoreElement(layer as VectorLayer, before); board.markDirty(); this.scheduleOverlayRedraw() },
+          redo: () => { this.restoreElement(layer as VectorLayer, after); board.markDirty(); this.scheduleOverlayRedraw() },
+        })
+      }
+      this.state = { kind: 'editing-stroke', id: st.id }
     }
 
     this.scheduleOverlayRedraw()
@@ -355,9 +410,8 @@ export class SelectTool extends Tool {
 
   /** Escape exits edit mode or clears selection. */
   exitEditMode(): void {
-    if (this.state.kind === 'editing' || this.state.kind === 'dragging-point') {
-      this.state = { kind: 'idle' }
-    } else if (this.state.kind === 'selected') {
+    const k = this.state.kind
+    if (k === 'editing' || k === 'dragging-point' || k === 'editing-stroke' || k === 'dragging-stroke-point' || k === 'selected') {
       this.state = { kind: 'idle' }
     }
     this.board?.clearStrokeCanvas()
@@ -368,7 +422,7 @@ export class SelectTool extends Tool {
     const layer = this.board?.getActiveLayer()
     if (!(layer instanceof VectorLayer)) return
     const st = this.state
-    if (st.kind !== 'selected' && st.kind !== 'editing') return
+    if (st.kind !== 'selected' && st.kind !== 'editing' && st.kind !== 'editing-stroke') return
     const ids = st.kind === 'selected' ? st.ids : [st.id]
     for (const id of ids) { layer.removeStroke(id); layer.removePath(id) }
     this.state = { kind: 'idle' }
@@ -413,12 +467,21 @@ export class SelectTool extends Tool {
       if (bounds) this.drawBoundingBox(strokeCtx, bounds, layer, board.camera, W, H)
     }
 
-    // Edit mode handles
+    // Edit mode handles (path)
     if (this.state.kind === 'editing' || this.state.kind === 'dragging-point') {
       const id = this.state.id
       if (layer instanceof VectorLayer) {
         const path = layer.paths.find((p) => p.id === id)
         if (path) this.drawEditHandles(strokeCtx, path.anchors, layer, board.camera, W, H)
+      }
+    }
+
+    // Edit mode handles (vector brush stroke)
+    if (this.state.kind === 'editing-stroke' || this.state.kind === 'dragging-stroke-point') {
+      const id = this.state.id
+      if (layer instanceof VectorLayer) {
+        const stroke = layer.strokes.find((s) => s.id === id)
+        if (stroke) this.drawStrokePoints(strokeCtx, stroke, layer, board.camera, W, H)
       }
     }
 
@@ -498,6 +561,37 @@ export class SelectTool extends Tool {
       ctx.beginPath(); ctx.arc(as.x, as.y, 5, 0, Math.PI * 2)
       ctx.fillStyle = '#fff'; ctx.strokeStyle = '#63b3ed'; ctx.fill(); ctx.stroke()
     }
+  }
+
+  // ── Stroke point edit drawing ─────────────────────────────────────────────
+
+  private drawStrokePoints(ctx: CanvasRenderingContext2D, stroke: VectorStroke, layer: VectorLayer, camera: Camera, W: number, H: number): void {
+    const ts = (lx: number, ly: number) => camera.worldToScreen(lx + layer.transform.x, ly + layer.transform.y, W, H)
+    const step = Math.max(1, Math.floor(stroke.points.length / 60))
+    ctx.setLineDash([])
+    ctx.lineWidth = 1.5
+    for (let i = 0; i < stroke.points.length; i += step) {
+      const p = stroke.points[i]!
+      const ps = ts(p.x, p.y)
+      ctx.beginPath()
+      ctx.arc(ps.x, ps.y, 3.5, 0, Math.PI * 2)
+      ctx.fillStyle = '#fff'
+      ctx.strokeStyle = '#63b3ed'
+      ctx.fill(); ctx.stroke()
+    }
+  }
+
+  private hitTestStrokePoint(sx: number, sy: number, stroke: VectorStroke, layer: VectorLayer): number | null {
+    if (!this.board) return null
+    const { camera, logicalWidth: W, logicalHeight: H } = this.board
+    const step = Math.max(1, Math.floor(stroke.points.length / 60))
+    const r2 = HIT_RADIUS * HIT_RADIUS
+    for (let i = 0; i < stroke.points.length; i += step) {
+      const p = stroke.points[i]!
+      const ps = camera.worldToScreen(p.x + layer.transform.x, p.y + layer.transform.y, W, H)
+      if ((sx - ps.x) ** 2 + (sy - ps.y) ** 2 <= r2) return i
+    }
+    return null
   }
 
   // ── Hit testing ───────────────────────────────────────────────────────────
