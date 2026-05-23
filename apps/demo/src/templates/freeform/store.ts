@@ -58,6 +58,9 @@ interface FreeformState {
   /** The special "Background" layer id — always at index 0 */
   backgroundLayerId: string | null
   backgroundLayerColor: string
+
+  /** Layer marked as reference for brush clipping + fill detection */
+  referenceLayerId: string | null
 }
 
 interface FreeformActions {
@@ -98,6 +101,7 @@ interface FreeformActions {
   setLayerName(id: string, name: string): void
   setLayerBlendMode(id: string, blendMode: string): void
   setBackgroundColor(hex: string): void
+  setReferenceLayerId(id: string | null): void
 
   exportPng(filename?: string): void
 }
@@ -185,6 +189,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     background: 'dots' as Background,
     backgroundLayerId: null,
     backgroundLayerColor: '#ffffff',
+    referenceLayerId: null,
     toolbarSnap: 'bottom' as const,
     toolbarEdgeOffset: 0.5,
     showColorPicker: false,
@@ -426,6 +431,12 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       layer.backgroundColor = hex
       board?.markDirty()
       set({ backgroundLayerColor: hex })
+    },
+
+    setReferenceLayerId(id) {
+      const { board } = get()
+      if (board) board.referenceLayerId = id
+      set({ referenceLayerId: id })
     },
 
     // ── Export ────────────────────────────────────────────────────────────

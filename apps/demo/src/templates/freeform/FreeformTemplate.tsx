@@ -48,13 +48,23 @@ function useFreeformSetup(board: Board | null) {
     // 2. Keyboard shortcuts via plugin (guard against hot-reload double-registration)
     if (!board.plugins.has('keyboard')) board.use(new KeyboardPlugin({
       pencil:      null,  // not registered
-      // Raster: B = brush, Shift+B = raster pen (cycles sibling)
-      pen:         null,  // raster pen no longer has its own shortcut key
+      pen:         null,  // raster pen has no standalone shortcut — cycled via Shift+B
+      // B = always brush; Shift+B = cycle through brush/pen slot
       brush:       { key: 'b', description: 'Raster brush', handler: (b) => b.setActiveTool('brush') },
-      rasterPen:   { key: 'b', shift: true, description: 'Raster pen (Shift+B)', handler: (b) => b.setActiveTool('pen') },
-      // Select: V = rect select, Shift+V = lasso
-      selectTool:  { key: 'v', description: 'Select',       handler: (b) => b.setActiveTool('select') },
-      lassoTool:   { key: 'v', shift: true, description: 'Lasso select (Shift+V)', handler: (b) => b.setActiveTool('lasso') },
+      rasterPen:   { key: 'b', shift: true, description: 'Cycle brush slot (Shift+B)', handler: (b) => {
+        const cur = useFreeformStore.getState().activeToolId
+        const slot: ToolId[] = ['brush', 'pen']
+        const idx = slot.indexOf(cur as ToolId)
+        b.setActiveTool(slot[(idx + 1) % slot.length]!)
+      }},
+      // V = rect select; Shift+V = cycle through select/lasso slot
+      selectTool:  { key: 'v', description: 'Select', handler: (b) => b.setActiveTool('select') },
+      lassoTool:   { key: 'v', shift: true, description: 'Cycle select slot (Shift+V)', handler: (b) => {
+        const cur = useFreeformStore.getState().activeToolId
+        const slot: ToolId[] = ['select', 'lasso']
+        const idx = slot.indexOf(cur as ToolId)
+        b.setActiveTool(slot[(idx + 1) % slot.length]!)
+      }},
       // Other tools
       vectorBrush: { key: 'w', description: 'Vector brush', handler: (b) => b.setActiveTool('vector') },
       vectorPen:   { key: 'p', description: 'Vector pen',   handler: (b) => b.setActiveTool('vectorpen') },
@@ -66,6 +76,10 @@ function useFreeformSetup(board: Board | null) {
         b.getTool<VectorPenTool>('vectorpen')?.cancelPath()
         b.getTool<SelectTool>('select')?.exitEditMode()
       }},
+      // Copy / cut / paste (vector objects)
+      copy:  { key: 'c', cmdOrCtrl: true, description: 'Copy selected',  handler: (b) => b.getTool<SelectTool>('select')?.copySelected() },
+      cut:   { key: 'x', cmdOrCtrl: true, description: 'Cut selected',   handler: (b) => b.getTool<SelectTool>('select')?.cutSelected() },
+      paste: { key: 'v', cmdOrCtrl: true, description: 'Paste',          handler: (b) => b.getTool<SelectTool>('select')?.pasteClipboard() },
     }))
 
     // 3. Store hooks — subscribe BEFORE creating layers so events fire correctly

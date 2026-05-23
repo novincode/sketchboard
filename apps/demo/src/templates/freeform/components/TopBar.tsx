@@ -93,7 +93,7 @@ export function TopBar() {
 
 function Pill({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-black/80 px-2.5 py-1.5 shadow-xl backdrop-blur-xl h-10">
+    <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-black/80 px-3 py-2 shadow-xl backdrop-blur-xl min-h-12">
       {children}
     </div>
   )

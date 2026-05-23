@@ -143,12 +143,13 @@ function ToolButton({
 
   const handleClick = (e: React.MouseEvent) => {
     if (hasSiblings && e.shiftKey) {
-      // Shift+click: cycle to the next sibling
+      // Shift+click: cycle to the next sibling in the slot
       const currentIdx = slot.indexOf(displayId)
       const nextId = slot[(currentIdx + 1) % slot.length]!
       onSelect(nextId)
     } else {
-      onSelect(displayId)
+      // Plain click always activates the primary (first) tool in the slot
+      onSelect(slot[0]!)
     }
   }
 

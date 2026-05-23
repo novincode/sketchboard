@@ -1,7 +1,7 @@
 import { Tool } from './Tool'
 import type { PointerData } from '../types'
 import { VectorLayer } from '../layers/VectorLayer'
-import type { BezierAnchor, VectorStroke } from '../layers/VectorLayer'
+import type { BezierAnchor, VectorStroke, VectorPath } from '../layers/VectorLayer'
 import type { Camera } from '../Camera'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -25,7 +25,7 @@ type SelectState =
   | { kind: 'pending-select'; sx: number; sy: number }
   | { kind: 'selecting'; sx0: number; sy0: number; sx1: number; sy1: number; additive: boolean }
   | { kind: 'selected'; ids: string[] }
-  | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[]; hasMoved: boolean }
+  | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[]; hasMoved: boolean; isDupe?: boolean }
   | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
   | { kind: 'editing'; id: string }
   | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot }
@@ -43,6 +43,7 @@ export class SelectTool extends Tool {
   state: SelectState = { kind: 'idle' }
   mode: SelectMode = 'rect'
 
+  private _clipboard: { strokes: VectorStroke[]; paths: VectorPath[] } | null = null
   private _overlayPending = false
   private _afterRenderUnsub: (() => void) | null = null
   private _lastDownTime = 0
@@ -246,6 +247,15 @@ export class SelectTool extends Tool {
       if (!(layer instanceof VectorLayer)) return
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
       const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
+
+      // Alt+drag: clone on first movement
+      if (!this.state.hasMoved && !this.state.isDupe && this._altDown) {
+        const clonedIds = this.cloneElements(layer, this.state.ids)
+        this.state.ids = clonedIds
+        this.state.snaps = clonedIds.map((id) => this.snapshotElement(layer, id))
+        this.state.isDupe = true
+      }
+
       const dx = lx - this.state.startLX, dy = ly - this.state.startLY
       for (const id of this.state.ids) layer.translateElement(id, dx, dy)
       this.state.startLX = lx; this.state.startLY = ly
@@ -365,7 +375,13 @@ export class SelectTool extends Tool {
       }
       board.canvas.style.cursor = 'default'
     } else if (this.state.kind === 'moving') {
-      if (this.state.hasMoved) this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
+      if (this.state.hasMoved) {
+        if (this.state.isDupe) {
+          this.pushDupeHistory(board, layer as VectorLayer, this.state.ids)
+        } else {
+          this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
+        }
+      }
       const ids = this.state.ids
       this.state = { kind: 'selected', ids }
       board.canvas.style.cursor = 'default'
@@ -440,6 +456,76 @@ export class SelectTool extends Tool {
     for (const id of ids) { layer.removeStroke(id); layer.removePath(id) }
     this.state = { kind: 'idle' }
     this.board?.markDirty(); this.scheduleOverlayRedraw()
+  }
+
+  copySelected(): void {
+    const layer = this.board?.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return
+    const st = this.state
+    if (st.kind !== 'selected' && st.kind !== 'editing' && st.kind !== 'editing-stroke') return
+    const ids = st.kind === 'selected' ? st.ids : [st.id]
+    this._clipboard = {
+      strokes: ids.flatMap((id) => {
+        const s = layer.strokes.find((ss) => ss.id === id)
+        return s ? [{ ...s, points: s.points.map((p) => ({ ...p })) }] : []
+      }),
+      paths: ids.flatMap((id) => {
+        const p = layer.paths.find((pp) => pp.id === id)
+        return p ? [{
+          ...p,
+          anchors: p.anchors.map((a) => ({
+            ...a,
+            handleIn: a.handleIn ? { ...a.handleIn } : null,
+            handleOut: a.handleOut ? { ...a.handleOut } : null,
+          })),
+        }] : []
+      }),
+    }
+  }
+
+  cutSelected(): void {
+    this.copySelected()
+    this.deleteSelected()
+  }
+
+  pasteClipboard(): void {
+    if (!this._clipboard || !this.board) return
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return
+
+    const OFFSET = 12
+    const newIds: string[] = []
+
+    for (const s of this._clipboard.strokes) {
+      const clone = layer.createStroke(
+        s.points.map((p) => ({ ...p, x: p.x + OFFSET, y: p.y + OFFSET })),
+        s.color, s.lineWidth, s.opacity, s.compositeOperation,
+      )
+      layer.addStroke(clone)
+      newIds.push(clone.id)
+    }
+
+    for (const p of this._clipboard.paths) {
+      const clone = layer.createPath(
+        p.anchors.map((a) => ({
+          ...a,
+          x: a.x + OFFSET, y: a.y + OFFSET,
+          handleIn:  a.handleIn  ? { x: a.handleIn.x  + OFFSET, y: a.handleIn.y  + OFFSET } : null,
+          handleOut: a.handleOut ? { x: a.handleOut.x + OFFSET, y: a.handleOut.y + OFFSET } : null,
+        })),
+        p.closed, p.strokeColor, p.strokeWidth, p.fillColor, p.opacity, p.compositeOperation,
+      )
+      layer.addPath(clone)
+      newIds.push(clone.id)
+    }
+
+    this.board.markDirty()
+    if (newIds.length > 0) {
+      this.state = { kind: 'selected', ids: newIds }
+      this.scheduleOverlayRedraw()
+      const board = this.board
+      this.pushDupeHistory(board, layer, newIds)
+    }
   }
 
   // ── Overlay rendering ─────────────────────────────────────────────────────
@@ -733,7 +819,83 @@ export class SelectTool extends Tool {
     }
   }
 
+  // ── Clone helpers ─────────────────────────────────────────────────────────
+
+  private cloneElements(layer: VectorLayer, ids: string[]): string[] {
+    const clonedIds: string[] = []
+    for (const id of ids) {
+      const stroke = layer.strokes.find((s) => s.id === id)
+      if (stroke) {
+        const clone = layer.createStroke(
+          stroke.points.map((p) => ({ ...p })),
+          stroke.color,
+          stroke.lineWidth,
+          stroke.opacity,
+          stroke.compositeOperation,
+        )
+        layer.addStroke(clone)
+        clonedIds.push(clone.id)
+      }
+      const path = layer.paths.find((p) => p.id === id)
+      if (path) {
+        const clone = layer.createPath(
+          path.anchors.map((a) => ({
+            ...a,
+            handleIn: a.handleIn ? { ...a.handleIn } : null,
+            handleOut: a.handleOut ? { ...a.handleOut } : null,
+          })),
+          path.closed,
+          path.strokeColor,
+          path.strokeWidth,
+          path.fillColor,
+          path.opacity,
+          path.compositeOperation,
+        )
+        layer.addPath(clone)
+        clonedIds.push(clone.id)
+      }
+    }
+    return clonedIds
+  }
+
   // ── History ───────────────────────────────────────────────────────────────
+
+  private pushDupeHistory(board: typeof this.board & {}, layer: VectorLayer, dupeIds: string[]): void {
+    if (!board) return
+    const finalStrokes = dupeIds.flatMap((id) => {
+      const s = layer.strokes.find((ss) => ss.id === id)
+      return s ? [{ ...s, points: s.points.map((p) => ({ ...p })) }] : []
+    })
+    const finalPaths = dupeIds.flatMap((id) => {
+      const p = layer.paths.find((pp) => pp.id === id)
+      return p ? [{
+        ...p,
+        anchors: p.anchors.map((a) => ({
+          ...a,
+          handleIn: a.handleIn ? { ...a.handleIn } : null,
+          handleOut: a.handleOut ? { ...a.handleOut } : null,
+        })),
+      }] : []
+    })
+    board.history.push({
+      undo: () => {
+        for (const id of dupeIds) { layer.removeStroke(id); layer.removePath(id) }
+        board.markDirty()
+      },
+      redo: () => {
+        for (const s of finalStrokes) layer.addStroke({ ...s, points: s.points.map((p) => ({ ...p })) })
+        for (const p of finalPaths) layer.addPath({
+          ...p,
+          anchors: p.anchors.map((a) => ({
+            ...a,
+            handleIn: a.handleIn ? { ...a.handleIn } : null,
+            handleOut: a.handleOut ? { ...a.handleOut } : null,
+          })),
+        })
+        board.markDirty()
+      },
+    })
+  }
 
   private pushHistory(board: typeof this.board & {}, layer: VectorLayer, ids: string[], snaps: ElementSnapshot[]): void {
     if (!board) return

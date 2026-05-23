@@ -6,6 +6,8 @@ import { BrushRegistry } from './brushes/BrushRegistry'
 import { Canvas2DRenderer } from './renderer/Canvas2DRenderer'
 import { GestureManager } from './gestures/GestureManager'
 import type { Layer } from './layers/Layer'
+import { RasterLayer } from './layers/RasterLayer'
+import { VectorLayer } from './layers/VectorLayer'
 import type { Tool } from './tools/Tool'
 import type { Renderer } from './renderer/Renderer'
 import type { Plugin } from './plugins/Plugin'
@@ -156,6 +158,49 @@ export class Board {
     const map = new Map(this.layers.map((l) => [l.id, l]))
     this.layers = ids.map((id) => map.get(id)).filter(Boolean) as Layer[]
     this.markDirty()
+  }
+
+  // ─── Reference layer ───────────────────────────────────────────────────────
+
+  /** When set, brush strokes and fill are clipped to this layer's alpha. */
+  referenceLayerId: string | null = null
+
+  /**
+   * Masks `layer`'s pixels against the reference layer's alpha channel.
+   * Pixels where the reference layer is fully transparent are erased.
+   */
+  applyReferenceMask(layer: RasterLayer): void {
+    if (!this.referenceLayerId) return
+    const ref = this.getLayerById(this.referenceLayerId)
+    if (!ref) return
+
+    let refData: ImageData | null = null
+
+    if (ref instanceof RasterLayer) {
+      if (ref.width !== layer.width || ref.height !== layer.height) return
+      refData = ref.getImageData()
+    } else if (ref instanceof VectorLayer) {
+      // Rasterize vector reference at the active layer's resolution
+      const offscreen = document.createElement('canvas')
+      offscreen.width = layer.width
+      offscreen.height = layer.height
+      const ctx = offscreen.getContext('2d')!
+      // VectorLayer.render ignores the camera and uses transform.applyToContext
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      ref.render(ctx, null as any)
+      refData = ctx.getImageData(0, 0, layer.width, layer.height)
+    }
+
+    if (!refData) return
+
+    const activeData = layer.getImageData()
+    const ad = activeData.data
+    const rd = refData.data
+    if (ad.length !== rd.length) return
+    for (let i = 3; i < ad.length; i += 4) {
+      if (rd[i] === 0) ad[i] = 0
+    }
+    layer.putImageData(activeData)
   }
 
   // ─── Stroke overlay helpers ────────────────────────────────────────────────

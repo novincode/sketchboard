@@ -11,6 +11,7 @@ import type { ToolId, EraserMode } from './types'
 import type { FillPlacement } from '@sketchboard/core'
 import { useFreeformStore } from './store'
 import { DraggableInput } from './components/DraggableInput'
+import { Popover } from './components/Popover'
 import { RASTER_BRUSH_PRESETS } from './brushPresets'
 import type { BrushPreset } from './brushPresets'
 
@@ -33,23 +34,23 @@ export interface ToolSlot {
 function BrushPresetDropdown() {
   const { activeBrushPresetId, setActiveBrushPreset, brushColor } = useFreeformStore()
   const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null)
 
   const activePreset = RASTER_BRUSH_PRESETS.find((p) => p.id === activeBrushPresetId) ?? RASTER_BRUSH_PRESETS[0]!
 
-  useEffect(() => {
-    if (!open) return
-    const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+  const handleToggle = () => {
+    if (!open && triggerRef.current) {
+      setAnchorRect(triggerRef.current.getBoundingClientRect())
     }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [open])
+    setOpen((o) => !o)
+  }
 
   return (
-    <div ref={ref} className="relative shrink-0">
+    <div className="shrink-0">
       <button
-        onClick={() => setOpen((o) => !o)}
+        ref={triggerRef}
+        onClick={handleToggle}
         title={activePreset.name}
         className={[
           'flex items-center gap-1.5 rounded-lg border transition-all px-2 py-1',
@@ -66,28 +67,30 @@ function BrushPresetDropdown() {
       </button>
 
       {open && (
-        <div
-          className="absolute left-0 top-full mt-1.5 z-50 w-52 overflow-y-auto rounded-xl border border-white/10 bg-[#111]/95 py-1 shadow-2xl backdrop-blur-xl"
-          style={{ maxHeight: 260 }}
-        >
-          {RASTER_BRUSH_PRESETS.map((preset) => (
-            <button
-              key={preset.id}
-              onClick={() => { setActiveBrushPreset(preset.id); setOpen(false) }}
-              className={[
-                'flex w-full items-center gap-3 px-3 py-2.5 transition-colors',
-                preset.id === activeBrushPresetId
-                  ? 'bg-blue-500/15 text-white'
-                  : 'text-white/60 hover:bg-white/8 hover:text-white',
-              ].join(' ')}
-            >
-              <div className="shrink-0 overflow-hidden rounded-sm" style={{ width: 56, height: 26 }}>
-                <BrushPreviewCanvas preset={preset} color={brushColor} width={56} height={26} />
-              </div>
-              <span className="text-xs">{preset.name}</span>
-            </button>
-          ))}
-        </div>
+        <Popover anchorRect={anchorRect} onClose={() => setOpen(false)} width={208}>
+          <div
+            className="overflow-y-auto rounded-xl border border-white/10 bg-[#111]/95 py-1 shadow-2xl backdrop-blur-xl"
+            style={{ maxHeight: 280 }}
+          >
+            {RASTER_BRUSH_PRESETS.map((preset) => (
+              <button
+                key={preset.id}
+                onClick={() => { setActiveBrushPreset(preset.id); setOpen(false) }}
+                className={[
+                  'flex w-full items-center gap-3 px-3 py-2.5 transition-colors',
+                  preset.id === activeBrushPresetId
+                    ? 'bg-blue-500/15 text-white'
+                    : 'text-white/60 hover:bg-white/8 hover:text-white',
+                ].join(' ')}
+              >
+                <div className="shrink-0 overflow-hidden rounded-sm" style={{ width: 56, height: 26 }}>
+                  <BrushPreviewCanvas preset={preset} color={brushColor} width={56} height={26} />
+                </div>
+                <span className="text-xs">{preset.name}</span>
+              </button>
+            ))}
+          </div>
+        </Popover>
       )}
     </div>
   )

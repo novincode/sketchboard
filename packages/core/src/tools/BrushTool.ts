@@ -100,6 +100,9 @@ export class BrushTool extends Tool {
       this.board.clearStrokeCanvas()
     }
 
+    // Clip painted pixels to reference layer alpha (if one is set)
+    if (this.activeLayer) this.board.applyReferenceMask(this.activeLayer)
+
     this.pushHistory()
     this.isDrawing = false
     this.activeLayer = null

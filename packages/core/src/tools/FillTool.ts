@@ -2,7 +2,7 @@ import { Tool } from './Tool'
 import type { PointerData } from '../types'
 import { RasterLayer } from '../layers/RasterLayer'
 import { VectorLayer } from '../layers/VectorLayer'
-import type { BezierAnchor, VectorPath } from '../layers/VectorLayer'
+import type { VectorPath } from '../layers/VectorLayer'
 
 export type FillPlacement = 'front' | 'back'
 
@@ -12,124 +12,7 @@ export interface FillSettings {
   placement: FillPlacement  // vector only: add fill in front or behind stroke
 }
 
-export class FillTool extends Tool {
-  settings: FillSettings = {
-    color: '#1a1a1a',
-    tolerance: 32,
-    placement: 'back',
-  }
-
-  onPointerDown(e: PointerData): void {
-    if (!this.board) return
-    const layer = this.board.getActiveLayer()
-    if (!layer) return
-    if (!layer.visible) { this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' }); return }
-
-    if (layer instanceof RasterLayer) {
-      this._fillRaster(e, layer)
-    } else if (layer instanceof VectorLayer) {
-      this._fillVector(e, layer)
-    }
-  }
-
-  onPointerMove(_e: PointerData): void {}
-  onPointerUp(_e: PointerData): void {}
-  onPointerCancel(_e: PointerData): void {}
-
-  // ── Raster flood fill ────────────────────────────────────────────────────
-
-  private _fillRaster(e: PointerData, layer: RasterLayer): void {
-    const board = this.board!
-    const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
-    const px = Math.floor(world.x - layer.transform.x)
-    const py = Math.floor(world.y - layer.transform.y)
-
-    if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return
-
-    const imageData = layer.getImageData()
-    const beforeBytes = imageData.data.slice()  // one GPU read, JS copy for undo
-
-    const hex = this.settings.color.replace('#', '')
-    const fillR = parseInt(hex.substring(0, 2), 16)
-    const fillG = parseInt(hex.substring(2, 4), 16)
-    const fillB = parseInt(hex.substring(4, 6), 16)
-    const fillA = 255
-
-    floodFill(imageData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
-    layer.putImageData(imageData)
-    board.markDirty()
-
-    const afterBytes = imageData.data.slice()
-    const w = layer.width, h = layer.height
-    board.history.push({
-      undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(beforeBytes), w, h)); board.markDirty() },
-      redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(afterBytes), w, h)); board.markDirty() },
-    })
-  }
-
-  // ── Vector fill ───────────────────────────────────────────────────────────
-
-  private _fillVector(e: PointerData, layer: VectorLayer): void {
-    const board = this.board!
-    const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
-    const lx = world.x - layer.transform.x
-    const ly = world.y - layer.transform.y
-
-    // Find the topmost closed path that contains the click point
-    let targetPath: VectorPath | null = null
-    for (let i = layer.paths.length - 1; i >= 0; i--) {
-      const p = layer.paths[i]!
-      if (p.closed && pathContainsPoint(p, lx, ly)) {
-        targetPath = p
-        break
-      }
-    }
-
-    if (!targetPath) return
-
-    const beforePaths = layer.paths.slice()
-    const fillPath = layer.createPath(
-      targetPath.anchors.map((a) => ({
-        ...a,
-        handleIn: a.handleIn ? { ...a.handleIn } : null,
-        handleOut: a.handleOut ? { ...a.handleOut } : null,
-      })),
-      true,
-      null,            // no stroke
-      0,
-      this.settings.color,  // fill color
-      targetPath.opacity,
-      targetPath.compositeOperation,
-    )
-
-    if (this.settings.placement === 'back') {
-      // Insert before the target path
-      const idx = layer.paths.indexOf(targetPath)
-      layer.paths.splice(idx, 0, fillPath)
-    } else {
-      // Insert after the target path
-      const idx = layer.paths.indexOf(targetPath)
-      layer.paths.splice(idx + 1, 0, fillPath)
-    }
-
-    board.markDirty()
-    board.history.push({
-      undo: () => { layer.paths = [...beforePaths]; board.markDirty() },
-      redo: () => {
-        if (this.settings.placement === 'back') {
-          const i = layer.paths.indexOf(targetPath!)
-          if (i >= 0) layer.paths.splice(i, 0, fillPath)
-        } else {
-          const i = layer.paths.indexOf(targetPath!)
-          if (i >= 0) layer.paths.splice(i + 1, 0, fillPath)
-        }
-        board.markDirty()
-      },
-    })
-  }
-}
-
-// ── Flood fill (scanline) ──────────────────────────────────────────────────────
+// ── Flood fill helpers (declared before class so DTS rollup can see them) ────────
 
 function floodFill(
   data: Uint8ClampedArray,
@@ -147,7 +30,6 @@ function floodFill(
   const si = getIdx(startX, startY)
   const tR = data[si]!, tG = data[si + 1]!, tB = data[si + 2]!, tA = data[si + 3]!
 
-  // Already the fill color
   if (tR === fillR && tG === fillG && tB === fillB && tA === fillA) return
 
   const match = (x: number, y: number): boolean => {
@@ -170,7 +52,6 @@ function floodFill(
     if (visited[y * width + x]) continue
     if (!match(x, y)) continue
 
-    // Scanline: go left and right from this x
     let lx = x
     while (lx > 0 && !visited[y * width + (lx - 1)] && match(lx - 1, y)) lx--
     let rx = x
@@ -186,7 +67,62 @@ function floodFill(
   }
 }
 
-// ── Point-in-path (ray casting on sampled bezier segments) ────────────────────
+// Reference-aware fill: uses reference alpha as walls; fills active layer in enclosed region.
+function floodFillWithRef(
+  activeData: Uint8ClampedArray,
+  refData: Uint8ClampedArray,
+  width: number,
+  height: number,
+  startX: number,
+  startY: number,
+  fillR: number,
+  fillG: number,
+  fillB: number,
+  fillA: number,
+  tolerance: number,
+): void {
+  const getIdx = (x: number, y: number) => (y * width + x) * 4
+  const isWall = (x: number, y: number): boolean => refData[getIdx(x, y) + 3]! > tolerance
+  if (isWall(startX, startY)) return
+
+  const visited = new Uint8Array(width * height)
+  const stack: number[] = [startX, startY]
+
+  while (stack.length) {
+    const y = stack.pop()!
+    const x = stack.pop()!
+    if (x < 0 || x >= width || y < 0 || y >= height) continue
+    if (visited[y * width + x]) continue
+    if (isWall(x, y)) continue
+
+    let lx = x
+    while (lx > 0 && !visited[y * width + (lx - 1)] && !isWall(lx - 1, y)) lx--
+    let rx = x
+    while (rx < width - 1 && !visited[y * width + (rx + 1)] && !isWall(rx + 1, y)) rx++
+
+    for (let cx = lx; cx <= rx; cx++) {
+      const ci = getIdx(cx, y)
+      activeData[ci] = fillR; activeData[ci + 1] = fillG; activeData[ci + 2] = fillB; activeData[ci + 3] = fillA
+      visited[y * width + cx] = 1
+      if (y > 0          && !visited[(y - 1) * width + cx] && !isWall(cx, y - 1)) stack.push(cx, y - 1)
+      if (y < height - 1 && !visited[(y + 1) * width + cx] && !isWall(cx, y + 1)) stack.push(cx, y + 1)
+    }
+  }
+}
+
+// Rasterize a VectorLayer to ImageData at the given dimensions.
+function rasterizeVectorLayer(vecLayer: VectorLayer, width: number, height: number): ImageData {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const ctx = canvas.getContext('2d')!
+  // VectorLayer.render ignores the camera — draws in world space via transform.applyToContext
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  vecLayer.render(ctx, null as any)
+  return ctx.getImageData(0, 0, width, height)
+}
+
+// ─── Point-in-path (ray casting on sampled bezier segments) ──────────────────
 
 function pathContainsPoint(path: VectorPath, px: number, py: number): boolean {
   const points = samplePath(path, 80)
@@ -227,4 +163,136 @@ function raycastPolygon(pts: Array<{ x: number; y: number }>, px: number, py: nu
     }
   }
   return inside
+}
+
+// ─── FillTool ─────────────────────────────────────────────────────────────────
+
+export class FillTool extends Tool {
+  settings: FillSettings = {
+    color: '#1a1a1a',
+    tolerance: 32,
+    placement: 'back',
+  }
+
+  onPointerDown(e: PointerData): void {
+    if (!this.board) return
+    const layer = this.board.getActiveLayer()
+    if (!layer) return
+    if (!layer.visible) { this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' }); return }
+
+    if (layer instanceof RasterLayer) {
+      this._fillRaster(e, layer)
+    } else if (layer instanceof VectorLayer) {
+      this._fillVector(e, layer)
+    }
+  }
+
+  onPointerMove(_e: PointerData): void {}
+  onPointerUp(_e: PointerData): void {}
+  onPointerCancel(_e: PointerData): void {}
+
+  // ── Raster flood fill ────────────────────────────────────────────────────
+
+  private _fillRaster(e: PointerData, layer: RasterLayer): void {
+    const board = this.board!
+    const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+    const px = Math.floor(world.x - layer.transform.x)
+    const py = Math.floor(world.y - layer.transform.y)
+
+    if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return
+
+    const hex = this.settings.color.replace('#', '')
+    const fillR = parseInt(hex.substring(0, 2), 16)
+    const fillG = parseInt(hex.substring(2, 4), 16)
+    const fillB = parseInt(hex.substring(4, 6), 16)
+    const fillA = 255
+
+    const imageData = layer.getImageData()
+    const beforeBytes = imageData.data.slice()
+
+    // Use reference layer as boundary source if set (supports both raster and vector reference)
+    const refObj = board.referenceLayerId ? board.getLayerById(board.referenceLayerId) : null
+    let refImageData: ImageData | null = null
+
+    if (refObj instanceof RasterLayer && refObj.width === layer.width && refObj.height === layer.height) {
+      refImageData = refObj.getImageData()
+    } else if (refObj instanceof VectorLayer) {
+      refImageData = rasterizeVectorLayer(refObj, layer.width, layer.height)
+    }
+
+    if (refImageData) {
+      floodFillWithRef(imageData.data, refImageData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
+    } else {
+      floodFill(imageData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
+    }
+
+    layer.putImageData(imageData)
+    board.markDirty()
+
+    const afterBytes = imageData.data.slice()
+    const w = layer.width, h = layer.height
+    board.history.push({
+      undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(beforeBytes), w, h)); board.markDirty() },
+      redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(afterBytes), w, h)); board.markDirty() },
+    })
+  }
+
+  // ── Vector fill ───────────────────────────────────────────────────────────
+
+  private _fillVector(e: PointerData, layer: VectorLayer): void {
+    const board = this.board!
+    const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+    const lx = world.x - layer.transform.x
+    const ly = world.y - layer.transform.y
+
+    // Find the topmost closed path that contains the click point
+    let targetPath: VectorPath | null = null
+    for (let i = layer.paths.length - 1; i >= 0; i--) {
+      const p = layer.paths[i]!
+      if (p.closed && pathContainsPoint(p, lx, ly)) {
+        targetPath = p
+        break
+      }
+    }
+
+    if (!targetPath) return
+
+    const beforePaths = layer.paths.slice()
+    const fillPath = layer.createPath(
+      targetPath.anchors.map((a) => ({
+        ...a,
+        handleIn: a.handleIn ? { ...a.handleIn } : null,
+        handleOut: a.handleOut ? { ...a.handleOut } : null,
+      })),
+      true,
+      null,
+      0,
+      this.settings.color,
+      targetPath.opacity,
+      targetPath.compositeOperation,
+    )
+
+    if (this.settings.placement === 'back') {
+      const idx = layer.paths.indexOf(targetPath)
+      layer.paths.splice(idx, 0, fillPath)
+    } else {
+      const idx = layer.paths.indexOf(targetPath)
+      layer.paths.splice(idx + 1, 0, fillPath)
+    }
+
+    board.markDirty()
+    board.history.push({
+      undo: () => { layer.paths = [...beforePaths]; board.markDirty() },
+      redo: () => {
+        if (this.settings.placement === 'back') {
+          const i = layer.paths.indexOf(targetPath!)
+          if (i >= 0) layer.paths.splice(i, 0, fillPath)
+        } else {
+          const i = layer.paths.indexOf(targetPath!)
+          if (i >= 0) layer.paths.splice(i + 1, 0, fillPath)
+        }
+        board.markDirty()
+      },
+    })
+  }
 }

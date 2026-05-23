@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState, forwardRef, useCallback } from 'rea
 import { createPortal } from 'react-dom'
 import {
   Eye, EyeOff, Plus, Trash2, Layers, PenLine,
-  ChevronDown, ChevronUp, Copy, Eraser,
+  ChevronDown, ChevronUp, Copy, Eraser, Bookmark,
 } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import { useFreeformStore } from '../store'
@@ -21,9 +21,11 @@ const BLEND_MODES = [
 export function LayerPanel() {
   const {
     layers, activeLayerId, backgroundLayerId, backgroundLayerColor,
+    referenceLayerId,
     addLayer, removeLayer, duplicateLayer, clearLayer,
     setActiveLayerId, setLayerVisibility, setLayerOpacity,
     setLayerBlendMode, setLayerName, setBackgroundColor,
+    setReferenceLayerId,
     toggleLayerPanel,
   } = useFreeformStore()
 
@@ -109,6 +111,7 @@ export function LayerPanel() {
               blendMode={layer.blendMode}
               layerType={layer.type}
               isActive={layer.id === activeLayerId}
+              isReference={layer.id === referenceLayerId}
               canDelete={layers.filter((l) => l.id !== backgroundLayerId).length > 1}
               onSelect={() => setActiveLayerId(layer.id)}
               onVisibilityToggle={() => setLayerVisibility(layer.id, !layer.visible)}
@@ -118,6 +121,7 @@ export function LayerPanel() {
               onOpacityChange={(v) => setLayerOpacity(layer.id, v)}
               onBlendModeChange={(m) => setLayerBlendMode(layer.id, m)}
               onRename={(n) => setLayerName(layer.id, n)}
+              onToggleReference={() => setReferenceLayerId(layer.id === referenceLayerId ? null : layer.id)}
             />
           )
         })}
@@ -189,14 +193,14 @@ function BackgroundLayerRow({
 
 function LayerRow({
   id, name, visible, opacity, blendMode, layerType,
-  isActive, canDelete,
+  isActive, isReference, canDelete,
   onSelect, onVisibilityToggle, onDelete, onDuplicate, onClear,
-  onOpacityChange, onBlendModeChange, onRename,
+  onOpacityChange, onBlendModeChange, onRename, onToggleReference,
 }: {
   id: string; name: string; visible: boolean; opacity: number; blendMode: string; layerType: LayerType
-  isActive: boolean; canDelete: boolean
+  isActive: boolean; isReference: boolean; canDelete: boolean
   onSelect: () => void; onVisibilityToggle: () => void; onDelete: () => void
-  onDuplicate: () => void; onClear: () => void
+  onDuplicate: () => void; onClear: () => void; onToggleReference: () => void
   onOpacityChange: (v: number) => void; onBlendModeChange: (m: string) => void; onRename: (n: string) => void
 }) {
   const [editing, setEditing] = useState(false)
@@ -219,6 +223,7 @@ function LayerRow({
     { label: 'Rename',    icon: null, onClick: () => setEditing(true) },
     { label: 'Duplicate', icon: <Copy size={13} />,   onClick: onDuplicate },
     { label: 'Clear',     icon: <Eraser size={13} />, onClick: onClear },
+    { label: isReference ? 'Remove reference' : 'Set as reference', icon: <Bookmark size={13} />, onClick: onToggleReference },
     { separator: true as const },
     { label: 'Delete', icon: <Trash2 size={13} />, danger: true, disabled: !canDelete, onClick: onDelete },
   ]
@@ -229,6 +234,7 @@ function LayerRow({
         className={[
           'group rounded-xl transition-colors overflow-hidden',
           isActive ? 'bg-white/8 ring-1 ring-white/20' : 'hover:bg-white/4',
+          isReference ? 'ring-1 ring-amber-400/40' : '',
         ].join(' ')}
         onContextMenu={onContextMenu}
         onPointerDown={onPointerDown}
@@ -268,6 +274,29 @@ function LayerRow({
           )}
 
           <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+            <button
+              onClick={onToggleReference}
+              title={isReference ? 'Remove reference' : 'Set as reference layer'}
+              className={[
+                'p-0.5 transition',
+                isReference
+                  ? 'text-amber-400 opacity-100'
+                  : 'opacity-0 group-hover:opacity-100 text-white/25 hover:text-amber-400',
+              ].join(' ')}
+            >
+              <Bookmark size={13} />
+            </button>
+            <button
+              onClick={onDelete}
+              disabled={!canDelete}
+              title="Delete layer"
+              className={[
+                'p-0.5 transition opacity-0 group-hover:opacity-100',
+                canDelete ? 'text-white/25 hover:text-red-400' : 'text-white/10 cursor-default',
+              ].join(' ')}
+            >
+              <Trash2 size={13} />
+            </button>
             <button onClick={onVisibilityToggle} className="text-white/30 hover:text-white/80 transition p-0.5">
               {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
             </button>

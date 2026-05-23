@@ -146,15 +146,21 @@ export class GestureManager {
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault()
     const rect = this.element.getBoundingClientRect()
-    const delta = e.ctrlKey ? e.deltaY : e.deltaY * 0.5
-    const factor = Math.pow(0.999, delta)
-    this.camera.zoomAt(
-      factor,
-      e.clientX - rect.left,
-      e.clientY - rect.top,
-      this.board.logicalWidth,
-      this.board.logicalHeight,
-    )
+
+    if (e.ctrlKey || e.metaKey) {
+      // Trackpad pinch (ctrlKey) or Cmd+scroll (metaKey) → zoom toward cursor
+      const factor = Math.pow(0.999, e.deltaY)
+      this.camera.zoomAt(
+        factor,
+        e.clientX - rect.left,
+        e.clientY - rect.top,
+        this.board.logicalWidth,
+        this.board.logicalHeight,
+      )
+    } else {
+      // Two-finger scroll/swipe (trackpad) → pan canvas
+      this.camera.pan(-e.deltaX, -e.deltaY)
+    }
     this.board.markDirty()
   }
 
