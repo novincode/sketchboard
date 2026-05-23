@@ -34,6 +34,7 @@ interface FreeformState {
   vectorSize: number
   vectorOpacity: number
   vectorBrushMerge: boolean
+  vectorStreamline: number
 
   fillTolerance: number
   fillPlacement: FillPlacement
@@ -74,6 +75,7 @@ interface FreeformActions {
   setVectorSize(size: number): void
   setVectorOpacity(opacity: number): void
   setVectorBrushMerge(merge: boolean): void
+  setVectorStreamline(streamline: number): void
 
   setFillTolerance(tolerance: number): void
   setFillPlacement(placement: FillPlacement): void
@@ -174,6 +176,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     vectorSize: 4,
     vectorOpacity: 1,
     vectorBrushMerge: false,
+    vectorStreamline: 0.2,
     fillTolerance: 32,
     fillPlacement: 'back' as FillPlacement,
     activeBrushPresetId: DEFAULT_BRUSH_PRESET_ID,
@@ -290,6 +293,12 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const tool = board?.getTool<VectorBrushTool>('vector')
       if (tool) tool.settings.merge = merge
       set({ vectorBrushMerge: merge })
+    },
+    setVectorStreamline(streamline) {
+      const { board } = get()
+      const tool = board?.getTool<VectorBrushTool>('vector')
+      if (tool) tool.settings.streamline = streamline
+      set({ vectorStreamline: streamline })
     },
 
     // ── Fill tool ─────────────────────────────────────────────────────────

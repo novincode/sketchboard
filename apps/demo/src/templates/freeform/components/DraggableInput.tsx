@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useRef, useState, useCallback } from 'react'
+import { ContextMenu, useContextMenu } from './ContextMenu'
 
 interface DraggableInputProps {
   label: string
@@ -12,6 +13,8 @@ interface DraggableInputProps {
   decimals?: number
   unit?: string
   onChange: (value: number) => void
+  /** If provided, right-click shows a "Reset to default" option */
+  defaultValue?: number
 }
 
 export function DraggableInput({
@@ -23,6 +26,7 @@ export function DraggableInput({
   decimals = 0,
   unit = '',
   onChange,
+  defaultValue,
 }: DraggableInputProps) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -30,12 +34,14 @@ export function DraggableInput({
   const startX = useRef(0)
   const startValue = useRef(0)
   const didDrag = useRef(false)
+  const { menu, open: openMenu, close: closeMenu } = useContextMenu()
 
   const clamp = (v: number) => Math.max(min, Math.min(max, v))
   const snap = (v: number) => Number(v.toFixed(decimals))
 
   const onPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      if (e.button !== 0) return  // ignore right-click — let onContextMenu handle it
       if (editing) return
       e.currentTarget.setPointerCapture(e.pointerId)
       startX.current = e.clientX
@@ -80,10 +86,19 @@ export function DraggableInput({
     setEditing(false)
   }, [draft, clamp, snap, onChange])
 
+  const onContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      if (defaultValue === undefined) return
+      e.preventDefault()
+      openMenu(e.clientX, e.clientY)
+    },
+    [defaultValue, openMenu],
+  )
+
   const displayValue = decimals > 0 ? value.toFixed(decimals) : String(Math.round(value))
 
   return (
-    <div className="flex flex-col items-center gap-1 select-none min-w-[52px]">
+    <div className="flex flex-col items-center gap-1 select-none min-w-13">
       <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">
         {label}
       </span>
@@ -106,10 +121,20 @@ export function DraggableInput({
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
           onPointerUp={onPointerUp}
-          title={`Drag to adjust ${label.toLowerCase()}, click to type`}
+          onContextMenu={onContextMenu}
+          title={`Drag to adjust ${label.toLowerCase()}, click to type${defaultValue !== undefined ? ', right-click to reset' : ''}`}
         >
           {displayValue}{unit}
         </div>
+      )}
+
+      {menu && defaultValue !== undefined && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          entries={[{ label: `Reset to default (${defaultValue}${unit})`, onClick: () => onChange(defaultValue) }]}
+          onClose={closeMenu}
+        />
       )}
     </div>
   )

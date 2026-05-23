@@ -11,6 +11,8 @@ export interface VectorBrushSettings {
   compositeOperation: GlobalCompositeOperation
   /** When true, new strokes append to the last stroke instead of creating a new one */
   merge: boolean
+  /** 0 = no simplification, 1 = maximum (fewer points, more rigid). Default 0.2 */
+  streamline: number
 }
 
 interface VPt {
@@ -26,6 +28,7 @@ export class VectorBrushTool extends Tool {
     color: Color.black(),
     compositeOperation: 'source-over',
     merge: false,
+    streamline: 0.2,
   }
 
   private isDrawing = false
@@ -69,7 +72,10 @@ export class VectorBrushTool extends Tool {
     this.addPoint(e)
 
     const { r, g, b } = this.settings.color
-    const newPts = this.points.map((p) => ({ x: p.lx, y: p.ly, pressure: p.pressure }))
+    const rawPts = this.points.map((p) => ({ x: p.lx, y: p.ly, pressure: p.pressure }))
+    const newPts = this.settings.streamline > 0
+      ? douglasPeucker(rawPts, this.settings.streamline * 4)
+      : rawPts
     const layer = this.activeLayer
     const board = this.board
 
@@ -167,4 +173,33 @@ export class VectorBrushTool extends Tool {
 
     strokeCtx.restore()
   }
+}
+
+// ── Douglas-Peucker polyline simplification ────────────────────────────────────
+
+function perpendicularDist(
+  p: { x: number; y: number },
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+): number {
+  const dx = b.x - a.x, dy = b.y - a.y
+  if (dx === 0 && dy === 0) return Math.hypot(p.x - a.x, p.y - a.y)
+  const t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / (dx * dx + dy * dy)
+  return Math.hypot(a.x + t * dx - p.x, a.y + t * dy - p.y)
+}
+
+function douglasPeucker<T extends { x: number; y: number }>(pts: T[], epsilon: number): T[] {
+  if (pts.length <= 2) return pts
+  let maxDist = 0, maxIdx = 0
+  const first = pts[0]!, last = pts[pts.length - 1]!
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d = perpendicularDist(pts[i]!, first, last)
+    if (d > maxDist) { maxDist = d; maxIdx = i }
+  }
+  if (maxDist > epsilon) {
+    const left = douglasPeucker(pts.slice(0, maxIdx + 1), epsilon)
+    const right = douglasPeucker(pts.slice(maxIdx), epsilon)
+    return [...left.slice(0, -1), ...right]
+  }
+  return [first, last]
 }

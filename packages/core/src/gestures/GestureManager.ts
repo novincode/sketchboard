@@ -4,6 +4,7 @@ import type { Board } from '../Board'
 export class GestureManager {
   private activePointers = new Map<number, PointerEvent>()
   private lastPinchDist = 0
+  private lastPinchAngle = 0
   private lastTwoFingerCenter = { x: 0, y: 0 }
   private isSpaceHeld = false
   private isMiddleDown = false
@@ -49,16 +50,20 @@ export class GestureManager {
     if (e.button === 1) {
       this.isMiddleDown = true
       this.board.setTempTool('pan')
-      // Forward down to pan tool so it enters drag mode
       this.board.activeTool?.onPointerDown(this.toPointerData(e))
       e.preventDefault()
       return
     }
 
     if (this.activePointers.size === 2) {
+      // Cancel any in-progress single-finger tool stroke before starting gesture
+      const firstPtr = [...this.activePointers.values()].find((p) => p.pointerId !== e.pointerId)
+      if (firstPtr) this.board.activeTool?.onPointerCancel(this.toPointerData(firstPtr))
+
       const [a, b] = [...this.activePointers.values()] as [PointerEvent, PointerEvent]
       this.lastPinchDist = this.distance(a, b)
       this.lastTwoFingerCenter = this.midpoint(a, b)
+      this.lastPinchAngle = this.angle(a, b)
       return
     }
 
@@ -70,10 +75,8 @@ export class GestureManager {
   private onPointerMove = (e: PointerEvent): void => {
     this.activePointers.set(e.pointerId, e)
 
-    // Two-finger gesture: pinch-zoom + pan
+    // Two-finger gesture: pinch-zoom + pan + rotate
     if (this.activePointers.size >= 2) {
-      // Don't process coalesced events for two-finger gestures
-
       const [a, b] = [...this.activePointers.values()] as [PointerEvent, PointerEvent]
       const dist = this.distance(a, b)
       const center = this.midpoint(a, b)
@@ -86,8 +89,16 @@ export class GestureManager {
       if (this.lastPinchDist > 0) {
         const zoomFactor = dist / this.lastPinchDist
         this.camera.zoomAt(zoomFactor, cx, cy, this.board.logicalWidth, this.board.logicalHeight)
-        // Pan: midpoint moved right → camera looks further right → content moves right
         this.camera.pan(cx - prevCx, cy - prevCy)
+
+        // Rotation delta — normalize to [-π, π] to avoid wrap-around jumps
+        const angle = this.angle(a, b)
+        let angleDelta = angle - this.lastPinchAngle
+        if (angleDelta > Math.PI)  angleDelta -= 2 * Math.PI
+        if (angleDelta < -Math.PI) angleDelta += 2 * Math.PI
+        this.camera.rotation += angleDelta
+        this.lastPinchAngle = angle
+
         this.board.markDirty()
       }
 
@@ -97,12 +108,10 @@ export class GestureManager {
     }
 
     // Use coalesced events to capture all intermediate pointer positions between frames.
-    // This is the single biggest factor for smooth, non-jagged strokes on high-Hz devices.
     const coalesced = e.getCoalescedEvents?.() ?? [e]
     for (const ce of coalesced) {
       this.board.activeTool?.onPointerMove(this.toPointerData(ce))
     }
-    // Predicted events give sub-frame latency — pass the final one only
     const predicted = e.getPredictedEvents?.()
     if (predicted?.length) {
       this.board.activeTool?.onPointerMove(this.toPointerData(predicted[predicted.length - 1]!))
@@ -111,7 +120,10 @@ export class GestureManager {
 
   private onPointerUp = (e: PointerEvent): void => {
     this.activePointers.delete(e.pointerId)
-    if (this.activePointers.size < 2) this.lastPinchDist = 0
+    if (this.activePointers.size < 2) {
+      this.lastPinchDist = 0
+      this.lastPinchAngle = 0
+    }
 
     if (e.button === 1 && this.isMiddleDown) {
       this.isMiddleDown = false
@@ -124,14 +136,16 @@ export class GestureManager {
 
   private onPointerCancel = (e: PointerEvent): void => {
     this.activePointers.delete(e.pointerId)
-    if (this.activePointers.size < 2) this.lastPinchDist = 0
+    if (this.activePointers.size < 2) {
+      this.lastPinchDist = 0
+      this.lastPinchAngle = 0
+    }
     this.board.activeTool?.onPointerCancel(this.toPointerData(e))
   }
 
   private onWheel = (e: WheelEvent): void => {
     e.preventDefault()
     const rect = this.element.getBoundingClientRect()
-    // Use logarithmic zoom for trackpad (deltaY can be fractional)
     const delta = e.ctrlKey ? e.deltaY : e.deltaY * 0.5
     const factor = Math.pow(0.999, delta)
     this.camera.zoomAt(
@@ -169,6 +183,10 @@ export class GestureManager {
 
   private midpoint(a: PointerEvent, b: PointerEvent): { x: number; y: number } {
     return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 }
+  }
+
+  private angle(a: PointerEvent, b: PointerEvent): number {
+    return Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX)
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────

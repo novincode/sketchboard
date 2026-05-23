@@ -24,7 +24,7 @@ import type { ToolId } from './types'
 const LAYER_W = 3840
 const LAYER_H = 2160
 
-const HIDE_CURSOR_TOOLS = new Set<ToolId>(['pen', 'brush', 'eraser', 'fill', 'vector', 'vectorpen'])
+const HIDE_CURSOR_TOOLS = new Set<ToolId>(['pen', 'brush', 'eraser', 'vector', 'vectorpen'])
 
 function useFreeformSetup(board: Board | null) {
   const { _setBoard, setBrushColor } = useFreeformStore()
@@ -201,7 +201,11 @@ export function FreeformTemplate() {
       <div
         ref={containerRef}
         className="absolute inset-0"
-        style={hideCursor ? { cursor: 'none' } : undefined}
+        style={
+          hideCursor ? { cursor: 'none' } :
+          activeToolId === 'fill' ? { cursor: 'crosshair' } :
+          undefined
+        }
       />
 
       <BrushCursor />

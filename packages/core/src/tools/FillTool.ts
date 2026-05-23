@@ -47,7 +47,7 @@ export class FillTool extends Tool {
     if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return
 
     const imageData = layer.getImageData()
-    const before = layer.getImageData()  // snapshot for undo
+    const beforeBytes = imageData.data.slice()  // one GPU read, JS copy for undo
 
     const hex = this.settings.color.replace('#', '')
     const fillR = parseInt(hex.substring(0, 2), 16)
@@ -59,10 +59,11 @@ export class FillTool extends Tool {
     layer.putImageData(imageData)
     board.markDirty()
 
-    const after = layer.getImageData()
+    const afterBytes = imageData.data.slice()
+    const w = layer.width, h = layer.height
     board.history.push({
-      undo: () => { layer.putImageData(before); board.markDirty() },
-      redo: () => { layer.putImageData(after); board.markDirty() },
+      undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(beforeBytes), w, h)); board.markDirty() },
+      redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(afterBytes), w, h)); board.markDirty() },
     })
   }
 

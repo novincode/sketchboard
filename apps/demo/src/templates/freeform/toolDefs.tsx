@@ -1,20 +1,9 @@
 'use client'
 
-/**
- * Central tool registry for the freeform template.
- *
- * Each ToolDef describes a single tool: its id, label, icon, and an optional
- * OptionsPanel component rendered in the TopBar when that tool is active.
- * OptionsPanels read directly from useFreeformStore — no prop-drilling needed.
- *
- * ToolSlots drive the Toolbar: each slot holds one or more sibling tools.
- * Shift+clicking the slot's toolbar button cycles through siblings.
- */
-
-import React, { useEffect, useRef } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import {
   MousePointer2, Lasso, Paintbrush, Pen, Eraser, PaintBucket,
-  Spline, PenTool as PenToolIcon, Pipette, Hand,
+  Spline, PenTool as PenToolIcon, Pipette, Hand, ChevronDown,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -31,62 +20,100 @@ export interface ToolDef {
   id: ToolId
   label: string
   Icon: LucideIcon
-  /** Compact horizontal options panel rendered in the TopBar. Reads from store directly. */
   OptionsPanel: React.FC | null
 }
 
-/** A logical toolbar "slot" — one button, possibly cycling through siblings via Shift+click */
 export interface ToolSlot {
-  /** All tool ids in this group. First = default when none are active. */
   ids: [ToolId, ...ToolId[]]
-  /** Primary keyboard shortcut key (without modifiers) */
   shortcut: string
 }
 
-// ─── Individual OptionsPanel components ───────────────────────────────────────
+// ─── Brush preset dropdown ────────────────────────────────────────────────────
+
+function BrushPresetDropdown() {
+  const { activeBrushPresetId, setActiveBrushPreset, brushColor } = useFreeformStore()
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  const activePreset = RASTER_BRUSH_PRESETS.find((p) => p.id === activeBrushPresetId) ?? RASTER_BRUSH_PRESETS[0]!
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
+  return (
+    <div ref={ref} className="relative shrink-0">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        title={activePreset.name}
+        className={[
+          'flex items-center gap-1.5 rounded-lg border transition-all px-2 py-1',
+          open
+            ? 'border-blue-400/50 bg-blue-500/10 text-white'
+            : 'border-white/12 bg-white/5 hover:border-white/25 text-white/70',
+        ].join(' ')}
+        style={{ width: 80, height: 32 }}
+      >
+        <div className="flex-1 overflow-hidden rounded-sm" style={{ height: 22 }}>
+          <BrushPreviewCanvas preset={activePreset} color={brushColor} width={56} height={22} />
+        </div>
+        <ChevronDown size={9} className="shrink-0 opacity-50" />
+      </button>
+
+      {open && (
+        <div
+          className="absolute left-0 top-full mt-1.5 z-50 w-52 overflow-y-auto rounded-xl border border-white/10 bg-[#111]/95 py-1 shadow-2xl backdrop-blur-xl"
+          style={{ maxHeight: 260 }}
+        >
+          {RASTER_BRUSH_PRESETS.map((preset) => (
+            <button
+              key={preset.id}
+              onClick={() => { setActiveBrushPreset(preset.id); setOpen(false) }}
+              className={[
+                'flex w-full items-center gap-3 px-3 py-2.5 transition-colors',
+                preset.id === activeBrushPresetId
+                  ? 'bg-blue-500/15 text-white'
+                  : 'text-white/60 hover:bg-white/8 hover:text-white',
+              ].join(' ')}
+            >
+              <div className="shrink-0 overflow-hidden rounded-sm" style={{ width: 56, height: 26 }}>
+                <BrushPreviewCanvas preset={preset} color={brushColor} width={56} height={26} />
+              </div>
+              <span className="text-xs">{preset.name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── OptionsPanel components ──────────────────────────────────────────────────
 
 function RasterBrushOptionsPanel() {
   const {
-    brushColor, brushSize, setBrushSize,
+    brushSize, setBrushSize,
     brushOpacity, setBrushOpacity,
     brushHardness, setBrushHardness,
     activeToolId,
-    activeBrushPresetId, setActiveBrushPreset,
   } = useFreeformStore()
 
   return (
     <div className="flex items-center gap-2">
-      {/* Brush preset thumbnails */}
-      <div className="flex gap-1">
-        {RASTER_BRUSH_PRESETS.map((preset) => (
-          <button
-            key={preset.id}
-            onClick={() => setActiveBrushPreset(preset.id)}
-            title={preset.name}
-            className={[
-              'relative overflow-hidden rounded-lg border transition-all',
-              activeBrushPresetId === preset.id
-                ? 'border-blue-400/70 ring-1 ring-blue-400/30 scale-105'
-                : 'border-white/12 hover:border-white/30',
-            ].join(' ')}
-            style={{ width: 48, height: 26 }}
-          >
-            <BrushPreviewCanvas preset={preset} color={brushColor} />
-            <span className={[
-              'absolute bottom-0 left-0 right-0 text-center leading-none py-0.5 text-[7px]',
-              activeBrushPresetId === preset.id ? 'text-blue-300' : 'text-white/35',
-            ].join(' ')}>{preset.name}</span>
-          </button>
-        ))}
-      </div>
+      <BrushPresetDropdown />
       <Sep />
-      <DraggableInput label="Size" value={brushSize} min={1} max={200} unit="px" onChange={setBrushSize} />
+      <DraggableInput label="Size" value={brushSize} min={1} max={200} unit="px" onChange={setBrushSize} defaultValue={8} />
       <Sep />
-      <DraggableInput label="Opacity" value={Math.round(brushOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setBrushOpacity(v / 100)} />
+      <DraggableInput label="Opacity" value={Math.round(brushOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setBrushOpacity(v / 100)} defaultValue={100} />
       {activeToolId === 'brush' && (
         <>
           <Sep />
-          <DraggableInput label="Hardness" value={Math.round(brushHardness * 100)} min={0} max={100} unit="%" onChange={(v) => setBrushHardness(v / 100)} />
+          <DraggableInput label="Hardness" value={Math.round(brushHardness * 100)} min={0} max={100} unit="%" onChange={(v) => setBrushHardness(v / 100)} defaultValue={85} />
         </>
       )}
     </div>
@@ -97,7 +124,7 @@ function EraserOptionsPanel() {
   const { eraserSize, setEraserSize, eraserMode, setEraserMode } = useFreeformStore()
   return (
     <div className="flex items-center gap-2">
-      <DraggableInput label="Size" value={eraserSize} min={1} max={400} unit="px" onChange={setEraserSize} />
+      <DraggableInput label="Size" value={eraserSize} min={1} max={400} unit="px" onChange={setEraserSize} defaultValue={24} />
       <Sep />
       <div className="flex items-center gap-1.5">
         <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">Mode</span>
@@ -122,7 +149,7 @@ function FillOptionsPanel() {
   const { fillTolerance, setFillTolerance, fillPlacement, setFillPlacement } = useFreeformStore()
   return (
     <div className="flex items-center gap-2">
-      <DraggableInput label="Tolerance" value={fillTolerance} min={0} max={255} unit="" onChange={setFillTolerance} />
+      <DraggableInput label="Tolerance" value={fillTolerance} min={0} max={255} unit="" onChange={setFillTolerance} defaultValue={32} />
       <Sep />
       <div className="flex items-center gap-1.5">
         <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">Placement</span>
@@ -144,12 +171,19 @@ function FillOptionsPanel() {
 }
 
 function VectorBrushOptionsPanel() {
-  const { vectorSize, setVectorSize, vectorOpacity, setVectorOpacity, vectorBrushMerge, setVectorBrushMerge } = useFreeformStore()
+  const {
+    vectorSize, setVectorSize,
+    vectorOpacity, setVectorOpacity,
+    vectorBrushMerge, setVectorBrushMerge,
+    vectorStreamline, setVectorStreamline,
+  } = useFreeformStore()
   return (
     <div className="flex items-center gap-2">
-      <DraggableInput label="Size" value={vectorSize} min={1} max={100} unit="px" onChange={setVectorSize} />
+      <DraggableInput label="Size" value={vectorSize} min={1} max={100} unit="px" onChange={setVectorSize} defaultValue={4} />
       <Sep />
-      <DraggableInput label="Opacity" value={Math.round(vectorOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setVectorOpacity(v / 100)} />
+      <DraggableInput label="Opacity" value={Math.round(vectorOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setVectorOpacity(v / 100)} defaultValue={100} />
+      <Sep />
+      <DraggableInput label="Streamline" value={Math.round(vectorStreamline * 100)} min={0} max={100} unit="%" onChange={(v) => setVectorStreamline(v / 100)} defaultValue={20} />
       <Sep />
       <button
         onClick={() => setVectorBrushMerge(!vectorBrushMerge)}
@@ -170,9 +204,9 @@ function VectorPenOptionsPanel() {
   const { vectorSize, setVectorSize, vectorOpacity, setVectorOpacity } = useFreeformStore()
   return (
     <div className="flex items-center gap-2">
-      <DraggableInput label="Size" value={vectorSize} min={1} max={100} unit="px" onChange={setVectorSize} />
+      <DraggableInput label="Size" value={vectorSize} min={1} max={100} unit="px" onChange={setVectorSize} defaultValue={4} />
       <Sep />
-      <DraggableInput label="Opacity" value={Math.round(vectorOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setVectorOpacity(v / 100)} />
+      <DraggableInput label="Opacity" value={Math.round(vectorOpacity * 100)} min={1} max={100} unit="%" onChange={(v) => setVectorOpacity(v / 100)} defaultValue={100} />
     </div>
   )
 }
@@ -192,10 +226,6 @@ export const TOOL_DEFS: Record<ToolId, ToolDef> = {
   pan:        { id: 'pan',        label: 'Hand',         Icon: Hand,          OptionsPanel: null },
 }
 
-/**
- * Ordered toolbar slots. One button per slot; Shift+clicking cycles through
- * the slot's sibling tools. The slot's first id is the default.
- */
 export const TOOLBAR_SLOTS: ToolSlot[] = [
   { ids: ['select', 'lasso'], shortcut: 'v' },
   { ids: ['brush', 'pen'],    shortcut: 'b' },
@@ -207,7 +237,6 @@ export const TOOLBAR_SLOTS: ToolSlot[] = [
   { ids: ['pan'],             shortcut: 'h' },
 ]
 
-/** Which slot (if any) a tool id belongs to */
 export function slotForTool(id: ToolId): ToolSlot | undefined {
   return TOOLBAR_SLOTS.find((s) => (s.ids as ToolId[]).includes(id))
 }
@@ -215,8 +244,8 @@ export function slotForTool(id: ToolId): ToolSlot | undefined {
 // ─── Brush preview canvas ─────────────────────────────────────────────────────
 
 export const BrushPreviewCanvas = React.memo(function BrushPreviewCanvas({
-  preset, color,
-}: { preset: BrushPreset; color: string }) {
+  preset, color, width = 56, height = 26,
+}: { preset: BrushPreset; color: string; width?: number; height?: number }) {
   const ref = useRef<HTMLCanvasElement>(null)
 
   useEffect(() => {
@@ -224,7 +253,7 @@ export const BrushPreviewCanvas = React.memo(function BrushPreviewCanvas({
     if (!canvas) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
-    const W = 48, H = 26
+    const W = canvas.width, H = canvas.height
 
     ctx.clearRect(0, 0, W, H)
 
@@ -243,11 +272,11 @@ export const BrushPreviewCanvas = React.memo(function BrushPreviewCanvas({
     }
 
     const pts = [
-      { x: 3,     y: H * 0.72, p: 0.1  },
+      { x: 3,        y: H * 0.72, p: 0.1  },
       { x: W * 0.28, y: H * 0.42, p: 0.65 },
       { x: W * 0.58, y: H * 0.38, p: 1.0  },
       { x: W * 0.8,  y: H * 0.48, p: 0.55 },
-      { x: W - 3,  y: H * 0.28, p: 0.15 },
+      { x: W - 3,   y: H * 0.28, p: 0.15 },
     ]
 
     const baseSize = 4
@@ -267,7 +296,7 @@ export const BrushPreviewCanvas = React.memo(function BrushPreviewCanvas({
     ctx.filter = 'none'; ctx.globalAlpha = 1
   }, [preset, color])
 
-  return <canvas ref={ref} width={48} height={26} className="w-full h-full" />
+  return <canvas ref={ref} width={width} height={height} className="w-full h-full" />
 })
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
