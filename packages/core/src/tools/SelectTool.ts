@@ -25,10 +25,10 @@ type SelectState =
   | { kind: 'pending-select'; sx: number; sy: number }
   | { kind: 'selecting'; sx0: number; sy0: number; sx1: number; sy1: number; additive: boolean }
   | { kind: 'selected'; ids: string[] }
-  | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[] }
+  | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[]; hasMoved: boolean }
   | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
   | { kind: 'editing'; id: string }
-  | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut' }
+  | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot }
 
 const HANDLE_SIZE = 8        // screen px, half-size of each resize handle square
 const HIT_RADIUS = 10        // screen px, pointer hit tolerance for handles/elements
@@ -91,7 +91,8 @@ export class SelectTool extends Tool {
     if (this.state.kind === 'editing' && isVec) {
       const hit = this.hitTestHandle(e.x, e.y, this.state.id, layer as VectorLayer)
       if (hit) {
-        this.state = { kind: 'dragging-point', ...hit }
+        const snap = this.snapshotElement(layer as VectorLayer, hit.id)
+        this.state = { kind: 'dragging-point', snap, ...hit }
         return
       }
       // Clicking outside handles: check if hitting a different element or empty space
@@ -150,7 +151,7 @@ export class SelectTool extends Tool {
           const lx = world.x - (layer as VectorLayer).transform.x
           const ly = world.y - (layer as VectorLayer).transform.y
           const snaps = ids.map((id) => this.snapshotElement(layer as VectorLayer, id))
-          this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps }
+          this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps, hasMoved: false }
           board.canvas.style.cursor = 'move'
           return
         }
@@ -178,7 +179,7 @@ export class SelectTool extends Tool {
         }
         const ids = [hitId]
         const snaps = ids.map((id) => this.snapshotElement(vl, id))
-        this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps }
+        this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps, hasMoved: false }
         board.canvas.style.cursor = 'move'
         this.scheduleOverlayRedraw()
         return
@@ -218,6 +219,7 @@ export class SelectTool extends Tool {
       const dx = lx - this.state.startLX, dy = ly - this.state.startLY
       for (const id of this.state.ids) layer.translateElement(id, dx, dy)
       this.state.startLX = lx; this.state.startLY = ly
+      this.state.hasMoved = true
       board.markDirty(); this.scheduleOverlayRedraw()
       return
     }
@@ -319,7 +321,7 @@ export class SelectTool extends Tool {
       }
       board.canvas.style.cursor = 'default'
     } else if (this.state.kind === 'moving') {
-      this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
+      if (this.state.hasMoved) this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
       const ids = this.state.ids
       this.state = { kind: 'selected', ids }
       board.canvas.style.cursor = 'default'
@@ -329,8 +331,16 @@ export class SelectTool extends Tool {
       this.state = { kind: 'selected', ids }
       board.canvas.style.cursor = 'default'
     } else if (this.state.kind === 'dragging-point') {
-      const id = this.state.id
-      this.state = { kind: 'editing', id }
+      const st = this.state
+      if (layer instanceof VectorLayer) {
+        const after = this.snapshotElement(layer, st.id)
+        const before = st.snap
+        board.history.push({
+          undo: () => { this.restoreElement(layer as VectorLayer, before); board.markDirty(); this.scheduleOverlayRedraw() },
+          redo: () => { this.restoreElement(layer as VectorLayer, after); board.markDirty(); this.scheduleOverlayRedraw() },
+        })
+      }
+      this.state = { kind: 'editing', id: st.id }
     }
 
     this.scheduleOverlayRedraw()

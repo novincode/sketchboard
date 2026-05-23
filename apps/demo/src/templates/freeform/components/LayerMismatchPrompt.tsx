@@ -13,7 +13,8 @@ export function LayerMismatchPrompt() {
   // ALL hooks before any conditional returns
   const activeLayer = layers.find((l) => l.id === activeLayerId)
   const needsVector = VECTOR_TOOLS.includes(activeToolId)
-  const needsRaster = ['pen', 'brush', 'eraser'].includes(activeToolId)
+  // Eraser works on both raster and vector layers — don't flag it as a mismatch
+  const needsRaster = ['pen', 'brush'].includes(activeToolId)
   const mismatch =
     (needsVector && activeLayer?.type === 'raster') ||
     (needsRaster && activeLayer?.type === 'vector')

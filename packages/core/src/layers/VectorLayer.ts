@@ -118,15 +118,12 @@ export class VectorLayer extends Layer {
 
   // ── Hit testing ───────────────────────────────────────────────────────────
 
-  /** Return the id of the topmost stroke or path whose points are within `radius` of (x,y). */
+  /** Return the id of the topmost stroke or path near (x,y) within `radius`. */
   hitTest(x: number, y: number, radius: number): string | null {
     const r2 = radius * radius
-    // Check paths first (drawn on top conceptually)
+    // Check paths first (drawn on top conceptually) — sample bezier curves for accurate hit testing
     for (let i = this.paths.length - 1; i >= 0; i--) {
-      for (const a of this.paths[i]!.anchors) {
-        const dx = a.x - x, dy = a.y - y
-        if (dx * dx + dy * dy <= r2) return this.paths[i]!.id
-      }
+      if (VectorLayer.pathHitTest(this.paths[i]!, x, y, r2)) return this.paths[i]!.id
     }
     for (let i = this.strokes.length - 1; i >= 0; i--) {
       for (const p of this.strokes[i]!.points) {
@@ -135,6 +132,41 @@ export class VectorLayer extends Layer {
       }
     }
     return null
+  }
+
+  /** Sample a cubic bezier at 20 pts per segment to check if point is within r2. */
+  private static pathHitTest(path: VectorPath, x: number, y: number, r2: number): boolean {
+    const N = 20
+    const cubicAt = (p0x: number, p0y: number, p1x: number, p1y: number, p2x: number, p2y: number, p3x: number, p3y: number, t: number) => {
+      const mt = 1 - t
+      return {
+        x: mt*mt*mt*p0x + 3*mt*mt*t*p1x + 3*mt*t*t*p2x + t*t*t*p3x,
+        y: mt*mt*mt*p0y + 3*mt*mt*t*p1y + 3*mt*t*t*p2y + t*t*t*p3y,
+      }
+    }
+    const checkSegment = (prev: BezierAnchor, curr: BezierAnchor) => {
+      const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
+      const cp2 = curr.handleIn ?? { x: curr.x, y: curr.y }
+      for (let j = 0; j <= N; j++) {
+        const pt = cubicAt(prev.x, prev.y, cp1.x, cp1.y, cp2.x, cp2.y, curr.x, curr.y, j / N)
+        const dx = pt.x - x, dy = pt.y - y
+        if (dx*dx + dy*dy <= r2) return true
+      }
+      return false
+    }
+    const { anchors, closed } = path
+    if (anchors.length === 0) return false
+    if (anchors.length === 1) {
+      const dx = anchors[0]!.x - x, dy = anchors[0]!.y - y
+      return dx*dx + dy*dy <= r2
+    }
+    for (let i = 1; i < anchors.length; i++) {
+      if (checkSegment(anchors[i - 1]!, anchors[i]!)) return true
+    }
+    if (closed && anchors.length >= 2) {
+      if (checkSegment(anchors[anchors.length - 1]!, anchors[0]!)) return true
+    }
+    return false
   }
 
   /**

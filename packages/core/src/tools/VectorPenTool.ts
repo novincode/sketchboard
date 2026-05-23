@@ -151,7 +151,7 @@ export class VectorPenTool extends Tool {
 
   private commitPath(layer: VectorLayer, closed: boolean): void {
     if (this.anchors.length < 2) { this.cancelPath(); return }
-    const before = layer.paths.slice()
+    const beforePaths = layer.paths.slice()
     const path = layer.createPath(
       [...this.anchors],
       closed,
@@ -164,8 +164,8 @@ export class VectorPenTool extends Tool {
 
     const board = this.board!
     board.history.push({
-      undo: () => { layer.paths = before; board.markDirty() },
-      redo: () => { layer.addPath(path); board.markDirty() },
+      undo: () => { layer.paths = [...beforePaths]; board.markDirty() },
+      redo: () => { layer.paths = [...beforePaths, path]; board.markDirty() },
     })
 
     this.anchors = []

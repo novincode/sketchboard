@@ -5,6 +5,7 @@ import {
   Paintbrush, Pen, Eraser, Hand, Pipette, Spline,
   PenTool as PenToolIcon, MousePointer2, type LucideIcon,
 } from 'lucide-react'
+
 import type { ToolId } from '../types'
 import { TOOLS } from '../types'
 import { useFreeformStore } from '../store'
@@ -21,7 +22,7 @@ const ICON_MAP: Record<string, LucideIcon> = {
   vector: Spline,
   vectorpen: PenToolIcon,
   eyedropper: Pipette,
-  hand:   Hand,
+  pan:    Hand,   // TOOLS uses id 'pan', not 'hand'
 }
 
 // Sub-tools shown in the long-press / right-click popup
@@ -57,6 +58,7 @@ function computeSnap(pointerX: number, pointerY: number): { snap: SnapEdge; offs
 }
 
 function clampOffset(snap: SnapEdge, raw: number): number {
+  if (typeof window === 'undefined') return raw
   const vw = window.innerWidth, vh = window.innerHeight
   if (snap === 'bottom' || snap === 'top') {
     const half = TOOLBAR_MAIN_ESTIMATED_W / 2
@@ -105,8 +107,9 @@ export function Toolbar() {
   // ── Long-press / right-click for sub-tool menu ────────────────────────────
   const startLongPress = useCallback((e: React.PointerEvent, toolId: string) => {
     if (!SUB_TOOLS[toolId]) return
+    const target = e.currentTarget as HTMLElement  // capture before setTimeout clears currentTarget
     longPressRef.current = setTimeout(() => {
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
+      const rect = target.getBoundingClientRect()
       setSubMenu({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, toolId })
     }, 500)
   }, [])

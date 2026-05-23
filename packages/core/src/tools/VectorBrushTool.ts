@@ -66,7 +66,7 @@ export class VectorBrushTool extends Tool {
     this.addPoint(e)
 
     const { r, g, b } = this.settings.color
-    const before = this.activeLayer.strokes.slice()
+    const beforeStrokes = this.activeLayer.strokes.slice()
     const stroke: VectorStroke = this.activeLayer.createStroke(
       this.points.map((p) => ({ x: p.lx, y: p.ly, pressure: p.pressure })),
       `rgb(${r},${g},${b})`,
@@ -79,8 +79,9 @@ export class VectorBrushTool extends Tool {
     const layer = this.activeLayer
     const board = this.board
     board.history.push({
-      undo: () => { layer.strokes = before; board.markDirty() },
-      redo: () => { layer.addStroke(stroke); board.markDirty() },
+      // Use spread so undo/redo always replace the array reference — never mutate the captured snapshots
+      undo: () => { layer.strokes = [...beforeStrokes]; board.markDirty() },
+      redo: () => { layer.strokes = [...beforeStrokes, stroke]; board.markDirty() },
     })
 
     if (this.usesOverlay) board.clearStrokeCanvas()
