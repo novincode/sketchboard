@@ -46,6 +46,8 @@ interface FreeformState {
 
   fillTolerance: number
   fillPlacement: FillPlacement
+  /** Vector-fill gap-close radius in layer-local px (Blender-style). */
+  fillGapClose: number
 
   /** Active raster brush preset id */
   activeBrushPresetId: string
@@ -96,6 +98,7 @@ interface FreeformActions {
 
   setFillTolerance(tolerance: number): void
   setFillPlacement(placement: FillPlacement): void
+  setFillGapClose(gap: number): void
 
   setActiveBrushPreset(id: string): void
 
@@ -230,6 +233,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     vectorStreamline: 0.2,
     fillTolerance: 32,
     fillPlacement: 'back' as FillPlacement,
+    fillGapClose: 0,
     activeBrushPresetId: DEFAULT_BRUSH_PRESET_ID,
     brushPressureSize: true,
     brushPressureOpacity: false,
@@ -264,6 +268,13 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
         vec.settings.size = s.vectorSize
         vec.settings.opacity = s.vectorOpacity
         vec.settings.color = Color.fromHex(s.brushColor)
+      }
+
+      const fillTool = board.getTool<FillTool>('fill')
+      if (fillTool) {
+        fillTool.settings.tolerance = s.fillTolerance
+        fillTool.settings.placement = s.fillPlacement
+        fillTool.settings.gapClose = s.fillGapClose
       }
 
       board.hooks.layerAdded.tap('store', () => set({ layers: layersToMeta(board.getLayers()) }))
@@ -380,6 +391,12 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const tool = board?.getTool<FillTool>('fill')
       if (tool) tool.settings.placement = placement
       set({ fillPlacement: placement })
+    },
+    setFillGapClose(gap) {
+      const { board } = get()
+      const tool = board?.getTool<FillTool>('fill')
+      if (tool) tool.settings.gapClose = gap
+      set({ fillGapClose: gap })
     },
 
     // ── UI ────────────────────────────────────────────────────────────────

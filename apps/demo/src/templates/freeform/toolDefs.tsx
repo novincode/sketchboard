@@ -53,40 +53,52 @@ function BrushPresetDropdown() {
         onClick={handleToggle}
         title={activePreset.name}
         className={[
-          'flex items-center gap-1.5 rounded-lg border transition-all px-2 py-1',
+          'flex items-center gap-1.5 rounded-lg border transition-all px-2 py-1 select-none',
           open
             ? 'border-blue-400/50 bg-blue-500/10 text-white'
             : 'border-white/12 bg-white/5 hover:border-white/25 text-white/70',
         ].join(' ')}
-        style={{ width: 80, height: 32 }}
+        style={{ width: 96, height: 32 }}
       >
         <div className="flex-1 overflow-hidden rounded-sm" style={{ height: 22 }}>
-          <BrushPreviewCanvas preset={activePreset} color={brushColor} width={56} height={22} />
+          <BrushPreviewCanvas preset={activePreset} color={brushColor} width={72} height={22} />
         </div>
         <ChevronDown size={9} className="shrink-0 opacity-50" />
       </button>
 
       {open && (
-        <Popover anchorRect={anchorRect} onClose={() => setOpen(false)} width={208}>
+        <Popover anchorRect={anchorRect} onClose={() => setOpen(false)} width={280}>
           <div
-            className="overflow-y-auto rounded-xl border border-white/10 bg-[#111]/95 py-1 shadow-2xl backdrop-blur-xl"
-            style={{ maxHeight: 280 }}
+            className="overflow-y-auto rounded-2xl border border-white/10 bg-[#0f0f0f]/96 p-1.5 shadow-2xl backdrop-blur-xl select-none"
+            style={{ maxHeight: 420 }}
           >
+            <div className="px-3 pt-2 pb-1.5 text-[9px] font-semibold uppercase tracking-widest text-white/30">
+              Brushes
+            </div>
             {RASTER_BRUSH_PRESETS.map((preset) => (
               <button
                 key={preset.id}
                 onClick={() => { setActiveBrushPreset(preset.id); setOpen(false) }}
                 className={[
-                  'flex w-full items-center gap-3 px-3 py-2.5 transition-colors',
+                  'flex w-full flex-col items-stretch gap-1 rounded-xl px-2.5 py-2 transition-colors text-left',
                   preset.id === activeBrushPresetId
-                    ? 'bg-blue-500/15 text-white'
-                    : 'text-white/60 hover:bg-white/8 hover:text-white',
+                    ? 'bg-blue-500/15 ring-1 ring-blue-400/40'
+                    : 'hover:bg-white/6',
                 ].join(' ')}
               >
-                <div className="shrink-0 overflow-hidden rounded-sm" style={{ width: 56, height: 26 }}>
-                  <BrushPreviewCanvas preset={preset} color={brushColor} width={56} height={26} />
+                <div
+                  className={[
+                    'overflow-hidden rounded-md',
+                    preset.id === activeBrushPresetId ? 'bg-black/40' : 'bg-black/25',
+                  ].join(' ')}
+                  style={{ height: 48 }}
+                >
+                  <BrushPreviewCanvas preset={preset} color={brushColor} width={252} height={48} />
                 </div>
-                <span className="text-xs">{preset.name}</span>
+                <span className={[
+                  'text-[11px] font-medium tracking-wide',
+                  preset.id === activeBrushPresetId ? 'text-white' : 'text-white/65',
+                ].join(' ')}>{preset.name}</span>
               </button>
             ))}
           </div>
@@ -149,10 +161,16 @@ function EraserOptionsPanel() {
 }
 
 function FillOptionsPanel() {
-  const { fillTolerance, setFillTolerance, fillPlacement, setFillPlacement } = useFreeformStore()
+  const {
+    fillTolerance, setFillTolerance,
+    fillPlacement, setFillPlacement,
+    fillGapClose, setFillGapClose,
+  } = useFreeformStore()
   return (
     <div className="flex items-center gap-2">
       <DraggableInput label="Tolerance" value={fillTolerance} min={0} max={255} unit="" onChange={setFillTolerance} defaultValue={32} />
+      <Sep />
+      <DraggableInput label="Gap" value={fillGapClose} min={0} max={32} unit="px" onChange={setFillGapClose} defaultValue={0} />
       <Sep />
       <div className="flex items-center gap-1.5">
         <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">Placement</span>
@@ -271,18 +289,19 @@ export const BrushPreviewCanvas = React.memo(function BrushPreviewCanvas({
     ctx.lineJoin = 'round'
 
     if (preset.hardness < 0.85) {
-      ctx.filter = `blur(${((1 - preset.hardness) * 2.5).toFixed(1)}px)`
+      ctx.filter = `blur(${((1 - preset.hardness) * (H / 14)).toFixed(1)}px)`
     }
 
+    const pad = Math.max(3, H * 0.18)
     const pts = [
-      { x: 3,        y: H * 0.72, p: 0.1  },
-      { x: W * 0.28, y: H * 0.42, p: 0.65 },
-      { x: W * 0.58, y: H * 0.38, p: 1.0  },
-      { x: W * 0.8,  y: H * 0.48, p: 0.55 },
-      { x: W - 3,   y: H * 0.28, p: 0.15 },
+      { x: pad,                 y: H * 0.72, p: 0.1  },
+      { x: pad + (W - pad * 2) * 0.25, y: H * 0.40, p: 0.65 },
+      { x: pad + (W - pad * 2) * 0.55, y: H * 0.34, p: 1.0  },
+      { x: pad + (W - pad * 2) * 0.80, y: H * 0.50, p: 0.55 },
+      { x: W - pad,             y: H * 0.28, p: 0.15 },
     ]
 
-    const baseSize = 4
+    const baseSize = Math.max(2.5, H / 6.5)
     for (let i = 1; i < pts.length; i++) {
       const p0 = pts[i - 1]!
       const p1 = pts[i]!

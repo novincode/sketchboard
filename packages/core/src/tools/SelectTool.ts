@@ -8,6 +8,8 @@ import type { Camera } from '../Camera'
 
 export type SelectMode = 'rect'   // 'lasso' is future work
 export type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+const ROTATE_HANDLE_OFFSET = 22   // screen px above the top edge
+const ROTATE_SNAP_DEG = 15        // snap angle when shift is held
 
 interface Bounds { x: number; y: number; w: number; h: number }
 
@@ -27,6 +29,7 @@ type SelectState =
   | { kind: 'selected'; ids: string[] }
   | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[]; hasMoved: boolean; isDupe?: boolean }
   | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
+  | { kind: 'rotating'; ids: string[]; centerLX: number; centerLY: number; startAngle: number; snaps: ElementSnapshot[] }
   | { kind: 'editing'; id: string }
   | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot }
   | { kind: 'editing-stroke'; id: string }
@@ -50,6 +53,7 @@ export class SelectTool extends Tool {
   private _lastDownX = 0
   private _lastDownY = 0
   private _altDown = false
+  private _shiftDown = false
   private _onKeyDown: ((e: KeyboardEvent) => void) | null = null
   private _onKeyUp: ((e: KeyboardEvent) => void) | null = null
 
@@ -58,9 +62,15 @@ export class SelectTool extends Tool {
     this._afterRenderUnsub = this.board?.hooks.afterRender.tap('select', () => {
       if (this.state.kind !== 'idle') this.scheduleOverlayRedraw()
     }) ?? null
-    // Track Alt key for bezier handle creation
-    this._onKeyDown = (e: KeyboardEvent) => { if (e.altKey || e.key === 'Alt') this._altDown = true }
-    this._onKeyUp = (e: KeyboardEvent) => { if (!e.altKey) this._altDown = false }
+    // Track Alt key for bezier handle creation; Shift for rotate snap.
+    this._onKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey || e.key === 'Alt') this._altDown = true
+      if (e.shiftKey || e.key === 'Shift') this._shiftDown = true
+    }
+    this._onKeyUp = (e: KeyboardEvent) => {
+      if (!e.altKey) this._altDown = false
+      if (!e.shiftKey) this._shiftDown = false
+    }
     window.addEventListener('keydown', this._onKeyDown)
     window.addEventListener('keyup', this._onKeyUp)
   }
@@ -71,6 +81,7 @@ export class SelectTool extends Tool {
     this.board?.clearStrokeCanvas()
     this.state = { kind: 'idle' }
     this._altDown = false
+    this._shiftDown = false
     if (this._onKeyDown) window.removeEventListener('keydown', this._onKeyDown)
     if (this._onKeyUp) window.removeEventListener('keyup', this._onKeyUp)
     this._onKeyDown = null; this._onKeyUp = null
@@ -140,6 +151,24 @@ export class SelectTool extends Tool {
       return
     }
     if (this.state.kind === 'dragging-stroke-point') return
+
+    // ── Check rotate handle first (sits above the bounds) ────────────────
+    if (this.state.kind === 'selected' && isVec) {
+      const ids = this.state.ids
+      const bounds = this.getCombinedBounds(layer as VectorLayer, ids)
+      if (bounds && this.hitTestRotateHandle(e.x, e.y, bounds, layer as VectorLayer)) {
+        const cx = bounds.x + bounds.w / 2
+        const cy = bounds.y + bounds.h / 2
+        const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+        const lx = world.x - (layer as VectorLayer).transform.x
+        const ly = world.y - (layer as VectorLayer).transform.y
+        const startAngle = Math.atan2(ly - cy, lx - cx)
+        const snaps = ids.map((id) => this.snapshotElement(layer as VectorLayer, id))
+        this.state = { kind: 'rotating', ids, centerLX: cx, centerLY: cy, startAngle, snaps }
+        board.canvas.style.cursor = 'grabbing'
+        return
+      }
+    }
 
     // ── Check resize handles (when selected) ──────────────────────────────
     if ((this.state.kind === 'selected' || this.state.kind === 'moving') && isVec) {
@@ -260,6 +289,26 @@ export class SelectTool extends Tool {
       for (const id of this.state.ids) layer.translateElement(id, dx, dy)
       this.state.startLX = lx; this.state.startLY = ly
       this.state.hasMoved = true
+      board.markDirty(); this.scheduleOverlayRedraw()
+      return
+    }
+
+    if (this.state.kind === 'rotating') {
+      const st = this.state
+      const layer = board.getActiveLayer()
+      if (!(layer instanceof VectorLayer)) return
+      const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+      const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
+      let angle = Math.atan2(ly - st.centerLY, lx - st.centerLX) - st.startAngle
+      // Shift = snap to ROTATE_SNAP_DEG (mirrors Figma / Procreate behavior)
+      // We approximate KeyboardEvent.shiftKey via window-tracked modifier (Pointer Events expose buttons not shift).
+      if (this._shiftDown) {
+        const snap = (ROTATE_SNAP_DEG * Math.PI) / 180
+        angle = Math.round(angle / snap) * snap
+      }
+      // Restore snapshot, then rotate by the absolute angle delta
+      for (const snap of st.snaps) this.restoreElement(layer, snap)
+      for (const id of st.ids) layer.rotateElement(id, angle, st.centerLX, st.centerLY)
       board.markDirty(); this.scheduleOverlayRedraw()
       return
     }
@@ -390,6 +439,11 @@ export class SelectTool extends Tool {
       const ids = this.state.ids
       this.state = { kind: 'selected', ids }
       board.canvas.style.cursor = 'default'
+    } else if (this.state.kind === 'rotating') {
+      this.pushHistory(board, layer as VectorLayer, this.state.ids, this.state.snaps)
+      const ids = this.state.ids
+      this.state = { kind: 'selected', ids }
+      board.canvas.style.cursor = 'default'
     } else if (this.state.kind === 'dragging-point') {
       const st = this.state
       if (layer instanceof VectorLayer) {
@@ -456,6 +510,21 @@ export class SelectTool extends Tool {
     for (const id of ids) { layer.removeStroke(id); layer.removePath(id) }
     this.state = { kind: 'idle' }
     this.board?.markDirty(); this.scheduleOverlayRedraw()
+  }
+
+  /** True if there is content currently on the internal clipboard. */
+  hasClipboard(): boolean {
+    return !!this._clipboard && (this._clipboard.strokes.length > 0 || this._clipboard.paths.length > 0)
+  }
+
+  /**
+   * True if there's an active selection that can be acted on (cut/copy/delete).
+   * Mirrors what `copySelected/deleteSelected/cutSelected` will use internally,
+   * so callers don't need to inspect `state` directly.
+   */
+  hasSelection(): boolean {
+    const k = this.state.kind
+    return k === 'selected' || k === 'editing' || k === 'editing-stroke'
   }
 
   copySelected(): void {
@@ -617,6 +686,24 @@ export class SelectTool extends Tool {
       ctx.fillRect(p.x - HANDLE_SIZE / 2, p.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
       ctx.strokeRect(p.x - HANDLE_SIZE / 2, p.y - HANDLE_SIZE / 2, HANDLE_SIZE, HANDLE_SIZE)
     }
+
+    // Rotate handle — circle floating above the top-center edge with a tether.
+    const top = handles.n
+    const rotPos = { x: top.x, y: top.y - ROTATE_HANDLE_OFFSET }
+    ctx.strokeStyle = 'rgba(99,179,237,0.7)'
+    ctx.lineWidth = 1
+    ctx.setLineDash([2, 3])
+    ctx.beginPath()
+    ctx.moveTo(top.x, top.y - HANDLE_SIZE / 2)
+    ctx.lineTo(rotPos.x, rotPos.y + 5)
+    ctx.stroke()
+    ctx.setLineDash([])
+    ctx.fillStyle = '#fff'
+    ctx.strokeStyle = 'rgba(99,179,237,0.9)'
+    ctx.lineWidth = 1.5
+    ctx.beginPath()
+    ctx.arc(rotPos.x, rotPos.y, 5, 0, Math.PI * 2)
+    ctx.fill(); ctx.stroke()
   }
 
   private getHandleScreenPositions(tl: {x:number;y:number}, tr: {x:number;y:number}, bl: {x:number;y:number}, br: {x:number;y:number}) {
@@ -694,6 +781,22 @@ export class SelectTool extends Tool {
   }
 
   // ── Hit testing ───────────────────────────────────────────────────────────
+
+  private rotateHandleScreenPos(bounds: Bounds, layer: VectorLayer): { x: number; y: number } | null {
+    if (!this.board) return null
+    const { camera, logicalWidth: W, logicalHeight: H } = this.board
+    const tl = camera.worldToScreen(bounds.x + layer.transform.x, bounds.y + layer.transform.y, W, H)
+    const tr = camera.worldToScreen(bounds.x + bounds.w + layer.transform.x, bounds.y + layer.transform.y, W, H)
+    const mid = { x: (tl.x + tr.x) / 2, y: (tl.y + tr.y) / 2 }
+    return { x: mid.x, y: mid.y - ROTATE_HANDLE_OFFSET }
+  }
+
+  private hitTestRotateHandle(sx: number, sy: number, bounds: Bounds, layer: VectorLayer): boolean {
+    const pos = this.rotateHandleScreenPos(bounds, layer)
+    if (!pos) return false
+    const dx = sx - pos.x, dy = sy - pos.y
+    return dx * dx + dy * dy <= HIT_RADIUS * HIT_RADIUS
+  }
 
   private hitTestResizeHandle(sx: number, sy: number, bounds: Bounds, layer: VectorLayer): ResizeHandle | null {
     if (!this.board) return null

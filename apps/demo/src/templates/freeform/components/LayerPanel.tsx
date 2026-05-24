@@ -133,7 +133,7 @@ export function LayerPanel() {
     <div
       ref={ref}
       data-layer-panel
-      className="fixed right-3 top-14 z-50 flex flex-col rounded-2xl border border-white/10 bg-[#111]/92 shadow-2xl backdrop-blur-xl overflow-hidden layer-panel-enter"
+      className="fixed right-3 top-14 z-50 flex flex-col rounded-2xl border border-white/10 bg-[#111]/92 shadow-2xl backdrop-blur-xl overflow-hidden layer-panel-enter select-none"
       style={{ width: 296, maxHeight: 'calc(100vh - 5.5rem)' }}
     >
       <PanelStyles />
@@ -325,9 +325,12 @@ function SortableLayerRow(props: LayerRowProps) {
     marginLeft: props.depth * INDENT_PX,
   }
 
+  // Whole-row drag: spread listeners on the wrapper so the user can grab
+  // anywhere on the row, not just the grip. Buttons still stop propagation
+  // via onPointerDown so they remain clickable.
   return (
-    <div ref={setNodeRef} style={style} {...attributes}>
-      <LayerRow {...props} dragHandleProps={listeners} />
+    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+      <LayerRow {...props} />
     </div>
   )
 }
@@ -347,8 +350,8 @@ function SortableGroupRow(props: GroupRowProps) {
   }
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes}>
-      <GroupRow {...props} dragHandleProps={listeners} />
+    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+      <GroupRow {...props} />
     </div>
   )
 }
@@ -499,6 +502,7 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
                 if (e.key === 'Escape') { setEditing(false); setDraft(name) }
                 e.stopPropagation()
               }}
+              onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
               className="flex-1 rounded-lg bg-white/10 px-2 py-0.5 text-xs text-white outline-none"
             />
@@ -511,7 +515,11 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
             </span>
           )}
 
-          <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="flex items-center gap-1 shrink-0"
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
             <button
               onClick={onToggleReference}
               title={isReference ? 'Remove reference' : 'Set as reference layer'}
@@ -548,7 +556,7 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
 
         {/* Expanded options */}
         {isActive && expanded && (
-          <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()}>
+          <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2">
               <DraggableInput
                 label="Opacity"
@@ -654,6 +662,7 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
 
           {/* Collapse chevron */}
           <button
+            onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => { e.stopPropagation(); onToggleCollapsed() }}
             className="text-white/45 hover:text-white/80 transition p-0.5"
             title={collapsed ? 'Expand' : 'Collapse'}
@@ -674,6 +683,7 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
                 if (e.key === 'Escape') { setEditing(false); setDraft(name) }
                 e.stopPropagation()
               }}
+              onPointerDown={(e) => e.stopPropagation()}
               onClick={(e) => e.stopPropagation()}
               className="flex-1 rounded-lg bg-white/10 px-2 py-0.5 text-xs text-white outline-none"
             />
@@ -688,7 +698,11 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
 
           <span className="shrink-0 rounded bg-white/8 px-1.5 py-0.5 text-[9px] font-mono text-white/45">{childCount}</span>
 
-          <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="flex items-center gap-1 shrink-0"
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
+          >
             <button onClick={onVisibilityToggle} className="text-white/30 hover:text-white/80 transition p-0.5">
               {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
             </button>
@@ -697,7 +711,7 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
 
         {/* Group opacity strip — visible when active */}
         {isActive && (
-          <div className="flex items-center gap-2 px-3 pb-2.5 pt-0.5 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center gap-2 px-3 pb-2.5 pt-0.5 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
             <DraggableInput
               label="Opacity"
               value={Math.round(opacity * 100)}

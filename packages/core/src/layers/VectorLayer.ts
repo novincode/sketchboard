@@ -232,6 +232,28 @@ export class VectorLayer extends Layer {
     }
   }
 
+  /** Rotate a stroke or path by `angle` radians around an origin in layer-local coords. */
+  rotateElement(id: string, angle: number, originX: number, originY: number): void {
+    const cos = Math.cos(angle), sin = Math.sin(angle)
+    const rot = (x: number, y: number): { x: number; y: number } => {
+      const dx = x - originX, dy = y - originY
+      return { x: originX + dx * cos - dy * sin, y: originY + dx * sin + dy * cos }
+    }
+    const stroke = this.strokes.find((s) => s.id === id)
+    if (stroke) {
+      for (const p of stroke.points) { const r = rot(p.x, p.y); p.x = r.x; p.y = r.y }
+      return
+    }
+    const path = this.paths.find((p) => p.id === id)
+    if (path) {
+      for (const a of path.anchors) {
+        const r = rot(a.x, a.y); a.x = r.x; a.y = r.y
+        if (a.handleIn)  { const h = rot(a.handleIn.x,  a.handleIn.y);  a.handleIn.x  = h.x; a.handleIn.y  = h.y }
+        if (a.handleOut) { const h = rot(a.handleOut.x, a.handleOut.y); a.handleOut.x = h.x; a.handleOut.y = h.y }
+      }
+    }
+  }
+
   /** Move a stroke or path by (dx, dy) in layer-local coords. */
   translateElement(id: string, dx: number, dy: number): void {
     const stroke = this.strokes.find((s) => s.id === id)

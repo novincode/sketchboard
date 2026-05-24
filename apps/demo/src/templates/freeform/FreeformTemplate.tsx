@@ -20,6 +20,7 @@ import { LayerMismatchPrompt } from './components/LayerMismatchPrompt'
 import { DrawBlockedToast } from './components/DrawBlockedToast'
 import { EyedropperMagnifier } from './components/EyedropperMagnifier'
 import { FillToleranceHud } from './components/FillToleranceHud'
+import { CanvasContextMenu } from './components/CanvasContextMenu'
 import type { ToolId } from './types'
 
 const LAYER_W = 3840
@@ -249,6 +250,7 @@ export function FreeformTemplate() {
       <DrawBlockedToast />
       <EyedropperMagnifier />
       <FillToleranceHud />
+      <CanvasContextMenu />
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>

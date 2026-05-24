@@ -4,13 +4,20 @@ import { RasterLayer } from '../layers/RasterLayer'
 import { VectorLayer } from '../layers/VectorLayer'
 import type { VectorPath } from '../layers/VectorLayer'
 import { rasterizeLayer } from '../renderer/rasterizeLayer'
+import { vectorRegionFill } from '../fill/vectorRegionFill'
 
 export type FillPlacement = 'front' | 'back'
 
 export interface FillSettings {
   color: string        // hex, e.g. '#ff0000'
-  tolerance: number    // 0–255 per channel
+  tolerance: number    // 0–255 per channel (raster flood)
   placement: FillPlacement  // vector only: add fill in front or behind stroke
+  /**
+   * Blender-style max-gap closure for vector fills, in layer-local pixels.
+   * Strokes within ~2*gap of each other will be treated as connected during
+   * region detection. 0 = strict (only fully-closed loops fill).
+   */
+  gapClose: number
 }
 
 // ── Flood fill helpers (declared before class so DTS rollup can see them) ────────
@@ -171,6 +178,7 @@ export class FillTool extends Tool {
     color: '#1a1a1a',
     tolerance: 32,
     placement: 'back',
+    gapClose: 0,
   }
 
   /** Pixels of horizontal drag that equal one tolerance unit (0-255). Lower = more sensitive. */
@@ -312,6 +320,7 @@ export class FillTool extends Tool {
     const lx = world.x - layer.transform.x
     const ly = world.y - layer.transform.y
 
+    // Fast path: click inside a true closed VectorPath → exact polygon fill.
     let targetPath: VectorPath | null = null
     for (let i = layer.paths.length - 1; i >= 0; i--) {
       const p = layer.paths[i]!
@@ -321,12 +330,28 @@ export class FillTool extends Tool {
       }
     }
 
-    if (!targetPath) return
+    if (targetPath) {
+      this._insertVectorFill(layer, targetPath.anchors, targetPath)
+      return
+    }
 
+    // Smart path: rasterize the layer, flood-fill into negative space with
+    // optional gap closure, trace the boundary, insert as a closed path.
+    const anchors = vectorRegionFill(layer, lx, ly, { gap: this.settings.gapClose })
+    if (!anchors) {
+      board.hooks.toolPreview.call({ tool: 'fill', kind: 'region-miss', data: { gap: this.settings.gapClose } })
+      return
+    }
+    this._insertVectorFill(layer, anchors, null)
+  }
+
+  private _insertVectorFill(layer: VectorLayer, anchors: BezierAnchorForFill[], anchorPath: VectorPath | null): void {
+    const board = this.board!
     const beforePaths = layer.paths.slice()
     const fillPath = layer.createPath(
-      targetPath.anchors.map((a) => ({
-        ...a,
+      anchors.map((a) => ({
+        x: a.x, y: a.y,
+        type: a.type ?? 'corner',
         handleIn: a.handleIn ? { ...a.handleIn } : null,
         handleOut: a.handleOut ? { ...a.handleOut } : null,
       })),
@@ -334,22 +359,43 @@ export class FillTool extends Tool {
       null,
       0,
       this.settings.color,
-      targetPath.opacity,
-      targetPath.compositeOperation,
+      anchorPath?.opacity ?? 1,
+      anchorPath?.compositeOperation ?? 'source-over',
     )
 
-    const idx = layer.paths.indexOf(targetPath)
-    const insertIdx = this.settings.placement === 'back' ? idx : idx + 1
+    let insertIdx: number
+    if (anchorPath) {
+      const idx = layer.paths.indexOf(anchorPath)
+      insertIdx = this.settings.placement === 'back' ? idx : idx + 1
+    } else {
+      // No anchor path → place at the back (behind all strokes/paths) by default,
+      // or at the very front for placement='front'.
+      insertIdx = this.settings.placement === 'back' ? 0 : layer.paths.length
+    }
     layer.paths.splice(insertIdx, 0, fillPath)
 
     board.markDirty()
     board.history.push({
       undo: () => { layer.paths = [...beforePaths]; board.markDirty() },
       redo: () => {
-        const i = layer.paths.indexOf(targetPath!)
-        if (i >= 0) layer.paths.splice(this.settings.placement === 'back' ? i : i + 1, 0, fillPath)
+        // Recompute insertion index in case other ops moved paths around
+        const i = anchorPath ? layer.paths.indexOf(anchorPath) : -1
+        const at = i >= 0
+          ? (this.settings.placement === 'back' ? i : i + 1)
+          : (this.settings.placement === 'back' ? 0 : layer.paths.length)
+        layer.paths.splice(at, 0, fillPath)
         board.markDirty()
       },
     })
   }
+}
+
+// Local structural alias so _insertVectorFill can accept either a real
+// BezierAnchor (from a VectorPath) or the simpler corner-only shape returned
+// by vectorRegionFill — both share the relevant fields.
+interface BezierAnchorForFill {
+  x: number; y: number
+  type?: 'smooth' | 'corner'
+  handleIn?: { x: number; y: number } | null
+  handleOut?: { x: number; y: number } | null
 }
