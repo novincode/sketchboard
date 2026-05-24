@@ -243,12 +243,21 @@ export class FillTool extends Tool {
    */
   scrubPreviewDownscale: number = 4
 
+  /**
+   * Once the user pauses scrubbing for this many ms, we redo the flood at
+   * FULL resolution so the preview matches what would commit. Set to 0 to
+   * disable (preview stays low-res until pointerup commits).
+   */
+  scrubAccuratePreviewDelayMs: number = 120
+
   // rAF coalescing for drag-scrub: pointermove fires far more often than we
   // can re-flood. We record the latest desired tolerance and run exactly one
   // reflood per animation frame.
   private _refloodRaf: number | null = null
   private _pendingTolerance: number | null = null
   private _lastFloodedTolerance: number = -1
+  // Debounced full-res "settle" reflood — fires when the scrub goes quiet.
+  private _settleTimer: ReturnType<typeof setTimeout> | null = null
 
   // Active raster scrub session (null when idle or running on a vector layer).
   //
@@ -396,19 +405,52 @@ export class FillTool extends Tool {
 
   private _scheduleReflood(tolerance: number): void {
     this._pendingTolerance = tolerance
+    // Any new tolerance value invalidates the pending "settle" pass — we'll
+    // schedule a fresh one after the rAF flood lands.
+    if (this._settleTimer !== null) { clearTimeout(this._settleTimer); this._settleTimer = null }
     if (this._refloodRaf !== null) return
     this._refloodRaf = requestAnimationFrame(() => {
       this._refloodRaf = null
       const t = this._pendingTolerance
       this._pendingTolerance = null
-      if (this._scrub && t !== null) this._reflood(t)
+      if (this._scrub && t !== null) {
+        this._reflood(t)
+        this._scheduleSettle(t)
+      }
     })
+  }
+
+  /**
+   * When the user stops scrubbing (no new tolerance for
+   * scrubAccuratePreviewDelayMs), redo the flood at FULL resolution so the
+   * preview matches the eventual commit. This eliminates the "low-res lied
+   * to me about the fill region" feeling without sacrificing snappy feedback
+   * during fast motion.
+   */
+  private _scheduleSettle(tolerance: number): void {
+    if (this.scrubAccuratePreviewDelayMs <= 0) return
+    if (!this._scrub || !this._scrub.low) return // already full-res; no settle needed
+    if (this._settleTimer !== null) clearTimeout(this._settleTimer)
+    this._settleTimer = setTimeout(() => {
+      this._settleTimer = null
+      if (!this._scrub || this._scrub.lastTolerance !== tolerance) return
+      // Run a full-res reflood to replace the blocky preview with the real
+      // fill region. Restore first so we don't composite over the low-res.
+      this._restoreFromBackup()
+      this._stampFullFill(tolerance)
+      this._lastFloodedTolerance = tolerance
+      this.board?.markDirty()
+    }, this.scrubAccuratePreviewDelayMs)
   }
 
   private _cancelPendingReflood(): void {
     if (this._refloodRaf !== null) {
       cancelAnimationFrame(this._refloodRaf)
       this._refloodRaf = null
+    }
+    if (this._settleTimer !== null) {
+      clearTimeout(this._settleTimer)
+      this._settleTimer = null
     }
     this._pendingTolerance = null
   }

@@ -68,6 +68,7 @@ export class RasterLayer extends Layer {
     copy.blendMode = this.blendMode
     copy.transform = this.transform.clone()
     copy.backgroundColor = this.backgroundColor
+    copy.masks = this.masks.map((m) => ({ ...m }))
     return copy
   }
 }

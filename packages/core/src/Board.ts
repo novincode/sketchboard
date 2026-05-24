@@ -138,7 +138,56 @@ export class Board {
     if (!removed) return false
     if (this._activeLayerId === id) this._activeLayerId = null
     if (this.referenceLayerId === id) this.referenceLayerId = null
+    // Strip any mask references to the gone layer so the renderer doesn't
+    // walk into stale ids on subsequent frames.
+    for (const l of this.getAllLayers()) {
+      if (l.masks.length && l.masks.some((m) => m.layerId === id)) {
+        l.masks = l.masks.filter((m) => m.layerId !== id)
+      }
+    }
     this.hooks.layerRemoved.call({ id })
+    this.markDirty()
+    return true
+  }
+
+  // ─── Mask API ──────────────────────────────────────────────────────────────
+
+  /** Replace a layer's full mask stack. */
+  setMasks(targetId: string, masks: ReadonlyArray<{ layerId: string; mode?: 'alpha' | 'inverse-alpha' }>): boolean {
+    const target = this.getLayerById(targetId)
+    if (!target) return false
+    target.masks = masks.map((m) => ({ layerId: m.layerId, mode: m.mode ?? 'alpha' }))
+    this.markDirty()
+    return true
+  }
+
+  /** Add a mask overlay to a target's mask stack. Idempotent on duplicate ids. */
+  addMask(targetId: string, overlayId: string, mode: 'alpha' | 'inverse-alpha' = 'alpha'): boolean {
+    if (targetId === overlayId) return false
+    const target = this.getLayerById(targetId)
+    const overlay = this.getLayerById(overlayId)
+    if (!target || !overlay) return false
+    if (target.masks.some((m) => m.layerId === overlayId)) return false
+    target.masks = [...target.masks, { layerId: overlayId, mode }]
+    this.markDirty()
+    return true
+  }
+
+  /** Remove one overlay from a target's mask stack. */
+  removeMask(targetId: string, overlayId: string): boolean {
+    const target = this.getLayerById(targetId)
+    if (!target) return false
+    const before = target.masks.length
+    target.masks = target.masks.filter((m) => m.layerId !== overlayId)
+    if (target.masks.length !== before) { this.markDirty(); return true }
+    return false
+  }
+
+  /** Drop all masks from a target. */
+  clearMasks(targetId: string): boolean {
+    const target = this.getLayerById(targetId)
+    if (!target || target.masks.length === 0) return false
+    target.masks = []
     this.markDirty()
     return true
   }
@@ -445,7 +494,7 @@ export class Board {
     const loop = () => {
       if (this._dirty) {
         this.hooks.beforeRender.call(this)
-        this.renderer.render(this.layers, this.camera)
+        this.renderer.render(this.layers, this.camera, (id) => this.getLayerById(id))
         this.hooks.afterRender.call(this)
         this._dirty = false
       }

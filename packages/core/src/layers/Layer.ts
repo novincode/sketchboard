@@ -7,6 +7,25 @@ type GroupLayerRef = any
 
 let _nextId = 1
 
+/**
+ * A reference to another layer used as a clipping mask.
+ *
+ * The referenced layer is rendered to an offscreen buffer in screen space and
+ * its alpha channel is used to clip THIS layer's render. Multiple masks union
+ * their alpha (overlapping opaque regions both keep the target visible) so a
+ * single target can receive "stack" masking from several overlays.
+ *
+ * `mode: 'inverse-alpha'` flips the polarity — the target is visible where
+ * the overlay is TRANSPARENT instead.
+ *
+ * The reference is by ID; the mask can live anywhere in the layer tree
+ * (root, nested, group, raster, vector — all uniform).
+ */
+export interface MaskRef {
+  layerId: string
+  mode?: 'alpha' | 'inverse-alpha'
+}
+
 export abstract class Layer {
   abstract readonly type: string
 
@@ -23,6 +42,13 @@ export abstract class Layer {
    * Never mutate directly — go through Board.moveLayer / GroupLayer methods.
    */
   parent: GroupLayerRef | null = null
+
+  /**
+   * Mask overlays applied to this layer during rendering. Empty = no masking.
+   * See {@link MaskRef}. Mutate via Board.setMasks / addMask / removeMask so
+   * the renderer's cache invalidates correctly.
+   */
+  masks: MaskRef[] = []
 
   constructor(name?: string) {
     this.id = `layer-${_nextId++}`

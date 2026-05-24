@@ -25,6 +25,10 @@ interface LayerMeta {
   collapsed?: boolean
   /** Group rows only — number of direct children. */
   childCount?: number
+  /** Overlay ids that clip THIS layer (this layer is the target). */
+  maskOverlayIds: string[]
+  /** Target ids that THIS layer clips (this layer is the overlay). */
+  maskTargetIds: string[]
 }
 
 interface FreeformState {
@@ -67,6 +71,13 @@ interface FreeformState {
 
   /** Multi-select: includes activeLayerId by convention when non-empty. */
   selectedLayerIds: string[]
+
+  /**
+   * When true, the layer panel shows checkboxes and a single tap toggles
+   * inclusion in `selectedLayerIds`. Designed for touch — right-click /
+   * long-press on any selected row then acts on the whole set.
+   */
+  selectionMode: boolean
 
   /** Live fill-tool tolerance scrub feedback (Procreate-style drag). */
   fillPreview: { tolerance: number; x: number; y: number } | null
@@ -143,6 +154,22 @@ interface FreeformActions {
   /** Reorder the children of `parentId` (null = root) to the given id sequence. */
   reorderSiblings(orderedIds: string[], parentId: string | null): void
 
+  // ── Selection mode ──────────────────────────────────────────────────────
+  setSelectionMode(on: boolean): void
+  toggleLayerInSelection(id: string): void
+
+  // ── Mask API (drives Board.addMask/removeMask/clearMasks) ───────────────
+  /**
+   * Mask the lower of two layers using the upper as the overlay. If a single
+   * layer is selected, use it as the overlay and the layer immediately below
+   * it (in panel order) as the target — same as Figma's mask-with-layer-below.
+   */
+  maskSelected(): void
+  /** Remove all masks from the given layer(s). */
+  releaseMasksFor(ids: string[]): void
+  /** Add `overlayId` to `targetId`'s mask stack. Used by drag-between behavior. */
+  joinMask(targetId: string, overlayId: string): void
+
   // ── ColorDrop (drag swatch → fill at canvas point) ──────────────────────
   beginColorDrag(color: string, x: number, y: number): void
   updateColorDrag(x: number, y: number): void
@@ -206,9 +233,26 @@ function applyBrushPreset(board: Board, preset: BrushPreset) {
  * with indentation per depth. Collapsed groups skip their descendants.
  */
 function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
+  // First pass: collect everyone's mask refs so we can compute reverse-lookup
+  // (which targets each overlay clips) in O(n).
+  const reverse = new Map<string, string[]>()
+  const collect = (ls: ReadonlyArray<Layer>) => {
+    for (const l of ls) {
+      for (const m of l.masks) {
+        const arr = reverse.get(m.layerId) ?? []
+        arr.push(l.id)
+        reverse.set(m.layerId, arr)
+      }
+      if (l instanceof GroupLayer) collect(l.children)
+    }
+  }
+  collect(layers)
+
   const out: LayerMeta[] = []
   const walk = (ls: ReadonlyArray<Layer>, depth: number, parentId: string | null) => {
     for (const l of ls) {
+      const maskOverlayIds = l.masks.map((m) => m.layerId)
+      const maskTargetIds = reverse.get(l.id) ?? []
       if (l instanceof GroupLayer) {
         out.push({
           id: l.id, name: l.name,
@@ -216,6 +260,7 @@ function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
           type: 'group', depth, parentId,
           collapsed: l.collapsed,
           childCount: l.children.length,
+          maskOverlayIds, maskTargetIds,
         })
         if (!l.collapsed) walk(l.children, depth + 1, l.id)
       } else {
@@ -224,6 +269,7 @@ function layersToMeta(layers: ReadonlyArray<Layer>): LayerMeta[] {
           visible: l.visible, opacity: l.opacity, blendMode: l.blendMode,
           type: (l as RasterLayer | VectorLayer).type === 'vector' ? 'vector' : 'raster',
           depth, parentId,
+          maskOverlayIds, maskTargetIds,
         })
       }
     }
@@ -265,6 +311,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     layers: [],
     activeLayerId: null,
     selectedLayerIds: [],
+    selectionMode: false,
     fillPreview: null,
     colorDrag: null,
     colorDropRipples: [],
@@ -630,6 +677,75 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const { board } = get()
       if (!board) return
       board.reorderLayers(orderedIds, parentId)
+      set({ layers: layersToMeta(board.getLayers()) })
+    },
+
+    // ── Selection mode ───────────────────────────────────────────────────
+    setSelectionMode(on) {
+      if (!on) set({ selectionMode: false })
+      else set({ selectionMode: true })
+    },
+
+    toggleLayerInSelection(id) {
+      const { selectedLayerIds, backgroundLayerId } = get()
+      if (id === backgroundLayerId) return
+      const next = selectedLayerIds.includes(id)
+        ? selectedLayerIds.filter((x) => x !== id)
+        : [...selectedLayerIds, id]
+      set({ selectedLayerIds: next, activeLayerId: next.at(-1) ?? null })
+      const { board } = get()
+      if (board && next.length > 0) board.setActiveLayer(next.at(-1)!)
+    },
+
+    // ── Mask API ─────────────────────────────────────────────────────────
+    maskSelected() {
+      const { board, selectedLayerIds, backgroundLayerId, layers } = get()
+      if (!board) return
+      const candidate = selectedLayerIds.filter((id) => id !== backgroundLayerId)
+      let overlayId: string | undefined
+      let targetIds: string[] = []
+      if (candidate.length >= 2) {
+        // Top of the SELECTION in panel order becomes the overlay.
+        // Panel reverses sibling order; we want the topmost row, which is the
+        // LAST in tree order among the selected ids that share a parent.
+        const ordered = layers.filter((l) => candidate.includes(l.id))
+        // Use the topmost in tree order as overlay, rest as targets.
+        const last = ordered[ordered.length - 1]
+        overlayId = last?.id
+        targetIds = candidate.filter((id) => id !== overlayId)
+      } else if (candidate.length === 1) {
+        overlayId = candidate[0]
+        // Single-select mask: target the layer immediately below in panel order.
+        const flatIds = layers.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
+        const idx = flatIds.indexOf(overlayId!)
+        // Panel reverses siblings, so "below" in panel = previous in tree order.
+        const targetId = idx > 0 ? flatIds[idx - 1] : undefined
+        if (targetId) targetIds = [targetId]
+      }
+      if (!overlayId || targetIds.length === 0) return
+      for (const t of targetIds) board.addMask(t, overlayId, 'alpha')
+      set({ layers: layersToMeta(board.getLayers()) })
+    },
+
+    releaseMasksFor(ids) {
+      const { board } = get()
+      if (!board) return
+      for (const id of ids) board.clearMasks(id)
+      // Also: if `id` was being used as an overlay elsewhere, drop that ref.
+      // We approximate by scanning all layers; reverse map kept by render.
+      const all = board.getAllLayers()
+      for (const l of all) {
+        if (l.masks.some((m) => ids.includes(m.layerId))) {
+          for (const id of ids) board.removeMask(l.id, id)
+        }
+      }
+      set({ layers: layersToMeta(board.getLayers()) })
+    },
+
+    joinMask(targetId, overlayId) {
+      const { board } = get()
+      if (!board) return
+      board.addMask(targetId, overlayId, 'alpha')
       set({ layers: layersToMeta(board.getLayers()) })
     },
 

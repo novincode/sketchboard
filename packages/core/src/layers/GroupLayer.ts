@@ -57,6 +57,7 @@ export class GroupLayer extends Layer {
     copy.blendMode = this.blendMode
     copy.transform = this.transform.clone()
     copy.collapsed = this.collapsed
+    copy.masks = this.masks.map((m) => ({ ...m }))
     for (const child of this.children) {
       const c = child.clone()
       copy.children.push(c)

@@ -550,6 +550,145 @@ export class SelectTool extends Tool {
     this.board?.markDirty(); this.scheduleOverlayRedraw()
   }
 
+  /**
+   * Snapshot of the currently selected element ids (vector strokes/paths).
+   * Returns an empty array when there's no selection — caller never needs to
+   * inspect tool state directly.
+   */
+  getSelectedIds(): string[] {
+    const k = this.state.kind
+    if (k === 'selected') return this.state.ids.slice()
+    if (k === 'editing' || k === 'editing-stroke') return [this.state.id]
+    return []
+  }
+
+  /**
+   * Read the common style (stroke color/width/opacity) of the current
+   * selection. If multiple elements are selected with different values,
+   * returns `mixed: true` and the value of the first element. Returns null
+   * when no vector selection exists.
+   */
+  getElementStyle(): {
+    strokeColor: string | null
+    strokeWidth: number
+    fillColor: string | null
+    opacity: number
+    mixedStrokeColor: boolean
+    mixedStrokeWidth: boolean
+    mixedFillColor: boolean
+    mixedOpacity: boolean
+  } | null {
+    if (!this.board) return null
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return null
+    const ids = this.getSelectedIds()
+    if (ids.length === 0) return null
+
+    let strokeColor: string | null = null
+    let strokeWidth: number | null = null
+    let fillColor: string | null = null
+    let opacity: number | null = null
+    let mixedStrokeColor = false, mixedStrokeWidth = false, mixedFillColor = false, mixedOpacity = false
+
+    for (const id of ids) {
+      const s = layer.strokes.find((x) => x.id === id)
+      const p = layer.paths.find((x) => x.id === id)
+      const elStrokeColor = s ? s.color : p ? p.strokeColor : null
+      const elStrokeWidth = s ? s.lineWidth : p ? p.strokeWidth : null
+      const elFillColor   = s ? null         : p ? p.fillColor   : null
+      const elOpacity     = s ? s.opacity    : p ? p.opacity     : null
+      if (strokeColor === null) strokeColor = elStrokeColor
+      else if (elStrokeColor !== strokeColor) mixedStrokeColor = true
+      if (strokeWidth === null) strokeWidth = elStrokeWidth
+      else if (elStrokeWidth !== strokeWidth) mixedStrokeWidth = true
+      if (fillColor === null) fillColor = elFillColor
+      else if (elFillColor !== fillColor) mixedFillColor = true
+      if (opacity === null) opacity = elOpacity
+      else if (elOpacity !== opacity) mixedOpacity = true
+    }
+
+    return {
+      strokeColor: strokeColor ?? '#000000',
+      strokeWidth: strokeWidth ?? 1,
+      fillColor: fillColor,
+      opacity: opacity ?? 1,
+      mixedStrokeColor, mixedStrokeWidth, mixedFillColor, mixedOpacity,
+    }
+  }
+
+  /**
+   * Mutate the common style of the current vector selection. Pass partial
+   * fields — only the provided ones are written. Pushes one history entry.
+   */
+  setElementStyle(patch: {
+    strokeColor?: string | null
+    strokeWidth?: number
+    fillColor?: string | null
+    opacity?: number
+  }): boolean {
+    if (!this.board) return false
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return false
+    const ids = this.getSelectedIds()
+    if (ids.length === 0) return false
+
+    const board = this.board
+    const before = ids.map((id) => this._snapshotElementFull(layer, id))
+    for (const id of ids) this._applyStylePatch(layer, id, patch)
+    const after = ids.map((id) => this._snapshotElementFull(layer, id))
+    board.markDirty()
+    this.scheduleOverlayRedraw()
+    board.history.push({
+      undo: () => { for (const s of before) this._restoreElementFull(layer, s); board.markDirty(); this.scheduleOverlayRedraw() },
+      redo: () => { for (const s of after)  this._restoreElementFull(layer, s); board.markDirty(); this.scheduleOverlayRedraw() },
+    })
+    return true
+  }
+
+  private _snapshotElementFull(layer: VectorLayer, id: string): { id: string; stroke?: VectorStroke; path?: VectorPath } {
+    const s = layer.strokes.find((x) => x.id === id)
+    if (s) return { id, stroke: { ...s, points: s.points.map((p) => ({ ...p })) } }
+    const p = layer.paths.find((x) => x.id === id)
+    if (p) return { id, path: { ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) } }
+    return { id }
+  }
+  private _restoreElementFull(layer: VectorLayer, snap: { id: string; stroke?: VectorStroke; path?: VectorPath }): void {
+    if (snap.stroke) {
+      const idx = layer.strokes.findIndex((x) => x.id === snap.id)
+      if (idx !== -1) layer.strokes[idx] = { ...snap.stroke, points: snap.stroke.points.map((p) => ({ ...p })) }
+      return
+    }
+    if (snap.path) {
+      const idx = layer.paths.findIndex((x) => x.id === snap.id)
+      if (idx !== -1) layer.paths[idx] = {
+        ...snap.path,
+        anchors: snap.path.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
+      }
+    }
+  }
+  private _applyStylePatch(layer: VectorLayer, id: string, patch: {
+    strokeColor?: string | null
+    strokeWidth?: number
+    fillColor?: string | null
+    opacity?: number
+  }): void {
+    const s = layer.strokes.find((x) => x.id === id)
+    if (s) {
+      if (patch.strokeColor !== undefined && patch.strokeColor !== null) s.color = patch.strokeColor
+      if (patch.strokeWidth !== undefined) s.lineWidth = patch.strokeWidth
+      if (patch.opacity     !== undefined) s.opacity   = patch.opacity
+      // strokes have no fill concept — ignore fillColor
+      return
+    }
+    const p = layer.paths.find((x) => x.id === id)
+    if (p) {
+      if (patch.strokeColor !== undefined) p.strokeColor = patch.strokeColor
+      if (patch.strokeWidth !== undefined) p.strokeWidth = patch.strokeWidth
+      if (patch.fillColor   !== undefined) p.fillColor   = patch.fillColor
+      if (patch.opacity     !== undefined) p.opacity     = patch.opacity
+    }
+  }
+
   /** True if there is content currently on the internal clipboard. */
   hasClipboard(): boolean {
     return !!this._clipboard && (this._clipboard.strokes.length > 0 || this._clipboard.paths.length > 0)

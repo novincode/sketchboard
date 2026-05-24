@@ -388,6 +388,7 @@ export class VectorLayer extends Layer {
     copy.opacity = this.opacity
     copy.blendMode = this.blendMode
     copy.transform = this.transform.clone()
+    copy.masks = this.masks.map((m) => ({ ...m }))
     return copy
   }
 }

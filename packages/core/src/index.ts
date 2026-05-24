@@ -13,6 +13,7 @@ export { Transform } from './Transform'
 
 // Layers
 export { Layer } from './layers/Layer'
+export type { MaskRef } from './layers/Layer'
 export { RasterLayer } from './layers/RasterLayer'
 export { GroupLayer } from './layers/GroupLayer'
 export { VectorLayer } from './layers/VectorLayer'

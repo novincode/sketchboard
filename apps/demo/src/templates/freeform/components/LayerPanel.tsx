@@ -3,9 +3,9 @@
 import React, { useEffect, useRef, useState, forwardRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  Eye, EyeOff, Plus, Trash2, Layers, PenLine,
-  ChevronDown, ChevronRight, Copy, Eraser, Bookmark,
-  GripVertical, Folder, FolderOpen,
+  Eye, EyeOff, Plus, Layers, PenLine,
+  ChevronDown, ChevronRight, Bookmark,
+  Folder, FolderOpen, Scissors, Check, CheckSquare, Square,
 } from 'lucide-react'
 import { HexColorPicker } from 'react-colorful'
 import {
@@ -18,8 +18,8 @@ import {
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import { useFreeformStore } from '../store'
-import { ContextMenu, useContextMenu } from './ContextMenu'
 import { DraggableInput } from './DraggableInput'
+import { LayerContextMenu } from './LayerContextMenu'
 
 const BLEND_MODES = [
   'normal', 'multiply', 'screen', 'overlay',
@@ -31,25 +31,50 @@ const INDENT_PX = 14
 
 // ─── LayerPanel ───────────────────────────────────────────────────────────────
 
+/**
+ * Where a drag would land if the user released right now. Computed on every
+ * dragOver from the cursor's Y position relative to the over-row's rect:
+ *   top third    → 'before'  (drop above the over-row, same parent)
+ *   middle third → 'into'    (drop INTO the over-row — groups only)
+ *   bottom third → 'after'   (drop below the over-row, same parent)
+ * For non-group rows the middle third collapses to whichever third is closer.
+ */
+type DropPos = 'before' | 'after' | 'into'
+interface DropHint {
+  overId: string
+  pos: DropPos
+}
+
 export function LayerPanel() {
   const {
     layers, activeLayerId, backgroundLayerId, backgroundLayerColor,
-    referenceLayerId, selectedLayerIds,
+    referenceLayerId, selectedLayerIds, selectionMode,
     addLayer, removeLayer, duplicateLayer, clearLayer,
-    selectLayer, selectRange,
+    selectLayer, selectRange, toggleLayerInSelection,
     setLayerVisibility, setLayerOpacity,
     setLayerBlendMode, setLayerName, setBackgroundColor,
     setReferenceLayerId,
     groupSelectedLayers, ungroupLayer, toggleGroupCollapsed,
-    moveLayer, reorderSiblings,
+    moveLayer, reorderSiblings, joinMask,
     toggleLayerPanel,
   } = useFreeformStore()
 
   const ref = useRef<HTMLDivElement>(null)
   const [showAddMenu, setShowAddMenu] = useState(false)
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
-  const [overGroupId, setOverGroupId] = useState<string | null>(null)
+  const [dropHint, setDropHint] = useState<DropHint | null>(null)
 
+  // Cursor Y during a drag — dnd-kit doesn't natively expose the live pointer
+  // position to the dragOver handler, but we need it to decide before/into/after.
+  const cursorYRef = useRef<number>(0)
+  useEffect(() => {
+    if (!activeDragId) return
+    const onMove = (e: PointerEvent) => { cursorYRef.current = e.clientY }
+    window.addEventListener('pointermove', onMove)
+    return () => window.removeEventListener('pointermove', onMove)
+  }, [activeDragId])
+
+  // Click-outside dismisses the panel (existing behavior).
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) toggleLayerPanel()
@@ -58,17 +83,9 @@ export function LayerPanel() {
     return () => document.removeEventListener('mousedown', handler)
   }, [toggleLayerPanel])
 
-  // Display the layer tree top-down (rendering: last layer in array = topmost,
-  // shown at the top of the panel). We keep groups together by reversing the
-  // siblings within each parent group while preserving the tree.
   const displayOrder = reverseSiblings(layers)
   const sortableIds = displayOrder.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
 
-  // Split sensors so touch swipes don't get hijacked by dnd-kit:
-  //   - Mouse: 4px movement starts a drag, as before.
-  //   - Touch: press-and-hold 240ms (with <6px wiggle) starts a drag. Quick
-  //     horizontal swipes finish well before that and reach the row's
-  //     swipe-to-reveal handler instead.
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 240, tolerance: 6 } }),
@@ -76,57 +93,84 @@ export function LayerPanel() {
 
   const onDragStart = (e: DragStartEvent) => {
     setActiveDragId(String(e.active.id))
+    setDropHint(null)
   }
   const onDragOver = (e: DragOverEvent) => {
     const over = e.over
-    if (!over) { setOverGroupId(null); return }
-    const overMeta = layers.find((l) => l.id === over.id)
-    if (overMeta?.type === 'group') {
-      setOverGroupId(overMeta.id)
-    } else {
-      setOverGroupId(null)
-    }
+    if (!over) { setDropHint(null); return }
+    const overId = String(over.id)
+    if (overId === String(e.active.id)) { setDropHint(null); return }
+    const overMeta = layers.find((l) => l.id === overId)
+    if (!overMeta) { setDropHint(null); return }
+
+    const rect = over.rect
+    const top = rect.top
+    const h = rect.height
+    const cy = cursorYRef.current || (top + h / 2)
+    const rel = (cy - top) / h
+    const isGroup = overMeta.type === 'group'
+
+    let pos: DropPos
+    if (isGroup && rel >= 0.33 && rel <= 0.66) pos = 'into'
+    else if (rel < 0.5)                         pos = 'before'
+    else                                        pos = 'after'
+
+    setDropHint((prev) => (prev?.overId === overId && prev?.pos === pos ? prev : { overId, pos }))
   }
   const onDragEnd = (e: DragEndEvent) => {
     const activeId = String(e.active.id)
-    const over = e.over
+    const hint = dropHint
     setActiveDragId(null)
-    setOverGroupId(null)
-    if (!over || over.id === activeId) return
+    setDropHint(null)
+    if (!hint || hint.overId === activeId) return
 
-    const overId = String(over.id)
-    const overMeta = layers.find((l) => l.id === overId)
+    const overMeta = layers.find((l) => l.id === hint.overId)
     const activeMeta = layers.find((l) => l.id === activeId)
     if (!overMeta || !activeMeta) return
 
-    // Drop onto a group header => move INTO that group as last child (top of group)
-    if (overMeta.type === 'group' && activeId !== overMeta.id) {
-      moveLayer(activeId, overMeta.id, /* end of children = topmost in panel */
-        Number.MAX_SAFE_INTEGER)
+    // Drop INTO a group: move to the end of that group's children (top of panel).
+    if (hint.pos === 'into' && overMeta.type === 'group') {
+      moveLayer(activeId, overMeta.id, Number.MAX_SAFE_INTEGER)
       return
     }
 
-    // Otherwise: reorder relative to overMeta within its parent.
-    // We work in tree order. Panel index → tree index: invert.
+    // Mask-stack drop: dropping a layer between an overlay row and a target
+    // row that share a mask relationship joins the dropped layer to the mask.
+    // We approximate this: if the row IMMEDIATELY ABOVE the drop position (in
+    // panel order) is currently masking the row below it, join the dropped
+    // layer to that same target.
+    const panelIds = sortableIds
+    const overPanelIdx = panelIds.indexOf(hint.overId)
+    if (overPanelIdx !== -1) {
+      // The visual "between" position depends on pos:
+      //   'before' = inserting ABOVE overId in panel → above is panelIds[overPanelIdx-1]
+      //   'after'  = inserting BELOW overId in panel → above is overId itself
+      const aboveId = hint.pos === 'before' ? panelIds[overPanelIdx - 1] : hint.overId
+      const belowId = hint.pos === 'before' ? hint.overId : panelIds[overPanelIdx + 1]
+      const aboveMeta = aboveId ? layers.find((l) => l.id === aboveId) : null
+      const belowMeta = belowId ? layers.find((l) => l.id === belowId) : null
+      if (aboveMeta && belowMeta && belowMeta.maskOverlayIds.includes(aboveMeta.id)) {
+        // We're dropping into the mask gap → add active as another overlay.
+        joinMask(belowMeta.id, activeId)
+        return
+      }
+    }
+
+    // Otherwise: reorder/reparent relative to overMeta.
     const parentId = overMeta.parentId
     const parentLayers = layers.filter((l) => l.parentId === parentId)
     const treeOrderIds = parentLayers.map((l) => l.id)
     const filtered = treeOrderIds.filter((id) => id !== activeId)
-    const overIdx = filtered.indexOf(overId)
+    const overIdx = filtered.indexOf(hint.overId)
 
-    // Panel renders parents reversed — so dragging "above over" in panel
-    // means inserting AFTER over in tree order; "below over" means BEFORE.
-    const sortableIdx = sortableIds.indexOf(activeId)
-    const overSortableIdx = sortableIds.indexOf(overId)
-    const draggingDown = sortableIdx < overSortableIdx
-    const insertAt = draggingDown ? overIdx : overIdx + 1
+    // Panel reverses sibling order, so:
+    //   pos 'before' (above overRow in panel) → AFTER overRow in tree
+    //   pos 'after'  (below overRow in panel) → BEFORE overRow in tree
+    const insertAt = hint.pos === 'before' ? overIdx + 1 : overIdx
 
-    // If active was in a different parent, reparent
     if (activeMeta.parentId !== parentId) {
-      // Convert "tree-index in new parent" — same number
       moveLayer(activeId, parentId, insertAt)
     } else {
-      // Same parent — pure reorder
       const newOrder = [...filtered]
       newOrder.splice(insertAt, 0, activeId)
       reorderSiblings(newOrder, parentId)
@@ -146,8 +190,27 @@ export function LayerPanel() {
 
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/8 shrink-0">
-        <span className="text-xs font-semibold text-white/70 tracking-wide">Layers</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-white/70 tracking-wide">Layers</span>
+          {selectionMode && (
+            <span className="rounded-md bg-blue-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-blue-300">
+              {selectedLayerIds.filter((id) => id !== backgroundLayerId).length} selected
+            </span>
+          )}
+        </div>
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => useFreeformStore.getState().setSelectionMode(!selectionMode)}
+            className={[
+              'flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] transition',
+              selectionMode
+                ? 'border-blue-400/60 bg-blue-500/15 text-blue-200'
+                : 'border-white/10 bg-white/5 text-white/45 hover:bg-white/10 hover:text-white/80',
+            ].join(' ')}
+            title={selectionMode ? 'Exit selection' : 'Select multiple layers'}
+          >
+            {selectionMode ? <CheckSquare size={12} /> : <Square size={12} />}
+          </button>
           <button
             onClick={groupSelectedLayers}
             disabled={selectedLayerIds.filter((id) => id !== backgroundLayerId).length === 0}
@@ -216,6 +279,8 @@ export function LayerPanel() {
                   />
                 )
               }
+              const indicator: 'before' | 'after' | 'into' | null =
+                dropHint?.overId === meta.id ? dropHint.pos : null
               if (meta.type === 'group') {
                 return (
                   <SortableGroupRow
@@ -229,13 +294,15 @@ export function LayerPanel() {
                     childCount={meta.childCount ?? 0}
                     isActive={meta.id === activeLayerId}
                     isSelected={selectedLayerIds.includes(meta.id)}
-                    isDropTarget={overGroupId === meta.id}
-                    onSelect={(e) => onSelect(e, meta.id, selectLayer, selectRange)}
+                    indicator={indicator}
+                    selectionMode={selectionMode}
+                    isReference={meta.id === referenceLayerId}
+                    maskOverlayIds={meta.maskOverlayIds}
+                    maskTargetIds={meta.maskTargetIds}
+                    onSelect={(e) => onSelect(e, meta.id, selectionMode, selectLayer, selectRange, toggleLayerInSelection)}
                     onToggleCollapsed={() => toggleGroupCollapsed(meta.id)}
                     onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
-                    onUngroup={() => ungroupLayer(meta.id)}
                     onRename={(n) => setLayerName(meta.id, n)}
-                    onDelete={() => removeLayer(meta.id)}
                     onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
                   />
                 )
@@ -253,12 +320,12 @@ export function LayerPanel() {
                   isActive={meta.id === activeLayerId}
                   isSelected={selectedLayerIds.includes(meta.id)}
                   isReference={meta.id === referenceLayerId}
-                  canDelete={layers.filter((l) => l.id !== backgroundLayerId && l.type !== 'group').length > 1}
-                  onSelect={(e) => onSelect(e, meta.id, selectLayer, selectRange)}
+                  indicator={indicator}
+                  selectionMode={selectionMode}
+                  maskOverlayIds={meta.maskOverlayIds}
+                  maskTargetIds={meta.maskTargetIds}
+                  onSelect={(e) => onSelect(e, meta.id, selectionMode, selectLayer, selectRange, toggleLayerInSelection)}
                   onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
-                  onDelete={() => removeLayer(meta.id)}
-                  onDuplicate={() => duplicateLayer(meta.id)}
-                  onClear={() => clearLayer(meta.id)}
                   onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
                   onBlendModeChange={(m) => setLayerBlendMode(meta.id, m)}
                   onRename={(n) => setLayerName(meta.id, n)}
@@ -286,11 +353,44 @@ export function LayerPanel() {
 function onSelect(
   e: React.MouseEvent,
   id: string,
+  selectionMode: boolean,
   selectLayer: (id: string, additive: boolean) => void,
   selectRange: (id: string) => void,
+  toggleInSelection: (id: string) => void,
 ) {
+  if (selectionMode) { toggleInSelection(id); return }
   if (e.shiftKey) { selectRange(id); return }
   selectLayer(id, e.metaKey || e.ctrlKey)
+}
+
+// ─── Per-row context menu hook (right-click + long-press, both pen & mouse) ──
+// Same primitive the ContextMenu module exposed, repeated here so we can
+// drive the unified LayerContextMenu (which lives in its own component).
+
+function useLayerContextTrigger() {
+  const [menu, setMenu] = React.useState<{ x: number; y: number } | null>(null)
+  const longPressRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const open = (x: number, y: number) => setMenu({ x, y })
+  const close = () => setMenu(null)
+  const onContextMenu = (e: React.MouseEvent) => { e.preventDefault(); open(e.clientX, e.clientY) }
+  const onPointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return
+    longPressRef.current = setTimeout(() => open(e.clientX, e.clientY), 500)
+  }
+  const cancelLongPress = () => {
+    if (longPressRef.current) clearTimeout(longPressRef.current)
+  }
+  return { menu, close, onContextMenu, onPointerDown, cancelLongPress }
+}
+
+// Thin colored line indicating drop-above / drop-below.
+function DropLine({ at }: { at: 'top' | 'bottom' }) {
+  return (
+    <div
+      className="pointer-events-none absolute left-2 right-2 z-10 h-[3px] rounded-full bg-blue-400/90 shadow-[0_0_8px_rgba(96,165,250,0.55)]"
+      style={{ [at]: -1, top: at === 'top' ? -1 : undefined, bottom: at === 'bottom' ? -1 : undefined }}
+    />
+  )
 }
 
 // ─── Reverse sibling order for visual display (top-most layer at top) ─────────
@@ -329,18 +429,17 @@ function SortableLayerRow(props: LayerRowProps) {
     transition,
     opacity: isDragging ? 0.3 : 1,
     marginLeft: props.depth * INDENT_PX,
+    position: 'relative',
   }
 
-  // Whole-row drag: spread listeners on the wrapper so the user can grab
-  // anywhere on the row. Delete is reachable via right-click / long-press.
   return (
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+      {props.indicator === 'before' && <DropLine at="top" />}
       <LayerRow {...props} />
+      {props.indicator === 'after' && <DropLine at="bottom" />}
     </div>
   )
 }
-
-// ─── Sortable group row ───────────────────────────────────────────────────────
 
 function SortableGroupRow(props: GroupRowProps) {
   const {
@@ -352,11 +451,14 @@ function SortableGroupRow(props: GroupRowProps) {
     transition,
     opacity: isDragging ? 0.3 : 1,
     marginLeft: props.depth * INDENT_PX,
+    position: 'relative',
   }
 
   return (
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+      {props.indicator === 'before' && <DropLine at="top" />}
       <GroupRow {...props} />
+      {props.indicator === 'after' && <DropLine at="bottom" />}
     </div>
   )
 }
@@ -424,26 +526,36 @@ function BackgroundLayerRow({
 interface LayerRowProps {
   id: string; name: string; depth: number
   visible: boolean; opacity: number; blendMode: string; layerType: 'raster' | 'vector'
-  isActive: boolean; isSelected: boolean; isReference: boolean; canDelete: boolean
+  isActive: boolean; isSelected: boolean; isReference: boolean
+  /** Cursor-aware drop indicator state (or null when no drop is hinted here). */
+  indicator: 'before' | 'after' | 'into' | null
+  /** When the panel is in selection mode, rows show a checkbox column. */
+  selectionMode: boolean
+  /** Ids of layers used as overlays clipping this row's layer. */
+  maskOverlayIds: string[]
+  /** Ids of layers this row's layer is acting as a mask FOR. */
+  maskTargetIds: string[]
   onSelect: (e: React.MouseEvent) => void
-  onVisibilityToggle: () => void; onDelete: () => void
-  onDuplicate: () => void; onClear: () => void; onToggleReference: () => void
-  onOpacityChange: (v: number) => void; onBlendModeChange: (m: string) => void; onRename: (n: string) => void
+  onVisibilityToggle: () => void
+  onToggleReference: () => void
+  onOpacityChange: (v: number) => void
+  onBlendModeChange: (m: string) => void
+  onRename: (n: string) => void
 }
 
-function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unknown> }) {
+function LayerRow(props: LayerRowProps) {
   const {
-    name, visible, opacity, blendMode, layerType,
-    isActive, isSelected, isReference, canDelete,
-    onSelect, onVisibilityToggle, onDelete, onDuplicate, onClear,
+    id, name, visible, opacity, blendMode, layerType,
+    isActive, isSelected, isReference,
+    indicator, selectionMode, maskOverlayIds, maskTargetIds,
+    onSelect, onVisibilityToggle,
     onOpacityChange, onBlendModeChange, onRename, onToggleReference,
-    dragHandleProps,
   } = props
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(name)
   const [expanded, setExpanded] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-  const { menu, close, onContextMenu, onPointerDown, cancelLongPress } = useContextMenu()
+  const { menu, close, onContextMenu, onPointerDown, cancelLongPress } = useLayerContextTrigger()
 
   const commitRename = () => {
     setEditing(false)
@@ -455,22 +567,19 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
     if (editing) { setDraft(name); inputRef.current?.focus(); inputRef.current?.select() }
   }, [editing, name])
 
-  const contextEntries = [
-    { label: 'Rename',    icon: null, onClick: () => setEditing(true) },
-    { label: 'Duplicate', icon: <Copy size={13} />,   onClick: onDuplicate },
-    { label: 'Clear',     icon: <Eraser size={13} />, onClick: onClear },
-    { label: isReference ? 'Remove reference' : 'Set as reference', icon: <Bookmark size={13} />, onClick: onToggleReference },
-    { separator: true as const },
-    { label: 'Delete', icon: <Trash2 size={13} />, danger: true, disabled: !canDelete, onClick: onDelete },
-  ]
+  const isMaskOverlay = maskTargetIds.length > 0       // this layer clips others
+  const isMaskedTarget = maskOverlayIds.length > 0     // others clip this layer
 
   return (
     <>
       <div
         className={[
           'group rounded-xl transition-colors overflow-hidden',
-          isActive ? 'bg-white/8 ring-1 ring-white/20' : isSelected ? 'bg-white/5 ring-1 ring-white/10' : 'hover:bg-white/4',
+          isActive ? 'bg-white/8 ring-1 ring-white/20'
+            : isSelected ? 'bg-white/5 ring-1 ring-white/10'
+            : 'hover:bg-white/4',
           isReference ? 'ring-1 ring-amber-400/40' : '',
+          indicator === 'into' ? 'ring-2 ring-blue-400/60 bg-blue-500/8' : '',
         ].join(' ')}
         onContextMenu={onContextMenu}
         onPointerDown={onPointerDown}
@@ -478,15 +587,21 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
         onPointerLeave={cancelLongPress}
       >
         <div className="flex items-center gap-1.5 px-2 py-2.5 cursor-pointer" onClick={onSelect}>
-          {/* Drag handle */}
-          <button
-            {...(dragHandleProps ?? {})}
-            onClick={(e) => e.stopPropagation()}
-            className="text-white/15 hover:text-white/55 transition p-0.5 cursor-grab active:cursor-grabbing touch-none"
-            title="Drag to reorder"
-          >
-            <GripVertical size={13} />
-          </button>
+          {selectionMode && (
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); onSelect(e) }}
+              className={[
+                'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition',
+                isSelected
+                  ? 'border-blue-400/80 bg-blue-500/30 text-white'
+                  : 'border-white/20 bg-white/5 text-transparent hover:border-white/40',
+              ].join(' ')}
+              aria-label={isSelected ? 'Deselect' : 'Select'}
+            >
+              {isSelected ? <Check size={12} /> : null}
+            </button>
+          )}
 
           {/* Layer type badge */}
           <span className={[
@@ -495,6 +610,20 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
           ].join(' ')}>
             {layerType === 'vector' ? 'VEC' : 'PX'}
           </span>
+
+          {/* Mask role badges */}
+          {isMaskOverlay && (
+            <span title="This layer is masking other layers"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-emerald-500/20 text-emerald-300">
+              <Scissors size={9} />MASK
+            </span>
+          )}
+          {isMaskedTarget && !isMaskOverlay && (
+            <span title="This layer is clipped by a mask"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
+              CLIP
+            </span>
+          )}
 
           {editing ? (
             <input
@@ -537,9 +666,6 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
             >
               <Bookmark size={13} />
             </button>
-            {/* No inline delete icon — was visual noise on every row. Delete
-                is reachable via right-click / long-press (vector + raster)
-                and swipe-left on touch. */}
             <button onClick={onVisibilityToggle} className="text-white/30 hover:text-white/80 transition p-0.5">
               {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
             </button>
@@ -551,7 +677,6 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
           </div>
         </div>
 
-        {/* Expanded options */}
         {isActive && expanded && (
           <div className="flex flex-col gap-2.5 px-3 pb-3 pt-1 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2">
@@ -578,13 +703,7 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
         )}
       </div>
 
-      {menu && (
-        <ContextMenu
-          x={menu.x} y={menu.y}
-          entries={contextEntries}
-          onClose={close}
-        />
-      )}
+      {menu && <LayerContextMenu x={menu.x} y={menu.y} onClose={close} focusedId={id} />}
     </>
   )
 }
@@ -594,27 +713,30 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
 interface GroupRowProps {
   id: string; name: string; depth: number
   visible: boolean; opacity: number; collapsed: boolean; childCount: number
-  isActive: boolean; isSelected: boolean; isDropTarget: boolean
+  isActive: boolean; isSelected: boolean
+  indicator: 'before' | 'after' | 'into' | null
+  selectionMode: boolean
+  isReference: boolean
+  maskOverlayIds: string[]
+  maskTargetIds: string[]
   onSelect: (e: React.MouseEvent) => void
   onToggleCollapsed: () => void
   onVisibilityToggle: () => void
-  onUngroup: () => void
   onRename: (n: string) => void
-  onDelete: () => void
   onOpacityChange: (v: number) => void
 }
 
-function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unknown> }) {
+function GroupRow(props: GroupRowProps) {
   const {
-    name, visible, opacity, collapsed, childCount,
-    isActive, isSelected, isDropTarget,
-    onSelect, onToggleCollapsed, onVisibilityToggle, onUngroup, onRename, onDelete, onOpacityChange,
-    dragHandleProps,
+    id, name, visible, opacity, collapsed, childCount,
+    isActive, isSelected, indicator, selectionMode,
+    isReference, maskOverlayIds, maskTargetIds,
+    onSelect, onToggleCollapsed, onVisibilityToggle, onRename, onOpacityChange,
   } = props
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(name)
   const inputRef = useRef<HTMLInputElement>(null)
-  const { menu, close, onContextMenu, onPointerDown, cancelLongPress } = useContextMenu()
+  const { menu, close, onContextMenu, onPointerDown, cancelLongPress } = useLayerContextTrigger()
 
   const commitRename = () => {
     setEditing(false)
@@ -626,20 +748,19 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
     if (editing) { setDraft(name); inputRef.current?.focus(); inputRef.current?.select() }
   }, [editing, name])
 
-  const contextEntries = [
-    { label: 'Rename', icon: null, onClick: () => setEditing(true) },
-    { label: 'Ungroup', icon: <FolderOpen size={13} />, onClick: onUngroup },
-    { separator: true as const },
-    { label: 'Delete group', icon: <Trash2 size={13} />, danger: true, onClick: onDelete },
-  ]
+  const isMaskOverlay = maskTargetIds.length > 0
+  const isMaskedTarget = maskOverlayIds.length > 0
 
   return (
     <>
       <div
         className={[
           'group rounded-xl transition-all overflow-hidden',
-          isActive ? 'bg-amber-500/10 ring-1 ring-amber-400/30' : isSelected ? 'bg-white/5 ring-1 ring-white/10' : 'hover:bg-white/4',
-          isDropTarget ? 'ring-2 ring-blue-400/60 bg-blue-500/8' : '',
+          isActive ? 'bg-amber-500/10 ring-1 ring-amber-400/30'
+            : isSelected ? 'bg-white/5 ring-1 ring-white/10'
+            : 'hover:bg-white/4',
+          isReference ? 'ring-1 ring-amber-400/40' : '',
+          indicator === 'into' ? 'ring-2 ring-blue-400/60 bg-blue-500/8' : '',
         ].join(' ')}
         onContextMenu={onContextMenu}
         onPointerDown={onPointerDown}
@@ -647,17 +768,22 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
         onPointerLeave={cancelLongPress}
       >
         <div className="flex items-center gap-1.5 px-2 py-2.5 cursor-pointer" onClick={onSelect}>
-          {/* Drag handle */}
-          <button
-            {...(dragHandleProps ?? {})}
-            onClick={(e) => e.stopPropagation()}
-            className="text-white/15 hover:text-white/55 transition p-0.5 cursor-grab active:cursor-grabbing touch-none"
-            title="Drag group"
-          >
-            <GripVertical size={13} />
-          </button>
+          {selectionMode && (
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); onSelect(e) }}
+              className={[
+                'flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition',
+                isSelected
+                  ? 'border-blue-400/80 bg-blue-500/30 text-white'
+                  : 'border-white/20 bg-white/5 text-transparent hover:border-white/40',
+              ].join(' ')}
+              aria-label={isSelected ? 'Deselect' : 'Select'}
+            >
+              {isSelected ? <Check size={12} /> : null}
+            </button>
+          )}
 
-          {/* Collapse chevron */}
           <button
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => { e.stopPropagation(); onToggleCollapsed() }}
@@ -668,6 +794,19 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
           </button>
 
           {collapsed ? <Folder size={13} className="text-amber-400/80" /> : <FolderOpen size={13} className="text-amber-400/90" />}
+
+          {isMaskOverlay && (
+            <span title="This group is masking other layers"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-emerald-500/20 text-emerald-300">
+              <Scissors size={9} />MASK
+            </span>
+          )}
+          {isMaskedTarget && !isMaskOverlay && (
+            <span title="This group is clipped by a mask"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
+              CLIP
+            </span>
+          )}
 
           {editing ? (
             <input
@@ -706,7 +845,6 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
           </div>
         </div>
 
-        {/* Group opacity strip — visible when active */}
         {isActive && (
           <div className="flex items-center gap-2 px-3 pb-2.5 pt-0.5 border-t border-white/6 row-expand" onClick={(e) => e.stopPropagation()} onPointerDown={(e) => e.stopPropagation()}>
             <DraggableInput
@@ -721,13 +859,7 @@ function GroupRow(props: GroupRowProps & { dragHandleProps?: Record<string, unkn
         )}
       </div>
 
-      {menu && (
-        <ContextMenu
-          x={menu.x} y={menu.y}
-          entries={contextEntries}
-          onClose={close}
-        />
-      )}
+      {menu && <LayerContextMenu x={menu.x} y={menu.y} onClose={close} focusedId={id} />}
     </>
   )
 }

@@ -23,6 +23,7 @@ import { FillToleranceHud } from './components/FillToleranceHud'
 import { CanvasContextMenu } from './components/CanvasContextMenu'
 import { ColorDropOverlay } from './components/ColorDropOverlay'
 import { StickyModifierDock } from './components/StickyModifierDock'
+import { VectorStylePanel } from './components/VectorStylePanel'
 import type { ToolId } from './types'
 
 const LAYER_W = 3840
@@ -255,6 +256,7 @@ export function FreeformTemplate() {
       <CanvasContextMenu />
       <ColorDropOverlay />
       <StickyModifierDock />
+      <VectorStylePanel />
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>
