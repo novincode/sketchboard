@@ -90,30 +90,31 @@ export class VectorLayer extends Layer {
 
   /**
    * Remove entire strokes/paths that come within `radius` (layer-local px) of (x, y).
-   * Returns true if anything was removed.
+   * Returns the removed elements (or empty arrays if nothing matched).
+   *
+   * Hit-tests strokes by point sample and paths by sampling along each bezier
+   * segment — so the eraser catches pen paths anywhere along the curve, not
+   * only at the sparse anchor positions.
    */
-  eraseAt(x: number, y: number, radius: number): boolean {
+  eraseAt(x: number, y: number, radius: number): { strokes: VectorStroke[]; paths: VectorPath[] } {
     const r2 = radius * radius
-    const strokesBefore = this.strokes.length
-    const pathsBefore = this.paths.length
+    const removedStrokes: VectorStroke[] = []
+    const removedPaths: VectorPath[] = []
 
     this.strokes = this.strokes.filter((s) => {
       for (const p of s.points) {
         const dx = p.x - x, dy = p.y - y
-        if (dx * dx + dy * dy <= r2) return false
+        if (dx * dx + dy * dy <= r2) { removedStrokes.push(s); return false }
       }
       return true
     })
 
     this.paths = this.paths.filter((p) => {
-      for (const a of p.anchors) {
-        const dx = a.x - x, dy = a.y - y
-        if (dx * dx + dy * dy <= r2) return false
-      }
+      if (VectorLayer.pathHitTest(p, x, y, r2)) { removedPaths.push(p); return false }
       return true
     })
 
-    return this.strokes.length !== strokesBefore || this.paths.length !== pathsBefore
+    return { strokes: removedStrokes, paths: removedPaths }
   }
 
   // ── Hit testing ───────────────────────────────────────────────────────────

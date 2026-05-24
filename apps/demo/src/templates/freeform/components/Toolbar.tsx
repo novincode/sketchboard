@@ -97,13 +97,8 @@ export function Toolbar() {
           <GripIcon vertical={isVertical} />
         </div>
 
-        {/* Color swatch */}
-        <button
-          onClick={toggleColorPicker}
-          className="h-7 w-7 rounded-full border-2 border-white/25 shadow-inner hover:border-white/50 transition shrink-0"
-          style={{ backgroundColor: brushColor }}
-          title="Color"
-        />
+        {/* Color swatch — tap = open picker, drag onto canvas = ColorDrop fill */}
+        <ColorSwatch color={brushColor} onTap={toggleColorPicker} />
 
         <Divider vertical={isVertical} />
 
@@ -199,3 +194,52 @@ function GripIcon({ vertical }: { vertical: boolean }) {
   )
 }
 
+
+// ─── Color swatch — tap to open picker, drag to ColorDrop ─────────────────────
+
+const COLOR_DRAG_THRESHOLD = 6  // px
+
+function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
+  const downRef = useRef<{ x: number; y: number; pointerId: number; tapped: boolean } | null>(null)
+  const draggingRef = useRef(false)
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return
+    downRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, tapped: false }
+    draggingRef.current = false
+  }
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    const d = downRef.current
+    if (!d || draggingRef.current) return
+    if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > COLOR_DRAG_THRESHOLD) {
+      // Release our local capture so the global ColorDropOverlay listeners take over.
+      draggingRef.current = true
+      try { (e.currentTarget as Element).releasePointerCapture?.(e.pointerId) } catch {}
+      useFreeformStore.getState().beginColorDrag(color, e.clientX, e.clientY)
+    }
+  }
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    const d = downRef.current
+    downRef.current = null
+    if (!d) return
+    if (!draggingRef.current) {
+      // Treat as a tap → toggle picker.
+      onTap()
+    }
+    // If draggingRef.current, ColorDropOverlay's window pointerup handler does the drop.
+    void e
+  }
+
+  return (
+    <button
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      className="h-7 w-7 rounded-full border-2 border-white/25 shadow-inner hover:border-white/50 transition shrink-0 select-none touch-none cursor-grab active:cursor-grabbing"
+      style={{ backgroundColor: color }}
+      title="Color — tap to open picker, drag onto canvas to fill"
+    />
+  )
+}

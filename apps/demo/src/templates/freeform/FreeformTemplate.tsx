@@ -21,6 +21,8 @@ import { DrawBlockedToast } from './components/DrawBlockedToast'
 import { EyedropperMagnifier } from './components/EyedropperMagnifier'
 import { FillToleranceHud } from './components/FillToleranceHud'
 import { CanvasContextMenu } from './components/CanvasContextMenu'
+import { ColorDropOverlay } from './components/ColorDropOverlay'
+import { StickyModifierDock } from './components/StickyModifierDock'
 import type { ToolId } from './types'
 
 const LAYER_W = 3840
@@ -251,6 +253,8 @@ export function FreeformTemplate() {
       <EyedropperMagnifier />
       <FillToleranceHud />
       <CanvasContextMenu />
+      <ColorDropOverlay />
+      <StickyModifierDock />
       {showColorPicker && <ColorPickerPopup />}
       {showLayerPanel && <LayerPanel />}
     </div>

@@ -54,6 +54,19 @@ export class SelectTool extends Tool {
   private _lastDownY = 0
   private _altDown = false
   private _shiftDown = false
+  // Sticky modifiers settable by a UI (e.g. the touch "sticky button" so a
+  // tablet user can hold Alt / Shift without a keyboard). OR'd with the real
+  // keyboard state, so either source enables the modifier.
+  private _stickyAlt = false
+  private _stickyShift = false
+  private get _altActive(): boolean { return this._altDown || this._stickyAlt }
+  private get _shiftActive(): boolean { return this._shiftDown || this._stickyShift }
+
+  /** UI hook: pin/unpin a modifier so subsequent gestures behave as if it's held. */
+  setStickyModifier(mod: 'alt' | 'shift', on: boolean): void {
+    if (mod === 'alt') this._stickyAlt = on
+    else this._stickyShift = on
+  }
   private _onKeyDown: ((e: KeyboardEvent) => void) | null = null
   private _onKeyUp: ((e: KeyboardEvent) => void) | null = null
 
@@ -278,7 +291,7 @@ export class SelectTool extends Tool {
       const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
 
       // Alt+drag: clone on first movement
-      if (!this.state.hasMoved && !this.state.isDupe && this._altDown) {
+      if (!this.state.hasMoved && !this.state.isDupe && this._altActive) {
         const clonedIds = this.cloneElements(layer, this.state.ids)
         this.state.ids = clonedIds
         this.state.snaps = clonedIds.map((id) => this.snapshotElement(layer, id))
@@ -302,7 +315,7 @@ export class SelectTool extends Tool {
       let angle = Math.atan2(ly - st.centerLY, lx - st.centerLX) - st.startAngle
       // Shift = snap to ROTATE_SNAP_DEG (mirrors Figma / Procreate behavior)
       // We approximate KeyboardEvent.shiftKey via window-tracked modifier (Pointer Events expose buttons not shift).
-      if (this._shiftDown) {
+      if (this._shiftActive) {
         const snap = (ROTATE_SNAP_DEG * Math.PI) / 180
         angle = Math.round(angle / snap) * snap
       }
@@ -327,8 +340,11 @@ export class SelectTool extends Tool {
       // Restore elements to their snapshot state first (prevents accumulation drift)
       for (const snap of st.snaps) this.restoreElement(layer, snap)
 
+      // Live-read modifiers so they can be toggled mid-drag (keyboard or sticky button)
+      const shift = st.shiftLock || this._shiftActive
+      const alt   = st.altCenter || this._altActive
       const { scaleX, scaleY, originX, originY } =
-        this.computeResize(st.handle, st.startBounds, dWorldX, dWorldY, st.shiftLock, st.altCenter)
+        this.computeResize(st.handle, st.startBounds, dWorldX, dWorldY, shift, alt)
 
       if (Math.abs(scaleX) < 0.001 || Math.abs(scaleY) < 0.001) return
 
@@ -363,9 +379,12 @@ export class SelectTool extends Tool {
       if (!anchor) return
 
       if (st.part === 'anchor') {
-        if (this._altDown) {
-          // Alt+drag anchor: always create/update symmetric smooth handles
-          // This creates a curve from what was a corner point
+        const hasHandles = !!(anchor.handleIn || anchor.handleOut)
+        if (this._altActive && !hasHandles) {
+          // Alt-drag on a CORNER anchor with no handles → grow symmetric
+          // smooth handles, just like Figma / Illustrator. If the anchor
+          // already has handles, fall through to plain translate so we
+          // don't destroy the user's existing curve shape.
           anchor.handleOut = { x: lx, y: ly }
           anchor.handleIn  = { x: anchor.x * 2 - lx, y: anchor.y * 2 - ly }
           anchor.type = 'smooth'
@@ -377,13 +396,20 @@ export class SelectTool extends Tool {
         }
       } else if (st.part === 'handleIn' && anchor.handleIn) {
         anchor.handleIn.x = lx; anchor.handleIn.y = ly
-        if (anchor.type === 'smooth' && anchor.handleOut) {
+        // Alt-drag on an existing handle of a smooth anchor → break sync:
+        // the anchor flips to 'corner' so each handle moves independently
+        // from now on. Matches Figma / Illustrator behavior.
+        if (this._altActive && anchor.type === 'smooth') {
+          anchor.type = 'corner'
+        } else if (anchor.type === 'smooth' && anchor.handleOut) {
           anchor.handleOut.x = anchor.x + (anchor.x - lx)
           anchor.handleOut.y = anchor.y + (anchor.y - ly)
         }
       } else if (st.part === 'handleOut' && anchor.handleOut) {
         anchor.handleOut.x = lx; anchor.handleOut.y = ly
-        if (anchor.type === 'smooth' && anchor.handleIn) {
+        if (this._altActive && anchor.type === 'smooth') {
+          anchor.type = 'corner'
+        } else if (anchor.type === 'smooth' && anchor.handleIn) {
           anchor.handleIn.x = anchor.x + (anchor.x - lx)
           anchor.handleIn.y = anchor.y + (anchor.y - ly)
         }

@@ -184,6 +184,12 @@ export class FillTool extends Tool {
   /** Pixels of horizontal drag that equal one tolerance unit (0-255). Lower = more sensitive. */
   dragSensitivity: number = 1.6
 
+  // rAF coalescing for drag-scrub: pointermove fires far more often than we can
+  // re-flood-fill a 4K bitmap. We record the latest desired tolerance and run
+  // exactly one reflood per animation frame.
+  private _refloodRaf: number | null = null
+  private _pendingTolerance: number | null = null
+
   // Active raster scrub session (null when idle or running on a vector layer)
   private _scrub: {
     layer: RasterLayer
@@ -213,27 +219,109 @@ export class FillTool extends Tool {
     }
   }
 
+  /**
+   * One-shot fill at a screen-space point with the given color, using the
+   * tool's current tolerance/gap/placement settings. No drag scrub. Used by
+   * the demo's "drag color onto canvas" gesture so callers don't have to
+   * switch the active tool — Procreate ColorDrop in core form.
+   */
+  fillAtScreenPoint(screenX: number, screenY: number, hexColor: string): boolean {
+    if (!this.board) return false
+    const layer = this.board.getActiveLayer()
+    if (!layer || !layer.visible) return false
+
+    const savedColor = this.settings.color
+    this.settings.color = hexColor
+    try {
+      const fakeEvt: PointerData = {
+        x: screenX, y: screenY, pressure: 1, tiltX: 0, tiltY: 0,
+        pointerId: -1, pointerType: 'mouse', timeStamp: performance.now(),
+      }
+      if (layer instanceof RasterLayer) {
+        // Skip the scrub setup; do a single fill + history entry directly.
+        return this._oneShotRasterFill(fakeEvt, layer, hexColor)
+      } else if (layer instanceof VectorLayer) {
+        this._fillVector(fakeEvt, layer)
+        return true
+      }
+      return false
+    } finally {
+      this.settings.color = savedColor
+    }
+  }
+
+  private _oneShotRasterFill(e: PointerData, layer: RasterLayer, hexColor: string): boolean {
+    const board = this.board!
+    const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+    const px = Math.floor(world.x - layer.transform.x)
+    const py = Math.floor(world.y - layer.transform.y)
+    if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return false
+
+    const hex = hexColor.replace('#', '')
+    const fillR = parseInt(hex.substring(0, 2), 16)
+    const fillG = parseInt(hex.substring(2, 4), 16)
+    const fillB = parseInt(hex.substring(4, 6), 16)
+    const fillA = 255
+
+    const imageData = layer.getImageData()
+    const before = imageData.data.slice()
+
+    const refObj = board.referenceLayerId ? board.getLayerById(board.referenceLayerId) : null
+    let refData: ImageData | null = null
+    if (refObj && refObj !== layer) {
+      if (refObj instanceof RasterLayer && refObj.width === layer.width && refObj.height === layer.height
+          && refObj.transform.x === layer.transform.x && refObj.transform.y === layer.transform.y) {
+        refData = refObj.getImageData()
+      } else {
+        refData = rasterizeLayer(refObj, layer.width, layer.height, layer.transform.x, layer.transform.y)
+      }
+    }
+
+    if (refData) {
+      floodFillWithRef(imageData.data, refData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
+    } else {
+      floodFill(imageData.data, layer.width, layer.height, px, py, fillR, fillG, fillB, fillA, this.settings.tolerance)
+    }
+    layer.putImageData(imageData)
+    board.markDirty()
+
+    const after = imageData.data.slice()
+    const W = layer.width, H = layer.height
+    board.history.push({
+      undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(before), W, H)); board.markDirty() },
+      redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(after),  W, H)); board.markDirty() },
+    })
+    return true
+  }
+
   onPointerMove(e: PointerData): void {
     if (!this._scrub) return
     const dx = e.x - this._scrub.startX
     const next = Math.max(0, Math.min(255, Math.round(this._scrub.startTolerance + dx / this.dragSensitivity)))
-    if (next === this._scrub.lastTolerance) return
+    if (next === this._scrub.lastTolerance && this._pendingTolerance === null) return
     this._scrub.lastTolerance = next
     this.settings.tolerance = next
-    this._reflood(next)
+    // HUD updates immediately (cheap); the actual flood reschedules to rAF.
     this.board!.hooks.toolPreview.call({
       tool: 'fill', kind: 'tolerance',
       data: { tolerance: next, x: e.x, y: e.y },
     })
+    this._scheduleReflood(next)
   }
 
   onPointerUp(_e: PointerData): void {
     if (!this._scrub) return
+    // Flush any pending reflood so the committed pixels match what's on screen.
+    this._cancelPendingReflood()
+    if (this._scrub.lastTolerance !== this._lastFloodedTolerance) {
+      this._reflood(this._scrub.lastTolerance)
+    }
     this._commitScrub()
   }
 
   onPointerCancel(_e: PointerData): void {
     if (!this._scrub) return
+    this._cancelPendingReflood()
     // Revert to original pixels — user aborted.
     const { layer, before, width, height } = this._scrub
     layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height))
@@ -242,8 +330,32 @@ export class FillTool extends Tool {
   }
 
   onDeactivate(): void {
-    if (this._scrub) this._commitScrub()
+    if (this._scrub) {
+      this._cancelPendingReflood()
+      this._commitScrub()
+    }
   }
+
+  private _scheduleReflood(tolerance: number): void {
+    this._pendingTolerance = tolerance
+    if (this._refloodRaf !== null) return
+    this._refloodRaf = requestAnimationFrame(() => {
+      this._refloodRaf = null
+      const t = this._pendingTolerance
+      this._pendingTolerance = null
+      if (this._scrub && t !== null) this._reflood(t)
+    })
+  }
+
+  private _cancelPendingReflood(): void {
+    if (this._refloodRaf !== null) {
+      cancelAnimationFrame(this._refloodRaf)
+      this._refloodRaf = null
+    }
+    this._pendingTolerance = null
+  }
+
+  private _lastFloodedTolerance: number = -1
 
   // ── Raster scrub session ─────────────────────────────────────────────────
 
@@ -283,6 +395,7 @@ export class FillTool extends Tool {
       startTolerance: this.settings.tolerance,
       lastTolerance: this.settings.tolerance,
     }
+    this._lastFloodedTolerance = -1
     this._reflood(this.settings.tolerance)
   }
 
@@ -295,6 +408,7 @@ export class FillTool extends Tool {
       floodFill(fresh, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     }
     s.layer.putImageData(new ImageData(fresh, s.width, s.height))
+    this._lastFloodedTolerance = tolerance
     this.board?.markDirty()
   }
 

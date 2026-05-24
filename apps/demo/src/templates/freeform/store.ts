@@ -71,6 +71,16 @@ interface FreeformState {
   /** Live fill-tool tolerance scrub feedback (Procreate-style drag). */
   fillPreview: { tolerance: number; x: number; y: number } | null
 
+  /**
+   * Procreate-style ColorDrop: user is dragging the color swatch out of the
+   * toolbar across the canvas. `x`/`y` are viewport coordinates of the cursor.
+   * Cleared when the drag ends (drop or cancel).
+   */
+  colorDrag: { color: string; x: number; y: number } | null
+
+  /** Animated ripples played at a fill drop point. Each has a unique id. */
+  colorDropRipples: Array<{ id: number; x: number; y: number; color: string }>
+
   /** The special "Background" layer id — always at index 0 */
   backgroundLayerId: string | null
   backgroundLayerColor: string
@@ -132,6 +142,13 @@ interface FreeformActions {
   moveLayer(id: string, parentId: string | null, index: number): void
   /** Reorder the children of `parentId` (null = root) to the given id sequence. */
   reorderSiblings(orderedIds: string[], parentId: string | null): void
+
+  // ── ColorDrop (drag swatch → fill at canvas point) ──────────────────────
+  beginColorDrag(color: string, x: number, y: number): void
+  updateColorDrag(x: number, y: number): void
+  /** End drag. Returns true if a fill happened. */
+  endColorDrag(x: number, y: number): boolean
+  cancelColorDrag(): void
 
   exportPng(filename?: string): void
 }
@@ -249,6 +266,8 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     activeLayerId: null,
     selectedLayerIds: [],
     fillPreview: null,
+    colorDrag: null,
+    colorDropRipples: [],
 
     // ── Board ──────────────────────────────────────────────────────────────
     _setBoard(board) {
@@ -612,6 +631,48 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       if (!board) return
       board.reorderLayers(orderedIds, parentId)
       set({ layers: layersToMeta(board.getLayers()) })
+    },
+
+    // ── ColorDrop (drag swatch onto canvas) ───────────────────────────────
+    beginColorDrag(color, x, y) {
+      set({ colorDrag: { color, x, y } })
+    },
+    updateColorDrag(x, y) {
+      const { colorDrag } = get()
+      if (!colorDrag) return
+      set({ colorDrag: { ...colorDrag, x, y } })
+    },
+    endColorDrag(x, y) {
+      const { board, colorDrag } = get()
+      set({ colorDrag: null })
+      if (!board || !colorDrag) return false
+
+      // Did the user release over the canvas? Use the canvas element bounding rect.
+      const canvasEl = board.canvas.parentElement
+      const rect = canvasEl?.getBoundingClientRect()
+      if (!rect || x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false
+
+      const fill = board.getTool<FillTool>('fill')
+      if (!fill) return false
+
+      const localX = x - rect.left
+      const localY = y - rect.top
+      const filled = fill.fillAtScreenPoint(localX, localY, colorDrag.color)
+      if (filled) {
+        // Ripple anchored to viewport coords so it survives store re-renders.
+        const id = Date.now() + Math.random()
+        set((s) => ({
+          colorDropRipples: [...s.colorDropRipples, { id, x, y, color: colorDrag.color }],
+        }))
+        // Auto-cleanup after the CSS animation completes.
+        setTimeout(() => {
+          set((s) => ({ colorDropRipples: s.colorDropRipples.filter((r) => r.id !== id) }))
+        }, 700)
+      }
+      return filled
+    },
+    cancelColorDrag() {
+      set({ colorDrag: null })
     },
 
     // ── Export ────────────────────────────────────────────────────────────
