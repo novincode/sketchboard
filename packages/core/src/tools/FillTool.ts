@@ -251,29 +251,38 @@ export class FillTool extends Tool {
   private _lastFloodedTolerance: number = -1
 
   // Active raster scrub session (null when idle or running on a vector layer).
-  // `before` is the full-resolution untouched snapshot used at commit time.
-  // The `_low` sub-record holds the precomputed downscaled grid used for
-  // every drag-time reflood; building it once at begin-time amortizes the
-  // downsample cost across the gesture.
+  //
+  // Key invariant: the LAYER CANVAS is never the source of truth during a
+  // scrub. We snapshot the pre-scrub state into `backupCanvas` once at begin,
+  // and every reflood / cancel restores from it via a single drawImage call —
+  // so accumulation between tolerance values is impossible by construction.
+  // `before` (raw bytes) is kept around just for the history entry at commit.
+  //
+  // `low` is a precomputed downscaled grid (built once at begin) that drives
+  // the snappy in-flight tolerance preview. The final commit always runs a
+  // full-resolution flood from `backupCanvas`, so what you see on release is
+  // the real fill, not the blocky low-res approximation.
   private _scrub: {
     layer: RasterLayer
     px: number
     py: number
     fillR: number; fillG: number; fillB: number; fillA: number
-    before: Uint8ClampedArray
     width: number
     height: number
+    /** Pristine layer pixels at scrub-start. Restored on every reflood. */
+    backupCanvas: HTMLCanvasElement
+    /** Same pixels as bytes — kept once so the history entry doesn't need a getImageData at commit. */
+    before: Uint8ClampedArray
     refData: ImageData | null
     startX: number
     startTolerance: number
     lastTolerance: number
-    /** Set when downsampled preview is active. Reused every reflood. */
     low: {
       scale: number
       w: number; h: number
       px: number; py: number
-      before: Uint8ClampedArray
-      refData: Uint8ClampedArray | null
+      beforeBytes: Uint8ClampedArray
+      refBytes: Uint8ClampedArray | null
       previewCanvas: HTMLCanvasElement
       previewCtx: CanvasRenderingContext2D
     } | null
@@ -447,8 +456,6 @@ export class FillTool extends Tool {
   scrubEnd(): void {
     if (!this._scrub) return
     this._cancelPendingReflood()
-    // Final flood at FULL resolution into the layer.
-    this._refloodFull(this._scrub.lastTolerance)
     this._commitScrub()
     this.board?.hooks.toolPreview.call({ tool: 'fill', kind: 'end', data: {} })
   }
@@ -457,8 +464,7 @@ export class FillTool extends Tool {
   scrubCancel(): void {
     if (!this._scrub) return
     this._cancelPendingReflood()
-    const { layer, before, width, height } = this._scrub
-    layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height))
+    this._restoreFromBackup()
     this.board?.markDirty()
     this._scrub = null
     this.board?.hooks.toolPreview.call({ tool: 'fill', kind: 'end', data: {} })
@@ -480,7 +486,22 @@ export class FillTool extends Tool {
     const fillB = parseInt(hex.substring(4, 6), 16)
     const fillA = 255
 
-    const before = layer.getImageData().data.slice()
+    // Read pristine pixel bytes ONCE — used for the low-res downsample input
+    // AND for the undo history entry at commit. No further getImageData calls
+    // happen during the scrub.
+    const beforeImg = layer.getImageData()
+    const before = beforeImg.data.slice()
+
+    // Snapshot the LAYER CANVAS into a backup canvas so every reflood can
+    // restore via a single GPU-accelerated drawImage call — much cheaper
+    // than the previous putImageData(33MB) approach, and accumulation across
+    // tolerance changes becomes mathematically impossible.
+    const backupCanvas = document.createElement('canvas')
+    backupCanvas.width = layer.width
+    backupCanvas.height = layer.height
+    const backupCtx = backupCanvas.getContext('2d')
+    if (!backupCtx) return false
+    backupCtx.drawImage(layer.canvas, 0, 0)
 
     const refObj = board.referenceLayerId ? board.getLayerById(board.referenceLayerId) : null
     let refData: ImageData | null = null
@@ -493,7 +514,6 @@ export class FillTool extends Tool {
       }
     }
 
-    // Build the downsampled scratch buffers ONCE so every reflood is cheap.
     const ds = this.scrubPreviewDownscale | 0
     const useLow = ds > 1 && (layer.width > 1024 || layer.height > 1024)
     const low = useLow ? this._buildLowResScratch(before, refData, layer.width, layer.height, px, py, ds) : null
@@ -501,8 +521,9 @@ export class FillTool extends Tool {
     this._scrub = {
       layer, px, py,
       fillR, fillG, fillB, fillA,
-      before,
       width: layer.width, height: layer.height,
+      backupCanvas,
+      before,
       refData,
       startX: e.x,
       startTolerance: this.settings.tolerance,
@@ -510,41 +531,53 @@ export class FillTool extends Tool {
       low,
     }
     this._lastFloodedTolerance = -1
-    this._reflood(this.settings.tolerance)
+    // Initial fill is ALWAYS full-resolution so what you see on click matches
+    // what would commit on release. Subsequent scrub motion uses the cheaper
+    // low-res preview.
+    this._restoreFromBackup()
+    this._stampFullFill(this.settings.tolerance)
+    this.board?.markDirty()
     return true
   }
 
-  private _reflood(tolerance: number): void {
+  /** Single source of truth for "put the layer back to its pristine state". */
+  private _restoreFromBackup(): void {
     const s = this._scrub!
-    if (s.low) this._refloodLow(tolerance)
-    else this._refloodFull(tolerance)
+    const ctx = s.layer.ctx
+    ctx.clearRect(0, 0, s.width, s.height)
+    ctx.drawImage(s.backupCanvas, 0, 0)
+  }
+
+  private _reflood(tolerance: number): void {
+    // ALWAYS restore from backup first — guarantees the previous reflood's
+    // pixels can't bleed into the next one.
+    this._restoreFromBackup()
+    const s = this._scrub!
+    if (s.low) this._stampLowOverlay(tolerance)
+    else this._stampFullFill(tolerance)
     this._lastFloodedTolerance = tolerance
     this.board?.markDirty()
   }
 
   /**
-   * Low-resolution flood preview: flood at 1/ds², then composite the result
-   * back on top of the (full-res) original pixels via drawImage upscale.
-   * The original layer content stays sharp; only the live fill region is
-   * approximated. On commit we redo the flood at full resolution.
+   * Low-resolution preview: flood at 1/ds², extract the fill region as a
+   * transparent-elsewhere overlay, drawImage it onto the (just-restored)
+   * layer scaled up. Smoothing OFF so the preview looks blocky-but-honest
+   * about the fill region rather than feathered.
    */
-  private _refloodLow(tolerance: number): void {
+  private _stampLowOverlay(tolerance: number): void {
     const s = this._scrub!
     const low = s.low!
-    const fresh = new Uint8ClampedArray(low.before)
-    if (low.refData) {
-      floodFillWithRef(fresh, low.refData, low.w, low.h, low.px, low.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+    const fresh = new Uint8ClampedArray(low.beforeBytes)
+    if (low.refBytes) {
+      floodFillWithRef(fresh, low.refBytes, low.w, low.h, low.px, low.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     } else {
       floodFill(fresh, low.w, low.h, low.px, low.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     }
 
-    // Build an overlay buffer that's transparent everywhere EXCEPT where the
-    // fill region differs from the pre-fill low-res snapshot. That way the
-    // preview composites cleanly over the (still full-res) original below.
     const overlay = new Uint8ClampedArray(fresh.length)
-    const beforeLo = low.before
+    const beforeLo = low.beforeBytes
     for (let i = 0; i < fresh.length; i += 4) {
-      // Pixel changed = pixel is part of the fill region.
       if (fresh[i] !== beforeLo[i] || fresh[i + 1] !== beforeLo[i + 1]
           || fresh[i + 2] !== beforeLo[i + 2] || fresh[i + 3] !== beforeLo[i + 3]) {
         overlay[i]     = s.fillR
@@ -555,34 +588,29 @@ export class FillTool extends Tool {
     }
     low.previewCtx.putImageData(new ImageData(overlay, low.w, low.h), 0, 0)
 
-    // Composite: full-res original (sharp) + drawImage-upscaled overlay.
     const dst = s.layer.ctx
-    dst.putImageData(new ImageData(new Uint8ClampedArray(s.before), s.width, s.height), 0, 0)
     dst.save()
-    // Smoothing softens the upscaled edges so the preview reads as "preview" rather than jagged final.
-    dst.imageSmoothingEnabled = true
+    dst.imageSmoothingEnabled = false
     dst.drawImage(low.previewCanvas, 0, 0, s.width, s.height)
     dst.restore()
   }
 
-  /** Full-resolution flood — used for the final commit and small layers. */
-  private _refloodFull(tolerance: number): void {
+  /**
+   * Full-resolution fill stamped onto the (just-restored) layer pixels.
+   * Reads the layer's current bytes for flood input — assumes the caller
+   * already called _restoreFromBackup() this frame.
+   */
+  private _stampFullFill(tolerance: number): void {
     const s = this._scrub!
-    const fresh = new Uint8ClampedArray(s.before)
+    const data = s.layer.getImageData()
     if (s.refData) {
-      floodFillWithRef(fresh, s.refData.data, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+      floodFillWithRef(data.data, s.refData.data, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     } else {
-      floodFill(fresh, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+      floodFill(data.data, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     }
-    s.layer.putImageData(new ImageData(fresh, s.width, s.height))
+    s.layer.putImageData(data)
   }
 
-  /**
-   * Build the downsampled `before` + `refData` buffers used during scrub.
-   * Alpha channel is max-pooled across each NxN block so thin walls survive
-   * the downsample (averaging would let the flood leak across them); RGB is
-   * sampled from the block center for cheap color-difference matching.
-   */
   private _buildLowResScratch(
     before: Uint8ClampedArray,
     refData: ImageData | null,
@@ -592,22 +620,19 @@ export class FillTool extends Tool {
   ): NonNullable<typeof this._scrub>['low'] {
     const w = Math.max(1, Math.ceil(W / ds))
     const h = Math.max(1, Math.ceil(H / ds))
-    const lowBefore = downsampleRgba(before, W, H, ds, w, h)
-    const lowRef = refData ? downsampleRgba(refData.data, W, H, ds, w, h) : null
+    const beforeBytes = downsampleRgba(before, W, H, ds, w, h)
+    const refBytes = refData ? downsampleRgba(refData.data, W, H, ds, w, h) : null
     const canvas = document.createElement('canvas')
     canvas.width = w; canvas.height = h
     const ctx = canvas.getContext('2d')
-    if (!ctx) {
-      // Should never happen in a real browser context — bail out to full-res.
-      return null
-    }
+    if (!ctx) return null
     return {
       scale: ds,
       w, h,
       px: Math.min(w - 1, Math.floor(px / ds)),
       py: Math.min(h - 1, Math.floor(py / ds)),
-      before: lowBefore,
-      refData: lowRef,
+      beforeBytes,
+      refBytes,
       previewCanvas: canvas,
       previewCtx: ctx,
     }
@@ -615,10 +640,16 @@ export class FillTool extends Tool {
 
   private _commitScrub(): void {
     const s = this._scrub!
+    // Ensure the LAYER holds the full-resolution final fill before snapshotting
+    // "after" bytes — previews during scrub may have been low-res.
+    this._restoreFromBackup()
+    this._stampFullFill(s.lastTolerance)
+
     const after = s.layer.getImageData().data.slice()
     const before = s.before
     const { layer, width, height } = s
     const board = this.board!
+    board.markDirty()
     board.history.push({
       undo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height)); board.markDirty() },
       redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(after),  width, height)); board.markDirty() },

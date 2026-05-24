@@ -675,17 +675,9 @@ function LayerRow(props: LayerRowProps & { dragHandleProps?: Record<string, unkn
             >
               <Bookmark size={13} />
             </button>
-            <button
-              onClick={onDelete}
-              disabled={!canDelete}
-              title="Delete layer"
-              className={[
-                'p-0.5 transition opacity-0 group-hover:opacity-100',
-                canDelete ? 'text-white/25 hover:text-red-400' : 'text-white/10 cursor-default',
-              ].join(' ')}
-            >
-              <Trash2 size={13} />
-            </button>
+            {/* No inline delete icon — was visual noise on every row. Delete
+                is reachable via right-click / long-press (vector + raster)
+                and swipe-left on touch. */}
             <button onClick={onVisibilityToggle} className="text-white/30 hover:text-white/80 transition p-0.5">
               {visible ? <Eye size={14} /> : <EyeOff size={14} className="text-white/20" />}
             </button>

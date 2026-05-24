@@ -31,7 +31,7 @@ type SelectState =
   | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
   | { kind: 'rotating'; ids: string[]; centerLX: number; centerLY: number; startAngle: number; snaps: ElementSnapshot[] }
   | { kind: 'editing'; id: string }
-  | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot }
+  | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot; createHandles?: boolean }
   | { kind: 'editing-stroke'; id: string }
   | { kind: 'dragging-stroke-point'; id: string; pointIdx: number; snap: ElementSnapshot }
 
@@ -119,7 +119,19 @@ export class SelectTool extends Tool {
       const hit = this.hitTestHandle(e.x, e.y, this.state.id, layer as VectorLayer)
       if (hit) {
         const snap = this.snapshotElement(layer as VectorLayer, hit.id)
-        this.state = { kind: 'dragging-point', snap, ...hit }
+        // Sticky "create handles" mode: if user Alt-grabs a CORNER anchor
+        // with no handles, we keep generating symmetric handles for the
+        // duration of the drag — even after the first frame writes handles
+        // onto the anchor. Without this flag the next move would see
+        // hasHandles=true and fall back to translating the anchor (the bug).
+        const vl = layer as VectorLayer
+        const path = vl.paths.find((p) => p.id === hit.id)
+        const anchor = path?.anchors[hit.anchorIdx]
+        const createHandles = hit.part === 'anchor'
+          && this._altActive
+          && !!anchor
+          && !(anchor.handleIn || anchor.handleOut)
+        this.state = { kind: 'dragging-point', snap, ...hit, createHandles }
         return
       }
       // Clicking outside handles: check if hitting a different element or empty space
@@ -379,12 +391,12 @@ export class SelectTool extends Tool {
       if (!anchor) return
 
       if (st.part === 'anchor') {
-        const hasHandles = !!(anchor.handleIn || anchor.handleOut)
-        if (this._altActive && !hasHandles) {
-          // Alt-drag on a CORNER anchor with no handles → grow symmetric
-          // smooth handles, just like Figma / Illustrator. If the anchor
-          // already has handles, fall through to plain translate so we
-          // don't destroy the user's existing curve shape.
+        // The `createHandles` flag was set at pointerdown if Alt was held on
+        // a corner anchor with no handles. It STAYS true for the whole drag,
+        // so each move keeps growing the symmetric handles (rather than the
+        // first move creating them and subsequent moves translating the
+        // anchor — the bug the user reported).
+        if (st.createHandles) {
           anchor.handleOut = { x: lx, y: ly }
           anchor.handleIn  = { x: anchor.x * 2 - lx, y: anchor.y * 2 - ly }
           anchor.type = 'smooth'

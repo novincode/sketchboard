@@ -1,105 +1,226 @@
 'use client'
 
-import React, { useEffect, useRef } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import type { FillTool } from '@sketchboard/core'
 import { useFreeformStore } from '../store'
 
 /**
- * Procreate ColorDrop visuals and gesture controller.
+ * Procreate ColorDrop — unified pipeline for raster AND vector.
  *
- *   1. Swatch begins drag → floating colored disc tethered to the cursor.
- *   2. Cursor enters canvas → FillTool starts a raster scrub at that point
- *      using the dragged color, immediately filling the region.
- *   3. While the finger / pen is still down, horizontal motion adjusts
- *      tolerance live (Procreate-style ColorDrop slider) using the same
- *      FillTool scrub primitive as the bucket tool — no duplicate flood logic.
- *   4. Release → scrub commits as a single history entry; ripple plays.
+ * Phase 1: AIMING
+ *   The swatch is dragging. A colored disc follows the cursor anywhere on
+ *   the screen. NO fill happens yet — the user is just deciding where to drop.
  *
- * All in-flight pointer tracking lives here (one set of window listeners per
- * mount) so drag sources only need to call `beginColorDrag` and forget.
+ * Phase 2: ARMING (cursor over canvas, mostly stationary)
+ *   When the cursor enters the canvas and stays within DROP_RADIUS for
+ *   DROP_DELAY_MS, a charging ring around the disc fills up. This avoids
+ *   the "instantly stamped into the background as I dragged past" bug.
+ *
+ * Phase 3: COMMIT (delay elapsed)
+ *   - Raster layer: FillTool.scrubBeginAtScreen fires (full-res initial
+ *     fill at current tolerance). Horizontal motion from this point on
+ *     scrubs tolerance live (low-res preview, identical to bucket tool).
+ *   - Vector layer: FillTool.fillAtScreenPoint fires (one-shot insert
+ *     of a closed bezier path). No scrub since vector fills are discrete.
+ *
+ * Phase 4: RELEASE / CANCEL
+ *   - pointerup on raster: scrub commits as one history entry, ripple
+ *     animation plays at the drop point.
+ *   - pointerup on vector: already committed at phase 3, just play ripple.
+ *   - ESC or pointer leaves the canvas before commit: cancel cleanly.
  */
+
+const DROP_DELAY_MS = 550        // how long the cursor must rest before firing
+const DROP_RADIUS_PX = 14        // movement budget while arming
+const SCRUB_CANCEL_DIST = 80     // raster: drag this far off-canvas → abort scrub
+
 export function ColorDropOverlay() {
   const colorDrag = useFreeformStore((s) => s.colorDrag)
   const ripples = useFreeformStore((s) => s.colorDropRipples)
   const board = useFreeformStore((s) => s.board)
 
-  // Track whether the in-flight drag has transitioned into a FillTool scrub.
-  const scrubbingRef = useRef(false)
+  // Phase tracking. We deliberately use refs (not state) for the hot-path
+  // values so pointermove updates don't trigger React renders 60 times/sec.
+  const phaseRef = useRef<'aiming' | 'arming' | 'scrubbing' | 'committed'>('aiming')
+  const armStartRef = useRef<{ x: number; y: number; t: number } | null>(null)
+  const dropPointRef = useRef<{ x: number; y: number } | null>(null)
 
+  // Charge progress (0–1) updates state at ~rAF cadence for the ring fill;
+  // bounded by render budget by clamping the React state set frequency.
+  const [chargeProgress, setChargeProgress] = useState(0)
+  const lastChargeRef = useRef(0)
+
+  // Reset everything when the drag ends or no board exists.
   useEffect(() => {
     if (!colorDrag) {
-      scrubbingRef.current = false
+      phaseRef.current = 'aiming'
+      armStartRef.current = null
+      dropPointRef.current = null
+      setChargeProgress(0)
+      lastChargeRef.current = 0
       return
     }
     if (!board) return
+
     const fill = board.getTool<FillTool>('fill')
     const canvasEl = board.canvas.parentElement
+    if (!fill || !canvasEl) return
 
-    const insideCanvas = (x: number, y: number): { lx: number; ly: number } | null => {
-      const rect = canvasEl?.getBoundingClientRect()
-      if (!rect) return null
-      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null
-      return { lx: x - rect.left, ly: y - rect.top }
+    let chargeRaf: number | null = null
+
+    const insideCanvas = (clientX: number, clientY: number): { lx: number; ly: number } | null => {
+      const rect = canvasEl.getBoundingClientRect()
+      if (clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom) return null
+      return { lx: clientX - rect.left, ly: clientY - rect.top }
+    }
+
+    const updateCharge = () => {
+      chargeRaf = null
+      const arm = armStartRef.current
+      if (!arm) { lastChargeRef.current = 0; setChargeProgress(0); return }
+      const elapsed = performance.now() - arm.t
+      const pct = Math.max(0, Math.min(1, elapsed / DROP_DELAY_MS))
+      // Throttle React state writes: only push when the visual changes meaningfully.
+      if (Math.abs(pct - lastChargeRef.current) > 0.04 || pct === 1 || pct === 0) {
+        lastChargeRef.current = pct
+        setChargeProgress(pct)
+      }
+      // If we crossed the threshold while arming, fire the drop.
+      if (pct >= 1 && phaseRef.current === 'arming') {
+        fireDrop(arm.x, arm.y)
+        return
+      }
+      // Keep ticking while we're still arming.
+      if (phaseRef.current === 'arming') {
+        chargeRaf = requestAnimationFrame(updateCharge)
+      }
+    }
+
+    const fireDrop = (clientX: number, clientY: number) => {
+      const inside = insideCanvas(clientX, clientY)
+      if (!inside) {
+        // Lost the canvas between the arming check and now — bail.
+        cancelArm()
+        return
+      }
+      dropPointRef.current = { x: clientX, y: clientY }
+      const dragColor = colorDrag.color
+      // Raster: start a scrub (initial fill is full-res inside scrubBeginAtScreen).
+      // Vector: scrubBeginAtScreen returns false; fall back to one-shot fill.
+      const startedScrub = fill.scrubBeginAtScreen(inside.lx, inside.ly, dragColor)
+      if (startedScrub) {
+        phaseRef.current = 'scrubbing'
+      } else {
+        // Vector path (or click missed the bitmap) — one-shot, no scrub.
+        fill.fillAtScreenPoint(inside.lx, inside.ly, dragColor)
+        phaseRef.current = 'committed'
+      }
+      armStartRef.current = null
+      setChargeProgress(0)
+      lastChargeRef.current = 0
+    }
+
+    const cancelArm = () => {
+      armStartRef.current = null
+      lastChargeRef.current = 0
+      setChargeProgress(0)
+      if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
+      phaseRef.current = 'aiming'
+    }
+
+    const playRipple = (x: number, y: number, color: string) => {
+      const id = Date.now() + Math.random()
+      useFreeformStore.setState((s) => ({
+        colorDropRipples: [...s.colorDropRipples, { id, x, y, color }],
+      }))
+      setTimeout(() => {
+        useFreeformStore.setState((s) => ({
+          colorDropRipples: s.colorDropRipples.filter((r) => r.id !== id),
+        }))
+      }, 700)
     }
 
     const onMove = (e: PointerEvent) => {
       useFreeformStore.getState().updateColorDrag(e.clientX, e.clientY)
-      if (!fill) return
       const inside = insideCanvas(e.clientX, e.clientY)
 
-      if (!scrubbingRef.current && inside) {
-        // First entry into the canvas → start a raster scrub right now.
-        // This is the "drop" — the fill happens immediately at the current
-        // position. From now on, horizontal motion drives tolerance.
-        const ok = fill.scrubBeginAtScreen(inside.lx, inside.ly, colorDrag.color)
-        if (ok) scrubbingRef.current = true
-      } else if (scrubbingRef.current && inside) {
-        fill.scrubMove(inside.lx, inside.ly)
-      } else if (scrubbingRef.current && !inside) {
-        // User dragged back out of the canvas — leave scrub running (matches
-        // Procreate; you can wiggle outside to commit by releasing). Could
-        // alternatively cancel here.
+      if (phaseRef.current === 'scrubbing') {
+        if (inside) {
+          fill.scrubMove(inside.lx, inside.ly)
+        } else {
+          // Allow some grace — only abort if we drift far away.
+          const drop = dropPointRef.current
+          if (!drop || Math.hypot(e.clientX - drop.x, e.clientY - drop.y) > SCRUB_CANCEL_DIST) {
+            fill.scrubCancel()
+            phaseRef.current = 'committed' // committed = "done", won't re-arm
+          }
+        }
+        return
+      }
+
+      if (phaseRef.current === 'committed') return
+
+      // Aiming or arming phase.
+      if (!inside) {
+        if (phaseRef.current === 'arming') cancelArm()
+        return
+      }
+
+      // Arrived over the canvas — start arming, or check if we moved too far.
+      if (phaseRef.current === 'aiming') {
+        armStartRef.current = { x: e.clientX, y: e.clientY, t: performance.now() }
+        phaseRef.current = 'arming'
+        if (chargeRaf === null) chargeRaf = requestAnimationFrame(updateCharge)
+        return
+      }
+
+      // Phase is 'arming'. If we've moved beyond the arm radius, restart the timer.
+      const arm = armStartRef.current
+      if (arm) {
+        const d = Math.hypot(e.clientX - arm.x, e.clientY - arm.y)
+        if (d > DROP_RADIUS_PX) {
+          armStartRef.current = { x: e.clientX, y: e.clientY, t: performance.now() }
+          lastChargeRef.current = 0
+          setChargeProgress(0)
+        }
       }
     }
 
     const onUp = (e: PointerEvent) => {
+      const phase = phaseRef.current
       const inside = insideCanvas(e.clientX, e.clientY)
-      const wasScrubbing = scrubbingRef.current
-      scrubbingRef.current = false
+      const dragColor = colorDrag.color
 
-      if (wasScrubbing && fill) {
+      if (phase === 'scrubbing') {
         fill.scrubEnd()
-        // Ripple at the canvas-local commit point.
-        const rippleX = inside ? e.clientX : e.clientX
-        const rippleY = inside ? e.clientY : e.clientY
-        const id = Date.now() + Math.random()
-        const color = colorDrag.color
-        useFreeformStore.setState((s) => ({
-          colorDropRipples: [...s.colorDropRipples, { id, x: rippleX, y: rippleY, color }],
-        }))
-        setTimeout(() => {
-          useFreeformStore.setState((s) => ({
-            colorDropRipples: s.colorDropRipples.filter((r) => r.id !== id),
-          }))
-        }, 700)
-      } else if (!wasScrubbing && inside && fill) {
-        // Released over the canvas but never entered a scrub (e.g. vector
-        // layer or click missed the canvas pixels). Fall back to one-shot.
-        fill.fillAtScreenPoint(inside.lx, inside.ly, colorDrag.color)
+        const drop = dropPointRef.current
+        playRipple(drop?.x ?? e.clientX, drop?.y ?? e.clientY, dragColor)
+      } else if (phase === 'committed') {
+        // Already fired (vector path). Ripple already played? No — play it now.
+        const drop = dropPointRef.current
+        if (drop) playRipple(drop.x, drop.y, dragColor)
+      } else if (inside && phase === 'arming') {
+        // User released before the charge completed but they were over the
+        // canvas — treat as an explicit "I want to fill here NOW" intent.
+        // (Matches Procreate: release-over-canvas always commits.)
+        const startedScrub = fill.scrubBeginAtScreen(inside.lx, inside.ly, dragColor)
+        if (startedScrub) fill.scrubEnd()
+        else fill.fillAtScreenPoint(inside.lx, inside.ly, dragColor)
+        playRipple(e.clientX, e.clientY, dragColor)
       }
+      // Else: released over chrome / outside without arming → silent cancel.
 
+      if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
       useFreeformStore.getState().cancelColorDrag()
     }
 
     const onCancel = () => {
-      if (scrubbingRef.current && fill) fill.scrubCancel()
-      scrubbingRef.current = false
+      if (phaseRef.current === 'scrubbing') fill.scrubCancel()
+      if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
       useFreeformStore.getState().cancelColorDrag()
     }
 
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel()
-    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onCancel() }
 
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
@@ -110,6 +231,7 @@ export function ColorDropOverlay() {
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onCancel)
       window.removeEventListener('keydown', onKey)
+      if (chargeRaf !== null) cancelAnimationFrame(chargeRaf)
     }
   }, [colorDrag, board])
 
@@ -141,20 +263,7 @@ export function ColorDropOverlay() {
             animation: 'colorDragIn 130ms ease-out',
           }}
         >
-          <div
-            className="rounded-full border-2 border-white/80 shadow-2xl"
-            style={{
-              width: 36, height: 36,
-              backgroundColor: colorDrag.color,
-              boxShadow: `0 8px 28px ${colorDrag.color}80, 0 0 0 6px ${colorDrag.color}26`,
-            }}
-          />
-          <div
-            className="pointer-events-none absolute inset-0 rounded-full"
-            style={{
-              boxShadow: 'inset 0 2px 4px rgba(255,255,255,0.55), inset 0 -3px 6px rgba(0,0,0,0.25)',
-            }}
-          />
+          <DropCursor color={colorDrag.color} chargeProgress={chargeProgress} />
         </div>
       )}
 
@@ -184,5 +293,51 @@ export function ColorDropOverlay() {
         </div>
       ))}
     </>
+  )
+}
+
+/**
+ * The disc itself + the charging ring rendered via an SVG circle so we can
+ * `stroke-dashoffset` it for a clean progress sweep with zero layout work.
+ */
+function DropCursor({ color, chargeProgress }: { color: string; chargeProgress: number }) {
+  const R = 22                // ring radius
+  const C = 2 * Math.PI * R   // circumference
+  return (
+    <div className="relative" style={{ width: 56, height: 56 }}>
+      {/* Ring */}
+      <svg className="absolute inset-0" width={56} height={56} viewBox="0 0 56 56">
+        <circle cx={28} cy={28} r={R} fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth={3} />
+        {chargeProgress > 0 && (
+          <circle
+            cx={28} cy={28} r={R}
+            fill="none"
+            stroke="white"
+            strokeWidth={3}
+            strokeLinecap="round"
+            strokeDasharray={C}
+            strokeDashoffset={C * (1 - chargeProgress)}
+            transform="rotate(-90 28 28)"
+            style={{ transition: 'stroke-dashoffset 60ms linear' }}
+          />
+        )}
+      </svg>
+      {/* Disc */}
+      <div
+        className="absolute rounded-full border-2 border-white/80 shadow-2xl"
+        style={{
+          left: 10, top: 10, width: 36, height: 36,
+          backgroundColor: color,
+          boxShadow: `0 8px 28px ${color}80, 0 0 0 6px ${color}26`,
+        }}
+      />
+      <div
+        className="absolute rounded-full pointer-events-none"
+        style={{
+          left: 10, top: 10, width: 36, height: 36,
+          boxShadow: 'inset 0 2px 4px rgba(255,255,255,0.55), inset 0 -3px 6px rgba(0,0,0,0.25)',
+        }}
+      />
+    </div>
   )
 }
