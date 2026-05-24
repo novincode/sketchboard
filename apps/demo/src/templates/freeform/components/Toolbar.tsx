@@ -200,22 +200,38 @@ function GripIcon({ vertical }: { vertical: boolean }) {
 const COLOR_DRAG_THRESHOLD = 6  // px
 
 function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
-  const downRef = useRef<{ x: number; y: number; pointerId: number; tapped: boolean } | null>(null)
-  const draggingRef = useRef(false)
+  // We tracked drag state in local refs before, which left CSS :active / cursor
+  // styles "stuck" when a drag ended on the canvas (no pointerup on the swatch
+  // because we'd released pointer capture). Now the *store* is the single
+  // source of truth for "is a color drag in flight"; the button's visual
+  // state derives from it and resets atomically when the store does.
+  const isDragging = useFreeformStore((s) => s.colorDrag !== null)
+  const downRef = useRef<{ x: number; y: number; pointerId: number; armed: boolean } | null>(null)
+  const initiatedDragRef = useRef(false)
+
+  // Watch for the global drag ending and clear local "initiated" flag so the
+  // next tap behaves cleanly even if the user releases over the canvas.
+  useEffect(() => {
+    if (!isDragging && initiatedDragRef.current) initiatedDragRef.current = false
+  }, [isDragging])
 
   const handlePointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return
-    downRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, tapped: false }
-    draggingRef.current = false
+    // Only one drag at a time — ignore if another is already in flight.
+    if (useFreeformStore.getState().colorDrag) return
+    downRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, armed: true }
+    initiatedDragRef.current = false
   }
 
   const handlePointerMove = (e: React.PointerEvent) => {
     const d = downRef.current
-    if (!d || draggingRef.current) return
+    if (!d || !d.armed) return
     if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > COLOR_DRAG_THRESHOLD) {
-      // Release our local capture so the global ColorDropOverlay listeners take over.
-      draggingRef.current = true
-      try { (e.currentTarget as Element).releasePointerCapture?.(e.pointerId) } catch {}
+      d.armed = false
+      initiatedDragRef.current = true
+      try { (e.currentTarget as Element).releasePointerCapture?.(e.pointerId) } catch { /* no-op */ }
+      // Blur the button so :focus-visible / sticky :active CSS clears cleanly.
+      ;(e.currentTarget as HTMLElement).blur()
       useFreeformStore.getState().beginColorDrag(color, e.clientX, e.clientY)
     }
   }
@@ -224,12 +240,16 @@ function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
     const d = downRef.current
     downRef.current = null
     if (!d) return
-    if (!draggingRef.current) {
-      // Treat as a tap → toggle picker.
+    if (d.armed && !initiatedDragRef.current) {
+      // Released without crossing the drag threshold → treat as a tap.
       onTap()
     }
-    // If draggingRef.current, ColorDropOverlay's window pointerup handler does the drop.
-    void e
+    // Otherwise ColorDropOverlay's window pointerup did the drop work.
+    ;(e.currentTarget as HTMLElement).blur()
+  }
+
+  const handlePointerCancel = () => {
+    downRef.current = null
   }
 
   return (
@@ -237,7 +257,15 @@ function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
-      className="h-7 w-7 rounded-full border-2 border-white/25 shadow-inner hover:border-white/50 transition shrink-0 select-none touch-none cursor-grab active:cursor-grabbing"
+      onPointerCancel={handlePointerCancel}
+      // No :active scaling and no sticky grab cursor — both caused the
+      // stuck-style bug after a drag that ended away from the button.
+      className={[
+        'h-7 w-7 rounded-full border-2 shadow-inner shrink-0 select-none touch-none transition-colors',
+        isDragging
+          ? 'border-white/15 opacity-40'
+          : 'border-white/25 hover:border-white/50 cursor-grab',
+      ].join(' ')}
       style={{ backgroundColor: color }}
       title="Color — tap to open picker, drag onto canvas to fill"
     />

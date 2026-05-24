@@ -26,9 +26,14 @@ export function StickyModifierDock() {
   const [altHeld, setAltHeld] = useState(false)
   const [shiftHeld, setShiftHeld] = useState(false)
   const [isTouch, setIsTouch] = useState(false)
+  // Desktop dock is visible but collapsed by default; users open it from a
+  // tiny pill so the floating button doesn't shout over the canvas.
+  const [desktopOpen, setDesktopOpen] = useState(false)
 
   useEffect(() => {
-    // Show only when there's no fine pointer (touch / pen-primary devices).
+    // Coarse-pointer devices (touch / pen-primary) get the full dock; mouse
+    // users see a small expandable affordance so the feature is still
+    // discoverable when a tablet is connected to a desktop browser.
     const mq = window.matchMedia('(pointer: coarse)')
     const update = () => setIsTouch(mq.matches)
     update()
@@ -43,10 +48,35 @@ export function StickyModifierDock() {
     select?.setStickyModifier('shift', shiftHeld || shiftLocked)
   }, [board, altHeld, altLocked, shiftHeld, shiftLocked])
 
-  if (!isTouch) return null
+  // On desktop, render a compact pill that expands into the dock on click.
+  // Closing the dock while a modifier is locked keeps the lock active — the
+  // pill turns amber so you remember it's still on.
+  if (!isTouch && !desktopOpen) {
+    const anyActive = altLocked || shiftLocked
+    return (
+      <button
+        onClick={() => setDesktopOpen(true)}
+        className={[
+          'fixed bottom-4 left-4 z-[9000] flex h-9 items-center gap-1.5 rounded-full border px-3 text-[11px] font-semibold shadow-2xl backdrop-blur-xl transition select-none',
+          anyActive
+            ? 'border-amber-400/70 bg-amber-400/20 text-amber-100'
+            : 'border-white/12 bg-black/55 text-white/55 hover:text-white/85',
+        ].join(' ')}
+        title="Sticky modifiers (Alt / Shift)"
+      >
+        <span className="text-sm leading-none">⌥</span>
+        <span className="text-sm leading-none">⇧</span>
+        {anyActive && (
+          <span className="ml-1 text-[9px] uppercase tracking-widest opacity-80">
+            {altLocked && shiftLocked ? 'A·S' : altLocked ? 'Alt' : 'Shift'}
+          </span>
+        )}
+      </button>
+    )
+  }
 
   return (
-    <div className="pointer-events-none fixed bottom-4 left-4 z-[9000] flex gap-2">
+    <div className="pointer-events-none fixed bottom-4 left-4 z-9000 flex items-end gap-2">
       <ModButton
         label="⌥"
         sub="Alt"
@@ -63,6 +93,13 @@ export function StickyModifierDock() {
         onHoldChange={setShiftHeld}
         onToggleLock={() => setShiftLocked((v) => !v)}
       />
+      {!isTouch && (
+        <button
+          onClick={() => setDesktopOpen(false)}
+          className="pointer-events-auto h-7 w-7 rounded-full border border-white/12 bg-black/55 text-xs text-white/55 hover:text-white/85 transition shadow-md"
+          title="Collapse"
+        >×</button>
+      )}
     </div>
   )
 }

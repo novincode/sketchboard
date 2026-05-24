@@ -162,6 +162,51 @@ function raycastPolygon(pts: Array<{ x: number; y: number }>, px: number, py: nu
   return inside
 }
 
+/**
+ * Downscale RGBA8 by integer factor `ds`. Alpha uses MAX over each block so
+ * thin walls / strokes survive the downsample (averaging would blend them
+ * out and the flood would leak right through). RGB samples the block center
+ * — cheaper than averaging and good enough for color-tolerance matching.
+ */
+function downsampleRgba(
+  src: Uint8ClampedArray,
+  W: number, H: number,
+  ds: number,
+  outW: number, outH: number,
+): Uint8ClampedArray {
+  const dst = new Uint8ClampedArray(outW * outH * 4)
+  const half = ds >> 1
+  for (let y = 0; y < outH; y++) {
+    const y0 = y * ds
+    const yEnd = Math.min(H, y0 + ds)
+    const sy = Math.min(H - 1, y0 + half)
+    for (let x = 0; x < outW; x++) {
+      const x0 = x * ds
+      const xEnd = Math.min(W, x0 + ds)
+      const sx = Math.min(W - 1, x0 + half)
+
+      // Max-pool alpha across the block (preserves walls).
+      let maxA = 0
+      for (let yy = y0; yy < yEnd; yy++) {
+        const row = yy * W * 4 + 3
+        for (let xx = x0; xx < xEnd; xx++) {
+          const a = src[row + (xx - 0) * 4]!
+          if (a > maxA) { maxA = a; if (a === 255) break }
+        }
+        if (maxA === 255) break
+      }
+      // Sample-center RGB.
+      const si = (sy * W + sx) * 4
+      const di = (y * outW + x) * 4
+      dst[di]     = src[si]!
+      dst[di + 1] = src[si + 1]!
+      dst[di + 2] = src[si + 2]!
+      dst[di + 3] = maxA
+    }
+  }
+  return dst
+}
+
 // ─── FillTool ─────────────────────────────────────────────────────────────────
 
 /**
@@ -184,19 +229,37 @@ export class FillTool extends Tool {
   /** Pixels of horizontal drag that equal one tolerance unit (0-255). Lower = more sensitive. */
   dragSensitivity: number = 1.6
 
-  // rAF coalescing for drag-scrub: pointermove fires far more often than we can
-  // re-flood-fill a 4K bitmap. We record the latest desired tolerance and run
-  // exactly one reflood per animation frame.
+  /**
+   * Tolerance quantize step during scrub. 256/2 = 128 distinct preview values
+   * is plenty for feel, and cuts reflood frequency in half.
+   */
+  scrubToleranceStep: number = 2
+
+  /**
+   * Downsample factor used for the in-flight scrub preview. A 4× downscale
+   * means the flood touches 1/16 the pixels — turns an 800ms flood on a 4K
+   * canvas into ~50ms. Only used during the drag; final commit is full-res.
+   * Set to 1 to disable downsampling.
+   */
+  scrubPreviewDownscale: number = 4
+
+  // rAF coalescing for drag-scrub: pointermove fires far more often than we
+  // can re-flood. We record the latest desired tolerance and run exactly one
+  // reflood per animation frame.
   private _refloodRaf: number | null = null
   private _pendingTolerance: number | null = null
+  private _lastFloodedTolerance: number = -1
 
-  // Active raster scrub session (null when idle or running on a vector layer)
+  // Active raster scrub session (null when idle or running on a vector layer).
+  // `before` is the full-resolution untouched snapshot used at commit time.
+  // The `_low` sub-record holds the precomputed downscaled grid used for
+  // every drag-time reflood; building it once at begin-time amortizes the
+  // downsample cost across the gesture.
   private _scrub: {
     layer: RasterLayer
     px: number
     py: number
     fillR: number; fillG: number; fillB: number; fillA: number
-    /** Untouched copy of layer pixels captured at pointer-down. */
     before: Uint8ClampedArray
     width: number
     height: number
@@ -204,6 +267,16 @@ export class FillTool extends Tool {
     startX: number
     startTolerance: number
     lastTolerance: number
+    /** Set when downsampled preview is active. Reused every reflood. */
+    low: {
+      scale: number
+      w: number; h: number
+      px: number; py: number
+      before: Uint8ClampedArray
+      refData: Uint8ClampedArray | null
+      previewCanvas: HTMLCanvasElement
+      previewCtx: CanvasRenderingContext2D
+    } | null
   } | null = null
 
   onPointerDown(e: PointerData): void {
@@ -295,45 +368,21 @@ export class FillTool extends Tool {
   }
 
   onPointerMove(e: PointerData): void {
-    if (!this._scrub) return
-    const dx = e.x - this._scrub.startX
-    const next = Math.max(0, Math.min(255, Math.round(this._scrub.startTolerance + dx / this.dragSensitivity)))
-    if (next === this._scrub.lastTolerance && this._pendingTolerance === null) return
-    this._scrub.lastTolerance = next
-    this.settings.tolerance = next
-    // HUD updates immediately (cheap); the actual flood reschedules to rAF.
-    this.board!.hooks.toolPreview.call({
-      tool: 'fill', kind: 'tolerance',
-      data: { tolerance: next, x: e.x, y: e.y },
-    })
-    this._scheduleReflood(next)
+    this.scrubMove(e.x, e.y)
   }
 
   onPointerUp(_e: PointerData): void {
     if (!this._scrub) return
-    // Flush any pending reflood so the committed pixels match what's on screen.
-    this._cancelPendingReflood()
-    if (this._scrub.lastTolerance !== this._lastFloodedTolerance) {
-      this._reflood(this._scrub.lastTolerance)
-    }
-    this._commitScrub()
+    this.scrubEnd()
   }
 
   onPointerCancel(_e: PointerData): void {
     if (!this._scrub) return
-    this._cancelPendingReflood()
-    // Revert to original pixels — user aborted.
-    const { layer, before, width, height } = this._scrub
-    layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height))
-    this.board?.markDirty()
-    this._scrub = null
+    this.scrubCancel()
   }
 
   onDeactivate(): void {
-    if (this._scrub) {
-      this._cancelPendingReflood()
-      this._commitScrub()
-    }
+    if (this._scrub) this.scrubEnd()
   }
 
   private _scheduleReflood(tolerance: number): void {
@@ -355,16 +404,75 @@ export class FillTool extends Tool {
     this._pendingTolerance = null
   }
 
-  private _lastFloodedTolerance: number = -1
-
   // ── Raster scrub session ─────────────────────────────────────────────────
 
-  private _beginRasterScrub(e: PointerData, layer: RasterLayer): void {
+  /**
+   * Begin a raster scrub at the given SCREEN coords with an optional color
+   * override. Used by both onPointerDown (FillTool active) and by the demo's
+   * ColorDrop overlay (which keeps the swatch gesture going past the drop and
+   * scrubs tolerance horizontally — same code path, no duplicate flood logic).
+   *
+   * Returns true if a scrub started, false if the click missed the layer or
+   * the active layer isn't a raster.
+   */
+  scrubBeginAtScreen(screenX: number, screenY: number, hexColor?: string): boolean {
+    if (!this.board) return false
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof RasterLayer) || !layer.visible) return false
+    if (hexColor) this.settings.color = hexColor
+    return this._beginRasterScrub({
+      x: screenX, y: screenY, pressure: 1, tiltX: 0, tiltY: 0,
+      pointerId: -1, pointerType: 'mouse', timeStamp: performance.now(),
+    }, layer)
+  }
+
+  /** Update the scrub cursor position (only horizontal delta drives tolerance). */
+  scrubMove(screenX: number, screenY: number): void {
+    if (!this._scrub) return
+    const dx = screenX - this._scrub.startX
+    const raw = this._scrub.startTolerance + dx / this.dragSensitivity
+    const q = this.scrubToleranceStep
+    const next = Math.max(0, Math.min(255, Math.round(raw / q) * q))
+    if (next === this._scrub.lastTolerance && this._pendingTolerance === null) return
+    this._scrub.lastTolerance = next
+    this.settings.tolerance = next
+    this.board!.hooks.toolPreview.call({
+      tool: 'fill', kind: 'tolerance',
+      data: { tolerance: next, x: screenX, y: screenY },
+    })
+    this._scheduleReflood(next)
+  }
+
+  /** Commit the scrub (full-res final flood + single history entry). */
+  scrubEnd(): void {
+    if (!this._scrub) return
+    this._cancelPendingReflood()
+    // Final flood at FULL resolution into the layer.
+    this._refloodFull(this._scrub.lastTolerance)
+    this._commitScrub()
+    this.board?.hooks.toolPreview.call({ tool: 'fill', kind: 'end', data: {} })
+  }
+
+  /** Abort the scrub, restoring the pre-scrub pixels. */
+  scrubCancel(): void {
+    if (!this._scrub) return
+    this._cancelPendingReflood()
+    const { layer, before, width, height } = this._scrub
+    layer.putImageData(new ImageData(new Uint8ClampedArray(before), width, height))
+    this.board?.markDirty()
+    this._scrub = null
+    this.board?.hooks.toolPreview.call({ tool: 'fill', kind: 'end', data: {} })
+  }
+
+  /** True while a scrub session is in progress. */
+  isScrubbing(): boolean { return this._scrub !== null }
+
+  private _beginRasterScrub(e: PointerData, layer: RasterLayer): boolean {
     const board = this.board!
     const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
     const px = Math.floor(world.x - layer.transform.x)
     const py = Math.floor(world.y - layer.transform.y)
-    if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return
+    if (px < 0 || px >= layer.width || py < 0 || py >= layer.height) return false
 
     const hex = this.settings.color.replace('#', '')
     const fillR = parseInt(hex.substring(0, 2), 16)
@@ -385,6 +493,11 @@ export class FillTool extends Tool {
       }
     }
 
+    // Build the downsampled scratch buffers ONCE so every reflood is cheap.
+    const ds = this.scrubPreviewDownscale | 0
+    const useLow = ds > 1 && (layer.width > 1024 || layer.height > 1024)
+    const low = useLow ? this._buildLowResScratch(before, refData, layer.width, layer.height, px, py, ds) : null
+
     this._scrub = {
       layer, px, py,
       fillR, fillG, fillB, fillA,
@@ -394,12 +507,66 @@ export class FillTool extends Tool {
       startX: e.x,
       startTolerance: this.settings.tolerance,
       lastTolerance: this.settings.tolerance,
+      low,
     }
     this._lastFloodedTolerance = -1
     this._reflood(this.settings.tolerance)
+    return true
   }
 
   private _reflood(tolerance: number): void {
+    const s = this._scrub!
+    if (s.low) this._refloodLow(tolerance)
+    else this._refloodFull(tolerance)
+    this._lastFloodedTolerance = tolerance
+    this.board?.markDirty()
+  }
+
+  /**
+   * Low-resolution flood preview: flood at 1/ds², then composite the result
+   * back on top of the (full-res) original pixels via drawImage upscale.
+   * The original layer content stays sharp; only the live fill region is
+   * approximated. On commit we redo the flood at full resolution.
+   */
+  private _refloodLow(tolerance: number): void {
+    const s = this._scrub!
+    const low = s.low!
+    const fresh = new Uint8ClampedArray(low.before)
+    if (low.refData) {
+      floodFillWithRef(fresh, low.refData, low.w, low.h, low.px, low.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+    } else {
+      floodFill(fresh, low.w, low.h, low.px, low.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
+    }
+
+    // Build an overlay buffer that's transparent everywhere EXCEPT where the
+    // fill region differs from the pre-fill low-res snapshot. That way the
+    // preview composites cleanly over the (still full-res) original below.
+    const overlay = new Uint8ClampedArray(fresh.length)
+    const beforeLo = low.before
+    for (let i = 0; i < fresh.length; i += 4) {
+      // Pixel changed = pixel is part of the fill region.
+      if (fresh[i] !== beforeLo[i] || fresh[i + 1] !== beforeLo[i + 1]
+          || fresh[i + 2] !== beforeLo[i + 2] || fresh[i + 3] !== beforeLo[i + 3]) {
+        overlay[i]     = s.fillR
+        overlay[i + 1] = s.fillG
+        overlay[i + 2] = s.fillB
+        overlay[i + 3] = s.fillA
+      }
+    }
+    low.previewCtx.putImageData(new ImageData(overlay, low.w, low.h), 0, 0)
+
+    // Composite: full-res original (sharp) + drawImage-upscaled overlay.
+    const dst = s.layer.ctx
+    dst.putImageData(new ImageData(new Uint8ClampedArray(s.before), s.width, s.height), 0, 0)
+    dst.save()
+    // Smoothing softens the upscaled edges so the preview reads as "preview" rather than jagged final.
+    dst.imageSmoothingEnabled = true
+    dst.drawImage(low.previewCanvas, 0, 0, s.width, s.height)
+    dst.restore()
+  }
+
+  /** Full-resolution flood — used for the final commit and small layers. */
+  private _refloodFull(tolerance: number): void {
     const s = this._scrub!
     const fresh = new Uint8ClampedArray(s.before)
     if (s.refData) {
@@ -408,8 +575,42 @@ export class FillTool extends Tool {
       floodFill(fresh, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     }
     s.layer.putImageData(new ImageData(fresh, s.width, s.height))
-    this._lastFloodedTolerance = tolerance
-    this.board?.markDirty()
+  }
+
+  /**
+   * Build the downsampled `before` + `refData` buffers used during scrub.
+   * Alpha channel is max-pooled across each NxN block so thin walls survive
+   * the downsample (averaging would let the flood leak across them); RGB is
+   * sampled from the block center for cheap color-difference matching.
+   */
+  private _buildLowResScratch(
+    before: Uint8ClampedArray,
+    refData: ImageData | null,
+    W: number, H: number,
+    px: number, py: number,
+    ds: number,
+  ): NonNullable<typeof this._scrub>['low'] {
+    const w = Math.max(1, Math.ceil(W / ds))
+    const h = Math.max(1, Math.ceil(H / ds))
+    const lowBefore = downsampleRgba(before, W, H, ds, w, h)
+    const lowRef = refData ? downsampleRgba(refData.data, W, H, ds, w, h) : null
+    const canvas = document.createElement('canvas')
+    canvas.width = w; canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) {
+      // Should never happen in a real browser context — bail out to full-res.
+      return null
+    }
+    return {
+      scale: ds,
+      w, h,
+      px: Math.min(w - 1, Math.floor(px / ds)),
+      py: Math.min(h - 1, Math.floor(py / ds)),
+      before: lowBefore,
+      refData: lowRef,
+      previewCanvas: canvas,
+      previewCtx: ctx,
+    }
   }
 
   private _commitScrub(): void {
@@ -423,7 +624,7 @@ export class FillTool extends Tool {
       redo: () => { layer.putImageData(new ImageData(new Uint8ClampedArray(after),  width, height)); board.markDirty() },
     })
     this._scrub = null
-    board.hooks.toolPreview.call({ tool: 'fill', kind: 'end', data: {} })
+    // 'end' is emitted by scrubEnd/scrubCancel so the HUD only fades once.
   }
 
   // ── Vector fill (no drag; one-shot insert of a fill path) ────────────────
