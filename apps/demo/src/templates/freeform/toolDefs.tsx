@@ -60,7 +60,19 @@ function BrushPresetDropdown() {
         ].join(' ')}
         style={{ width: 96, height: 32 }}
       >
-        <div className="flex-1 overflow-hidden rounded-sm" style={{ height: 22 }}>
+        <div
+          className="flex-1 overflow-hidden rounded-sm"
+          style={{
+            height: 22,
+            backgroundColor: '#f1efe9',
+            backgroundImage: `
+              linear-gradient(45deg, rgba(0,0,0,0.05) 25%, transparent 25%),
+              linear-gradient(-45deg, rgba(0,0,0,0.05) 25%, transparent 25%)
+            `,
+            backgroundSize: '6px 6px',
+            backgroundPosition: '0 0, 0 3px',
+          }}
+        >
           <BrushPreviewCanvas preset={activePreset} color={brushColor} width={72} height={22} />
         </div>
         <ChevronDown size={9} className="shrink-0 opacity-50" />
@@ -86,12 +98,26 @@ function BrushPresetDropdown() {
                     : 'hover:bg-white/6',
                 ].join(' ')}
               >
+                {/* Procreate-style preview tile: neutral light-pearl surface
+                    with a faint checker so ANY brush color (dark or light)
+                    reads cleanly. No more dark-stroke-on-dark-bg invisibility. */}
                 <div
                   className={[
-                    'overflow-hidden rounded-md',
-                    preset.id === activeBrushPresetId ? 'bg-black/40' : 'bg-black/25',
+                    'overflow-hidden rounded-md ring-1',
+                    preset.id === activeBrushPresetId ? 'ring-blue-400/40' : 'ring-white/8',
                   ].join(' ')}
-                  style={{ height: 48 }}
+                  style={{
+                    height: 48,
+                    backgroundColor: '#f1efe9',
+                    backgroundImage: `
+                      linear-gradient(45deg, rgba(0,0,0,0.05) 25%, transparent 25%),
+                      linear-gradient(-45deg, rgba(0,0,0,0.05) 25%, transparent 25%),
+                      linear-gradient(45deg, transparent 75%, rgba(0,0,0,0.05) 75%),
+                      linear-gradient(-45deg, transparent 75%, rgba(0,0,0,0.05) 75%)
+                    `,
+                    backgroundSize: '8px 8px',
+                    backgroundPosition: '0 0, 0 4px, 4px -4px, -4px 0',
+                  }}
                 >
                   <BrushPreviewCanvas preset={preset} color={brushColor} width={252} height={48} />
                 </div>

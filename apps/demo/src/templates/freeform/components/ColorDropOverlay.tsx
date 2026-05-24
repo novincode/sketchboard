@@ -1,71 +1,59 @@
 'use client'
 
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState, memo } from 'react'
 import type { FillTool } from '@sketchboard/core'
 import { useFreeformStore } from '../store'
 
 /**
- * Procreate ColorDrop — unified pipeline for raster AND vector.
+ * Procreate-style ColorDrop with hold-to-commit + tolerance scrub.
  *
- * Phase 1: AIMING
- *   The swatch is dragging. A colored disc follows the cursor anywhere on
- *   the screen. NO fill happens yet — the user is just deciding where to drop.
+ *   AIMING  → disc follows cursor, nothing fires
+ *   ARMING  → cursor over canvas + stationary within DROP_RADIUS_PX;
+ *             charging ring fills over DROP_DELAY_MS
+ *   COMMIT  → raster: FillTool.scrubBeginAtScreen (full-res initial fill),
+ *             then horizontal motion runs FillTool.scrubMove for live tolerance.
+ *             vector: FillTool.fillAtScreenPoint (one-shot)
+ *   RELEASE → scrub commits (raster) / already done (vector); ripple plays
  *
- * Phase 2: ARMING (cursor over canvas, mostly stationary)
- *   When the cursor enters the canvas and stays within DROP_RADIUS for
- *   DROP_DELAY_MS, a charging ring around the disc fills up. This avoids
- *   the "instantly stamped into the background as I dragged past" bug.
+ * CRITICAL: the gesture-controller effect must NOT re-run on pointermove.
+ * Previously it did, because we subscribed to the full `colorDrag` object
+ * (whose .x/.y changes every event) — every frame tore down the window
+ * listeners and cancelled the charging rAF, so arming never completed.
  *
- * Phase 3: COMMIT (delay elapsed)
- *   - Raster layer: FillTool.scrubBeginAtScreen fires (full-res initial
- *     fill at current tolerance). Horizontal motion from this point on
- *     scrubs tolerance live (low-res preview, identical to bucket tool).
- *   - Vector layer: FillTool.fillAtScreenPoint fires (one-shot insert
- *     of a closed bezier path). No scrub since vector fills are discrete.
- *
- * Phase 4: RELEASE / CANCEL
- *   - pointerup on raster: scrub commits as one history entry, ripple
- *     animation plays at the drop point.
- *   - pointerup on vector: already committed at phase 3, just play ripple.
- *   - ESC or pointer leaves the canvas before commit: cancel cleanly.
+ * The controller now subscribes only to a STABLE identity (the color hex of
+ * the active drag, or null). Position rendering is split into a separate
+ * memoized child that subscribes to `colorDrag` directly.
  */
 
-const DROP_DELAY_MS = 550        // how long the cursor must rest before firing
-const DROP_RADIUS_PX = 14        // movement budget while arming
-const SCRUB_CANCEL_DIST = 80     // raster: drag this far off-canvas → abort scrub
+const DROP_DELAY_MS = 550
+const DROP_RADIUS_PX = 14
+const SCRUB_CANCEL_DIST = 80
 
 export function ColorDropOverlay() {
-  const colorDrag = useFreeformStore((s) => s.colorDrag)
-  const ripples = useFreeformStore((s) => s.colorDropRipples)
+  // Stable identity: only changes when a drag starts or ends (not on move).
+  const dragColor = useFreeformStore((s) => s.colorDrag?.color ?? null)
   const board = useFreeformStore((s) => s.board)
 
-  // Phase tracking. We deliberately use refs (not state) for the hot-path
-  // values so pointermove updates don't trigger React renders 60 times/sec.
-  const phaseRef = useRef<'aiming' | 'arming' | 'scrubbing' | 'committed'>('aiming')
-  const armStartRef = useRef<{ x: number; y: number; t: number } | null>(null)
-  const dropPointRef = useRef<{ x: number; y: number } | null>(null)
-
-  // Charge progress (0–1) updates state at ~rAF cadence for the ring fill;
-  // bounded by render budget by clamping the React state set frequency.
+  // Charge progress (0–1) drives the ring animation. Updated at rAF cadence
+  // but throttled to ~4% deltas so it doesn't render 60 times/sec.
   const [chargeProgress, setChargeProgress] = useState(0)
-  const lastChargeRef = useRef(0)
 
-  // Reset everything when the drag ends or no board exists.
   useEffect(() => {
-    if (!colorDrag) {
-      phaseRef.current = 'aiming'
-      armStartRef.current = null
-      dropPointRef.current = null
+    if (!dragColor || !board) {
       setChargeProgress(0)
-      lastChargeRef.current = 0
       return
     }
-    if (!board) return
 
     const fill = board.getTool<FillTool>('fill')
     const canvasEl = board.canvas.parentElement
     if (!fill || !canvasEl) return
 
+    // All hot-path state lives in refs so handler activity does NOT cause
+    // the effect to re-run.
+    let phase: 'aiming' | 'arming' | 'scrubbing' | 'committed' = 'aiming'
+    let armStart: { x: number; y: number; t: number } | null = null
+    let dropPoint: { x: number; y: number } | null = null
+    let lastCharge = 0
     let chargeRaf: number | null = null
 
     const insideCanvas = (clientX: number, clientY: number): { lx: number; ly: number } | null => {
@@ -74,64 +62,58 @@ export function ColorDropOverlay() {
       return { lx: clientX - rect.left, ly: clientY - rect.top }
     }
 
-    const updateCharge = () => {
+    const tick = () => {
       chargeRaf = null
-      const arm = armStartRef.current
-      if (!arm) { lastChargeRef.current = 0; setChargeProgress(0); return }
-      const elapsed = performance.now() - arm.t
+      if (phase !== 'arming' || !armStart) return
+      const elapsed = performance.now() - armStart.t
       const pct = Math.max(0, Math.min(1, elapsed / DROP_DELAY_MS))
-      // Throttle React state writes: only push when the visual changes meaningfully.
-      if (Math.abs(pct - lastChargeRef.current) > 0.04 || pct === 1 || pct === 0) {
-        lastChargeRef.current = pct
+      if (Math.abs(pct - lastCharge) > 0.04 || pct === 1) {
+        lastCharge = pct
         setChargeProgress(pct)
       }
-      // If we crossed the threshold while arming, fire the drop.
-      if (pct >= 1 && phaseRef.current === 'arming') {
-        fireDrop(arm.x, arm.y)
+      if (pct >= 1) {
+        fireDrop(armStart.x, armStart.y)
         return
       }
-      // Keep ticking while we're still arming.
-      if (phaseRef.current === 'arming') {
-        chargeRaf = requestAnimationFrame(updateCharge)
-      }
+      chargeRaf = requestAnimationFrame(tick)
+    }
+
+    const startArm = (clientX: number, clientY: number) => {
+      armStart = { x: clientX, y: clientY, t: performance.now() }
+      lastCharge = 0
+      setChargeProgress(0)
+      phase = 'arming'
+      if (chargeRaf === null) chargeRaf = requestAnimationFrame(tick)
+    }
+
+    const cancelArm = () => {
+      armStart = null
+      lastCharge = 0
+      setChargeProgress(0)
+      phase = 'aiming'
+      if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
     }
 
     const fireDrop = (clientX: number, clientY: number) => {
       const inside = insideCanvas(clientX, clientY)
-      if (!inside) {
-        // Lost the canvas between the arming check and now — bail.
-        cancelArm()
-        return
-      }
-      dropPointRef.current = { x: clientX, y: clientY }
-      const dragColor = colorDrag.color
-      // Raster: start a scrub (initial fill is full-res inside scrubBeginAtScreen).
-      // Vector: scrubBeginAtScreen returns false; fall back to one-shot fill.
+      if (!inside) { cancelArm(); return }
+      dropPoint = { x: clientX, y: clientY }
       const startedScrub = fill.scrubBeginAtScreen(inside.lx, inside.ly, dragColor)
-      if (startedScrub) {
-        phaseRef.current = 'scrubbing'
-      } else {
-        // Vector path (or click missed the bitmap) — one-shot, no scrub.
+      phase = startedScrub ? 'scrubbing' : 'committed'
+      if (!startedScrub) {
+        // Vector or out-of-bounds raster → one-shot fillAtScreenPoint.
         fill.fillAtScreenPoint(inside.lx, inside.ly, dragColor)
-        phaseRef.current = 'committed'
       }
-      armStartRef.current = null
-      setChargeProgress(0)
-      lastChargeRef.current = 0
-    }
-
-    const cancelArm = () => {
-      armStartRef.current = null
-      lastChargeRef.current = 0
+      armStart = null
+      lastCharge = 0
       setChargeProgress(0)
       if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
-      phaseRef.current = 'aiming'
     }
 
-    const playRipple = (x: number, y: number, color: string) => {
+    const playRipple = (x: number, y: number) => {
       const id = Date.now() + Math.random()
       useFreeformStore.setState((s) => ({
-        colorDropRipples: [...s.colorDropRipples, { id, x, y, color }],
+        colorDropRipples: [...s.colorDropRipples, { id, x, y, color: dragColor }],
       }))
       setTimeout(() => {
         useFreeformStore.setState((s) => ({
@@ -141,81 +123,64 @@ export function ColorDropOverlay() {
     }
 
     const onMove = (e: PointerEvent) => {
+      // Position the floating disc via the store.
       useFreeformStore.getState().updateColorDrag(e.clientX, e.clientY)
       const inside = insideCanvas(e.clientX, e.clientY)
 
-      if (phaseRef.current === 'scrubbing') {
+      if (phase === 'scrubbing') {
         if (inside) {
           fill.scrubMove(inside.lx, inside.ly)
-        } else {
-          // Allow some grace — only abort if we drift far away.
-          const drop = dropPointRef.current
-          if (!drop || Math.hypot(e.clientX - drop.x, e.clientY - drop.y) > SCRUB_CANCEL_DIST) {
-            fill.scrubCancel()
-            phaseRef.current = 'committed' // committed = "done", won't re-arm
-          }
+        } else if (dropPoint && Math.hypot(e.clientX - dropPoint.x, e.clientY - dropPoint.y) > SCRUB_CANCEL_DIST) {
+          fill.scrubCancel()
+          phase = 'committed'
         }
         return
       }
+      if (phase === 'committed') return
 
-      if (phaseRef.current === 'committed') return
-
-      // Aiming or arming phase.
       if (!inside) {
-        if (phaseRef.current === 'arming') cancelArm()
+        if (phase === 'arming') cancelArm()
         return
       }
 
-      // Arrived over the canvas — start arming, or check if we moved too far.
-      if (phaseRef.current === 'aiming') {
-        armStartRef.current = { x: e.clientX, y: e.clientY, t: performance.now() }
-        phaseRef.current = 'arming'
-        if (chargeRaf === null) chargeRaf = requestAnimationFrame(updateCharge)
+      if (phase === 'aiming') {
+        startArm(e.clientX, e.clientY)
         return
       }
 
-      // Phase is 'arming'. If we've moved beyond the arm radius, restart the timer.
-      const arm = armStartRef.current
-      if (arm) {
-        const d = Math.hypot(e.clientX - arm.x, e.clientY - arm.y)
-        if (d > DROP_RADIUS_PX) {
-          armStartRef.current = { x: e.clientX, y: e.clientY, t: performance.now() }
-          lastChargeRef.current = 0
-          setChargeProgress(0)
-        }
+      // Phase === 'arming': reset the timer if we moved too far.
+      if (armStart && Math.hypot(e.clientX - armStart.x, e.clientY - armStart.y) > DROP_RADIUS_PX) {
+        startArm(e.clientX, e.clientY)
       }
     }
 
     const onUp = (e: PointerEvent) => {
-      const phase = phaseRef.current
+      const localPhase = phase
       const inside = insideCanvas(e.clientX, e.clientY)
-      const dragColor = colorDrag.color
 
-      if (phase === 'scrubbing') {
+      if (localPhase === 'scrubbing') {
         fill.scrubEnd()
-        const drop = dropPointRef.current
-        playRipple(drop?.x ?? e.clientX, drop?.y ?? e.clientY, dragColor)
-      } else if (phase === 'committed') {
-        // Already fired (vector path). Ripple already played? No — play it now.
-        const drop = dropPointRef.current
-        if (drop) playRipple(drop.x, drop.y, dragColor)
-      } else if (inside && phase === 'arming') {
-        // User released before the charge completed but they were over the
-        // canvas — treat as an explicit "I want to fill here NOW" intent.
-        // (Matches Procreate: release-over-canvas always commits.)
+        const drop = dropPoint
+        playRipple(drop?.x ?? e.clientX, drop?.y ?? e.clientY)
+      } else if (localPhase === 'committed') {
+        const drop = dropPoint
+        if (drop) playRipple(drop.x, drop.y)
+      } else if (inside) {
+        // User released over the canvas before the charge completed.
+        // Treat as "fill here now" intent.
         const startedScrub = fill.scrubBeginAtScreen(inside.lx, inside.ly, dragColor)
         if (startedScrub) fill.scrubEnd()
         else fill.fillAtScreenPoint(inside.lx, inside.ly, dragColor)
-        playRipple(e.clientX, e.clientY, dragColor)
+        playRipple(e.clientX, e.clientY)
       }
-      // Else: released over chrome / outside without arming → silent cancel.
+      // Else: released over chrome → silent cancel, no fill.
 
       if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
       useFreeformStore.getState().cancelColorDrag()
     }
 
     const onCancel = () => {
-      if (phaseRef.current === 'scrubbing') fill.scrubCancel()
+      if (phase === 'scrubbing') fill.scrubCancel()
       if (chargeRaf !== null) { cancelAnimationFrame(chargeRaf); chargeRaf = null }
       useFreeformStore.getState().cancelColorDrag()
     }
@@ -233,7 +198,7 @@ export function ColorDropOverlay() {
       window.removeEventListener('keydown', onKey)
       if (chargeRaf !== null) cancelAnimationFrame(chargeRaf)
     }
-  }, [colorDrag, board])
+  }, [dragColor, board])
 
   return (
     <>
@@ -253,20 +218,36 @@ export function ColorDropOverlay() {
           100% { transform: translate(-50%, -50%) scale(0.2); opacity: 0; }
         }
       `}</style>
+      <DragDisc chargeProgress={chargeProgress} />
+      <Ripples />
+    </>
+  )
+}
 
-      {colorDrag && (
-        <div
-          className="pointer-events-none fixed z-[10001]"
-          style={{
-            left: colorDrag.x, top: colorDrag.y,
-            transform: 'translate(-50%, -50%)',
-            animation: 'colorDragIn 130ms ease-out',
-          }}
-        >
-          <DropCursor color={colorDrag.color} chargeProgress={chargeProgress} />
-        </div>
-      )}
+// ─── DragDisc: subscribes to colorDrag so the position re-renders here ───────
+// (but never re-runs the controller's effect because that's in the parent).
 
+const DragDisc = memo(function DragDisc({ chargeProgress }: { chargeProgress: number }) {
+  const drag = useFreeformStore((s) => s.colorDrag)
+  if (!drag) return null
+  return (
+    <div
+      className="pointer-events-none fixed z-[10001]"
+      style={{
+        left: drag.x, top: drag.y,
+        transform: 'translate(-50%, -50%)',
+        animation: 'colorDragIn 130ms ease-out',
+      }}
+    >
+      <DropCursor color={drag.color} chargeProgress={chargeProgress} />
+    </div>
+  )
+})
+
+const Ripples = memo(function Ripples() {
+  const ripples = useFreeformStore((s) => s.colorDropRipples)
+  return (
+    <>
       {ripples.map((r) => (
         <div
           key={r.id}
@@ -294,18 +275,17 @@ export function ColorDropOverlay() {
       ))}
     </>
   )
-}
+})
 
 /**
- * The disc itself + the charging ring rendered via an SVG circle so we can
- * `stroke-dashoffset` it for a clean progress sweep with zero layout work.
+ * The disc + SVG progress ring. Pure presentation: stroke-dashoffset drives
+ * the sweep with no layout work.
  */
 function DropCursor({ color, chargeProgress }: { color: string; chargeProgress: number }) {
-  const R = 22                // ring radius
-  const C = 2 * Math.PI * R   // circumference
+  const R = 22
+  const C = 2 * Math.PI * R
   return (
     <div className="relative" style={{ width: 56, height: 56 }}>
-      {/* Ring */}
       <svg className="absolute inset-0" width={56} height={56} viewBox="0 0 56 56">
         <circle cx={28} cy={28} r={R} fill="none" stroke="rgba(255,255,255,0.18)" strokeWidth={3} />
         {chargeProgress > 0 && (
@@ -322,7 +302,6 @@ function DropCursor({ color, chargeProgress }: { color: string; chargeProgress: 
           />
         )}
       </svg>
-      {/* Disc */}
       <div
         className="absolute rounded-full border-2 border-white/80 shadow-2xl"
         style={{
@@ -332,7 +311,7 @@ function DropCursor({ color, chargeProgress }: { color: string; chargeProgress: 
         }}
       />
       <div
-        className="absolute rounded-full pointer-events-none"
+        className="pointer-events-none absolute rounded-full"
         style={{
           left: 10, top: 10, width: 36, height: 36,
           boxShadow: 'inset 0 2px 4px rgba(255,255,255,0.55), inset 0 -3px 6px rgba(0,0,0,0.25)',

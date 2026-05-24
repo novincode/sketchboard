@@ -332,18 +332,10 @@ function SortableLayerRow(props: LayerRowProps) {
   }
 
   // Whole-row drag: spread listeners on the wrapper so the user can grab
-  // anywhere on the row, not just the grip. The inner SwipeableRow handles
-  // touch swipe-to-reveal and stops propagation when it commits to a swipe
-  // so dnd-kit doesn't double-handle the gesture.
+  // anywhere on the row. Delete is reachable via right-click / long-press.
   return (
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
-      <SwipeableRow
-        canDelete={props.canDelete}
-        onDelete={props.onDelete}
-        onMore={() => { /* handled by long-press context menu inside LayerRow */ }}
-      >
-        <LayerRow {...props} />
-      </SwipeableRow>
+      <LayerRow {...props} />
     </div>
   )
 }
@@ -364,137 +356,7 @@ function SortableGroupRow(props: GroupRowProps) {
 
   return (
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
-      <SwipeableRow canDelete={true} onDelete={props.onDelete}>
-        <GroupRow {...props} />
-      </SwipeableRow>
-    </div>
-  )
-}
-
-// ─── Swipeable row (touch only) ───────────────────────────────────────────────
-
-const SWIPE_REVEAL_PX = 88
-const SWIPE_COMMIT_PX = 44
-
-function SwipeableRow({
-  canDelete, onDelete, children,
-}: {
-  canDelete: boolean
-  onDelete: () => void
-  onMore?: () => void
-  children: React.ReactNode
-}) {
-  const [offset, setOffset] = React.useState(0)   // current translateX (-N..0)
-  const [revealed, setRevealed] = React.useState(false)
-  const startRef = useRef<{ x: number; y: number; t: number; locked: 'x' | 'y' | null; pointerId: number } | null>(null)
-
-  // Lazy-collapse if user taps anywhere outside while revealed.
-  useEffect(() => {
-    if (!revealed) return
-    const onDown = (e: PointerEvent) => {
-      const target = e.target as Element | null
-      // Don't collapse if the tap is on the revealed action button (which has its own handler).
-      if (target?.closest('[data-swipe-action]')) return
-      setRevealed(false)
-      setOffset(0)
-    }
-    document.addEventListener('pointerdown', onDown, true)
-    return () => document.removeEventListener('pointerdown', onDown, true)
-  }, [revealed])
-
-  const onPointerDown = (e: React.PointerEvent) => {
-    // Only touch / pen are gestural swipes. Mouse users have hover buttons.
-    if (e.pointerType === 'mouse') return
-    if (e.button !== 0) return
-    startRef.current = { x: e.clientX, y: e.clientY, t: performance.now(), locked: null, pointerId: e.pointerId }
-  }
-
-  const onPointerMove = (e: React.PointerEvent) => {
-    const s = startRef.current
-    if (!s) return
-    if (e.pointerId !== s.pointerId) return
-    const dx = e.clientX - s.x
-    const dy = e.clientY - s.y
-
-    // Don't lock axis on first jitter — wait for >6px of motion.
-    if (s.locked === null) {
-      if (Math.hypot(dx, dy) < 6) return
-      s.locked = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y'
-      // If we're locking horizontal, take ownership: stop the event from
-      // reaching dnd-kit's listeners further up so the row doesn't also drag.
-      if (s.locked === 'x') {
-        e.stopPropagation()
-        try { (e.currentTarget as Element).setPointerCapture?.(e.pointerId) } catch { /* no-op */ }
-      } else {
-        // Hand off cleanly — abandon this gesture; dnd-kit takes over.
-        startRef.current = null
-        return
-      }
-    }
-
-    if (s.locked === 'x') {
-      e.stopPropagation()
-      // Allow swipe in BOTH directions when revealed (so user can swipe right
-      // to dismiss); only allow swipe-left when collapsed.
-      let next = revealed ? -SWIPE_REVEAL_PX + dx : Math.min(0, dx)
-      next = Math.max(-SWIPE_REVEAL_PX - 12, Math.min(12, next))
-      setOffset(next)
-    }
-  }
-
-  const onPointerUp = (e: React.PointerEvent) => {
-    const s = startRef.current
-    startRef.current = null
-    if (!s || s.locked !== 'x') return
-    e.stopPropagation()
-    const dx = e.clientX - s.x
-    if (revealed) {
-      // Currently revealed → swipe right by SWIPE_COMMIT_PX dismisses.
-      if (dx > SWIPE_COMMIT_PX) { setRevealed(false); setOffset(0); return }
-      setOffset(-SWIPE_REVEAL_PX) // snap back to revealed
-    } else {
-      if (dx < -SWIPE_COMMIT_PX && canDelete) { setRevealed(true); setOffset(-SWIPE_REVEAL_PX) }
-      else { setOffset(0) }
-    }
-  }
-
-  const onPointerCancel = () => {
-    startRef.current = null
-    setOffset(revealed ? -SWIPE_REVEAL_PX : 0)
-  }
-
-  return (
-    <div className="relative overflow-hidden rounded-xl">
-      {/* Action shelf behind — visible as the row translates left. */}
-      <div className="pointer-events-none absolute inset-y-0 right-0 flex w-[88px] items-center justify-center">
-        <button
-          data-swipe-action
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => { e.stopPropagation(); onDelete(); setRevealed(false); setOffset(0) }}
-          disabled={!canDelete}
-          className={[
-            'pointer-events-auto flex h-9 w-16 items-center justify-center rounded-lg text-white shadow-md transition',
-            canDelete ? 'bg-red-500/85 hover:bg-red-500' : 'bg-white/10 text-white/30',
-          ].join(' ')}
-          aria-label="Delete layer"
-        >
-          <span className="text-xs font-semibold">Delete</span>
-        </button>
-      </div>
-
-      <div
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerCancel}
-        style={{
-          transform: `translateX(${offset}px)`,
-          transition: startRef.current ? 'none' : 'transform 180ms cubic-bezier(0.22, 1, 0.36, 1)',
-          touchAction: 'pan-y',
-        }}
-      >
-        {children}
-      </div>
+      <GroupRow {...props} />
     </div>
   )
 }
