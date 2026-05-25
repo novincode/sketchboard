@@ -38,12 +38,18 @@ const INDENT_PX = 14
  *   middle third → 'into'    (drop INTO the over-row — groups only)
  *   bottom third → 'after'   (drop below the over-row, same parent)
  * For non-group rows the middle third collapses to whichever third is closer.
+ *
+ * Plus: 'outdent' — cursor drifted significantly left of the over-row's
+ * indented content while the active layer is inside a group. The drop will
+ * lift the active layer out of its current group into the group's parent
+ * (Figma-style "drag-left to outdent").
  */
-type DropPos = 'before' | 'after' | 'into'
+type DropPos = 'before' | 'after' | 'into' | 'outdent'
 interface DropHint {
   overId: string
   pos: DropPos
 }
+const OUTDENT_THRESHOLD_PX = 24  // how far left the cursor must drift
 
 export function LayerPanel() {
   const {
@@ -64,12 +70,17 @@ export function LayerPanel() {
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
   const [dropHint, setDropHint] = useState<DropHint | null>(null)
 
-  // Cursor Y during a drag — dnd-kit doesn't natively expose the live pointer
-  // position to the dragOver handler, but we need it to decide before/into/after.
+  // Cursor X/Y during a drag — dnd-kit doesn't natively expose the live
+  // pointer position to the dragOver handler, but we need it to decide
+  // before/into/after (Y) and outdent-to-parent (X).
   const cursorYRef = useRef<number>(0)
+  const cursorXRef = useRef<number>(0)
   useEffect(() => {
     if (!activeDragId) return
-    const onMove = (e: PointerEvent) => { cursorYRef.current = e.clientY }
+    const onMove = (e: PointerEvent) => {
+      cursorYRef.current = e.clientY
+      cursorXRef.current = e.clientX
+    }
     window.addEventListener('pointermove', onMove)
     return () => window.removeEventListener('pointermove', onMove)
   }, [activeDragId])
@@ -107,13 +118,21 @@ export function LayerPanel() {
     const top = rect.top
     const h = rect.height
     const cy = cursorYRef.current || (top + h / 2)
+    const cx = cursorXRef.current || rect.left
     const rel = (cy - top) / h
     const isGroup = overMeta.type === 'group'
 
+    // Outdent hint: cursor is well to the left of the over-row's left edge
+    // AND the active layer is inside a group (otherwise outdent is meaningless).
+    const activeMeta = layers.find((l) => l.id === String(e.active.id))
+    const activeInsideGroup = !!activeMeta && activeMeta.parentId != null
+    const draggedLeft = (rect.left - cx) > OUTDENT_THRESHOLD_PX
+
     let pos: DropPos
-    if (isGroup && rel >= 0.33 && rel <= 0.66) pos = 'into'
-    else if (rel < 0.5)                         pos = 'before'
-    else                                        pos = 'after'
+    if (activeInsideGroup && draggedLeft) pos = 'outdent'
+    else if (isGroup && rel >= 0.33 && rel <= 0.66) pos = 'into'
+    else if (rel < 0.5)                              pos = 'before'
+    else                                              pos = 'after'
 
     setDropHint((prev) => (prev?.overId === overId && prev?.pos === pos ? prev : { overId, pos }))
   }
@@ -131,6 +150,14 @@ export function LayerPanel() {
     // Drop INTO a group: move to the end of that group's children (top of panel).
     if (hint.pos === 'into' && overMeta.type === 'group') {
       moveLayer(activeId, overMeta.id, Number.MAX_SAFE_INTEGER)
+      return
+    }
+
+    // Outdent: lift active out of its current group regardless of which row
+    // is under the cursor — the user's intent was "move me to a shallower
+    // level", anchored at the active layer's own current group.
+    if (hint.pos === 'outdent') {
+      useFreeformStore.getState().moveLayerOutOfGroup(activeId)
       return
     }
 
@@ -279,7 +306,7 @@ export function LayerPanel() {
                   />
                 )
               }
-              const indicator: 'before' | 'after' | 'into' | null =
+              const indicator: 'before' | 'after' | 'into' | 'outdent' | null =
                 dropHint?.overId === meta.id ? dropHint.pos : null
               if (meta.type === 'group') {
                 return (
@@ -393,6 +420,20 @@ function DropLine({ at }: { at: 'top' | 'bottom' }) {
   )
 }
 
+// "Outdent" hint badge — pinned to the row's left edge while the cursor is
+// dragged far left of the row's indent, telling the user the drop will lift
+// their layer out of its current group.
+function OutdentBadge() {
+  return (
+    <div
+      className="pointer-events-none absolute z-20 flex items-center gap-1 rounded-md bg-amber-400/90 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-black shadow-md"
+      style={{ left: -34, top: '50%', transform: 'translateY(-50%)' }}
+    >
+      ←Out
+    </div>
+  )
+}
+
 // ─── Reverse sibling order for visual display (top-most layer at top) ─────────
 
 function reverseSiblings(flat: ReturnType<typeof useFreeformStore.getState>['layers']) {
@@ -435,6 +476,7 @@ function SortableLayerRow(props: LayerRowProps) {
   return (
     <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
       {props.indicator === 'before' && <DropLine at="top" />}
+      {props.indicator === 'outdent' && <OutdentBadge />}
       <LayerRow {...props} />
       {props.indicator === 'after' && <DropLine at="bottom" />}
     </div>
@@ -528,7 +570,7 @@ interface LayerRowProps {
   visible: boolean; opacity: number; blendMode: string; layerType: 'raster' | 'vector'
   isActive: boolean; isSelected: boolean; isReference: boolean
   /** Cursor-aware drop indicator state (or null when no drop is hinted here). */
-  indicator: 'before' | 'after' | 'into' | null
+  indicator: 'before' | 'after' | 'into' | 'outdent' | null
   /** When the panel is in selection mode, rows show a checkbox column. */
   selectionMode: boolean
   /** Ids of layers used as overlays clipping this row's layer. */
@@ -567,8 +609,13 @@ function LayerRow(props: LayerRowProps) {
     if (editing) { setDraft(name); inputRef.current?.focus(); inputRef.current?.select() }
   }, [editing, name])
 
-  const isMaskOverlay = maskTargetIds.length > 0       // this layer clips others
-  const isMaskedTarget = maskOverlayIds.length > 0     // others clip this layer
+  // In our clipping-mask convention:
+  //   maskOverlayIds non-empty  → this layer is the CLIPPED one ("CLIP" badge,
+  //                               it appears only where its base has alpha)
+  //   maskTargetIds non-empty   → this layer is the alpha SOURCE / BASE for
+  //                               some clipped layer above ("BASE" badge)
+  const isClipped = maskOverlayIds.length > 0
+  const isBaseForOthers = maskTargetIds.length > 0
 
   return (
     <>
@@ -611,17 +658,19 @@ function LayerRow(props: LayerRowProps) {
             {layerType === 'vector' ? 'VEC' : 'PX'}
           </span>
 
-          {/* Mask role badges */}
-          {isMaskOverlay && (
-            <span title="This layer is masking other layers"
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-emerald-500/20 text-emerald-300">
-              <Scissors size={9} />MASK
+          {/* Mask role badges — Procreate convention:
+              CLIP = this layer is clipped to the base below;
+              BASE = this layer's alpha is the clipping shape for layers above */}
+          {isClipped && (
+            <span title="Clipping mask — this layer only shows where the base below has alpha"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
+              <Scissors size={9} />CLIP
             </span>
           )}
-          {isMaskedTarget && !isMaskOverlay && (
-            <span title="This layer is clipped by a mask"
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
-              CLIP
+          {isBaseForOthers && !isClipped && (
+            <span title="Base layer — its alpha clips the layer(s) above"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-emerald-500/20 text-emerald-300">
+              BASE
             </span>
           )}
 
@@ -714,7 +763,7 @@ interface GroupRowProps {
   id: string; name: string; depth: number
   visible: boolean; opacity: number; collapsed: boolean; childCount: number
   isActive: boolean; isSelected: boolean
-  indicator: 'before' | 'after' | 'into' | null
+  indicator: 'before' | 'after' | 'into' | 'outdent' | null
   selectionMode: boolean
   isReference: boolean
   maskOverlayIds: string[]
@@ -748,8 +797,8 @@ function GroupRow(props: GroupRowProps) {
     if (editing) { setDraft(name); inputRef.current?.focus(); inputRef.current?.select() }
   }, [editing, name])
 
-  const isMaskOverlay = maskTargetIds.length > 0
-  const isMaskedTarget = maskOverlayIds.length > 0
+  const isClipped = maskOverlayIds.length > 0
+  const isBaseForOthers = maskTargetIds.length > 0
 
   return (
     <>
@@ -795,16 +844,16 @@ function GroupRow(props: GroupRowProps) {
 
           {collapsed ? <Folder size={13} className="text-amber-400/80" /> : <FolderOpen size={13} className="text-amber-400/90" />}
 
-          {isMaskOverlay && (
-            <span title="This group is masking other layers"
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-emerald-500/20 text-emerald-300">
-              <Scissors size={9} />MASK
+          {isClipped && (
+            <span title="This group is clipped to the base layer below it"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
+              <Scissors size={9} />CLIP
             </span>
           )}
-          {isMaskedTarget && !isMaskOverlay && (
-            <span title="This group is clipped by a mask"
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
-              CLIP
+          {isBaseForOthers && !isClipped && (
+            <span title="This group is the base — its alpha clips the layer(s) above"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-emerald-500/20 text-emerald-300">
+              BASE
             </span>
           )}
 

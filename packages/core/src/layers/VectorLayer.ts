@@ -1,5 +1,6 @@
 import { Layer } from './Layer'
 import type { Camera } from '../Camera'
+import { buildShapeAnchors } from '../shapes/shapeAnchors'
 
 // ─── Brush stroke (free-draw, many auto-smooth points) ────────────────────────
 
@@ -31,6 +32,35 @@ export interface BezierAnchor {
   type: 'smooth' | 'corner'
 }
 
+/**
+ * Optional shape descriptor — present when a path was created by the shape
+ * tool (rectangle, ellipse, regular polygon, etc). The renderer ignores this
+ * field entirely; it's metadata for editing UIs (corner-radius handles,
+ * "Sides" stepper) and for the regeneration helper that rebuilds `anchors`
+ * when shape params change.
+ *
+ * Without this metadata a path is "free" — it can still be edited node by
+ * node like any other bezier path; only the shape-aware editing affordances
+ * disappear.
+ */
+export interface VectorShape {
+  kind: 'rect' | 'ellipse' | 'polygon'
+  /** Bounding box top-left in layer-local coords. */
+  x: number
+  y: number
+  width: number
+  height: number
+  /**
+   * Per-corner radius for rectangles (top-left, top-right, bottom-right, bottom-left).
+   * Ignored for ellipse/polygon. Always 4 entries; clamped to half-min-dimension.
+   */
+  cornerRadius?: [number, number, number, number]
+  /** Polygon vertex count (3..N). Ignored for rect/ellipse. */
+  sides?: number
+  /** Polygon rotation in radians (default 0 = first vertex at top). */
+  rotation?: number
+}
+
 export interface VectorPath {
   id: string
   anchors: BezierAnchor[]
@@ -40,6 +70,8 @@ export interface VectorPath {
   fillColor: string | null
   opacity: number
   compositeOperation: GlobalCompositeOperation
+  /** Optional shape descriptor enabling shape-aware editing. See {@link VectorShape}. */
+  shape?: VectorShape
 }
 
 // ─── Layer ────────────────────────────────────────────────────────────────────
@@ -85,6 +117,45 @@ export class VectorLayer extends Layer {
   addPath(path: VectorPath): void { this.paths.push(path) }
 
   removePath(id: string): void { this.paths = this.paths.filter((p) => p.id !== id) }
+
+  /**
+   * Update the shape descriptor on a path and regenerate its anchors. No-op
+   * if the path doesn't carry shape metadata. Bounds-only changes (move /
+   * resize) should go through translateElement / scaleElement instead, which
+   * update both anchors AND mirror those changes back into shape.x/y/width/height
+   * via {@link syncShapeBounds} so the parametric editor stays in sync.
+   */
+  updateShape(pathId: string, patch: Partial<VectorShape>): boolean {
+    const path = this.paths.find((p) => p.id === pathId)
+    if (!path || !path.shape) return false
+    const next = { ...path.shape, ...patch }
+    // Re-clamp radius / sides to stay safe
+    if (next.cornerRadius) {
+      const max = Math.min(next.width, next.height) / 2
+      next.cornerRadius = next.cornerRadius.map((r) => Math.max(0, Math.min(r, max))) as [number, number, number, number]
+    }
+    if (next.sides !== undefined) next.sides = Math.max(3, Math.min(64, Math.round(next.sides)))
+    path.shape = next
+    path.anchors = buildShapeAnchors(next)
+    return true
+  }
+
+  /**
+   * After translate/scale on a shape-bearing path, mirror the new bounding
+   * box back into the shape descriptor so further parametric edits start
+   * from the correct origin.
+   */
+  syncShapeBounds(pathId: string): void {
+    const path = this.paths.find((p) => p.id === pathId)
+    if (!path || !path.shape) return
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const a of path.anchors) {
+      if (a.x < minX) minX = a.x; if (a.x > maxX) maxX = a.x
+      if (a.y < minY) minY = a.y; if (a.y > maxY) maxY = a.y
+    }
+    if (minX === Infinity) return
+    path.shape = { ...path.shape, x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+  }
 
   // ── Erase ─────────────────────────────────────────────────────────────────
 
@@ -384,6 +455,7 @@ export class VectorLayer extends Layer {
         handleIn: a.handleIn ? { ...a.handleIn } : null,
         handleOut: a.handleOut ? { ...a.handleOut } : null,
       })),
+      shape: p.shape ? { ...p.shape, cornerRadius: p.shape.cornerRadius ? [...p.shape.cornerRadius] as [number, number, number, number] : undefined } : undefined,
     }))
     copy.opacity = this.opacity
     copy.blendMode = this.blendMode

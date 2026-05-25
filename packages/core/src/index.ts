@@ -19,8 +19,9 @@ export { GroupLayer } from './layers/GroupLayer'
 export { VectorLayer } from './layers/VectorLayer'
 export type {
   VectorStroke, VectorStrokePoint,
-  VectorPath, BezierAnchor,
+  VectorPath, BezierAnchor, VectorShape,
 } from './layers/VectorLayer'
+export { buildShapeAnchors } from './shapes/shapeAnchors'
 
 // Tools
 export { Tool } from './tools/Tool'
@@ -35,6 +36,8 @@ export { VectorPenTool } from './tools/VectorPenTool'
 export { SelectTool } from './tools/SelectTool'
 export { FillTool } from './tools/FillTool'
 export type { FillSettings, FillPlacement } from './tools/FillTool'
+export { ShapeTool } from './tools/ShapeTool'
+export type { ShapeSettings, ShapeKind } from './tools/ShapeTool'
 export { LassoSelectTool } from './tools/LassoSelectTool'
 export type { BrushSettings } from './tools/BrushTool'
 export type { VectorBrushSettings } from './tools/VectorBrushTool'

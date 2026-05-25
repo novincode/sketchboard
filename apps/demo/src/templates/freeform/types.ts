@@ -3,6 +3,7 @@ export type ToolId =
   | 'pen'        // raster pen — sibling of brush (Shift+B cycles)
   | 'eraser'
   | 'fill'       // fill bucket
+  | 'shape'      // rect / ellipse / polygon — creates parametric VectorPath
   | 'vector'
   | 'vectorpen'
   | 'select'

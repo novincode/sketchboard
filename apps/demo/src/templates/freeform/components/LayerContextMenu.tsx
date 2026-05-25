@@ -46,6 +46,7 @@ export function LayerContextMenu({
     setSelectionMode,
     maskSelected, releaseMasksFor,
     selectLayer,
+    moveLayerOutOfGroup,
   } = useFreeformStore()
 
   // Effective selection set: include the focused row if not already selected.
@@ -77,6 +78,13 @@ export function LayerContextMenu({
   const canDelete = acting.length > 0 && !isFocusedBackground
   const canGroup = acting.length >= 2
   const canUngroup = acting.length === 1 && isSingleGroup
+  // "Move out of group" applies when at least one selected layer is currently
+  // inside ANY group (parentId != null).
+  const insideGroupIds = acting.filter((id) => {
+    const m = layers.find((l) => l.id === id)
+    return !!m && m.parentId != null
+  })
+  const canOutdent = insideGroupIds.length > 0
 
   const entries: ContextMenuEntry[] = []
 
@@ -110,13 +118,21 @@ export function LayerContextMenu({
       onClick: () => ungroupLayer(single!),
     })
   }
+  if (canOutdent) {
+    entries.push({
+      label: insideGroupIds.length > 1 ? `Move ${insideGroupIds.length} out of group` : 'Move out of group',
+      icon: <FolderOpen size={13} />,
+      onClick: () => { for (const id of insideGroupIds) moveLayerOutOfGroup(id) },
+    })
+  }
 
   if (canMask) {
     entries.push({
-      label: acting.length >= 2 ? 'Mask with top layer' : 'Use as mask (clip layer below)',
+      label: acting.length >= 2
+        ? 'Clipping mask (top clips to bottom)'
+        : 'Clip to layer below',
       icon: <Scissors size={13} />,
       onClick: () => {
-        // Make sure the menu's "effective" set is what gets masked.
         if (!selectedLayerIds.includes(focusedId)) selectLayer(focusedId, false)
         maskSelected()
       },
@@ -124,7 +140,7 @@ export function LayerContextMenu({
   }
   if (hasMaskedTargets) {
     entries.push({
-      label: 'Release mask',
+      label: 'Release clipping mask',
       icon: <Scissors size={13} />,
       onClick: () => releaseMasksFor(acting),
     })

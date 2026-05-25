@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool, FillTool, FillPlacement } from '@sketchboard/core'
+import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool, FillTool, FillPlacement, ShapeTool, ShapeKind } from '@sketchboard/core'
 import { Color, RasterLayer, VectorLayer, GroupLayer } from '@sketchboard/core'
 import type { ToolId, Background, EraserMode, LayerType } from './types'
 import { RASTER_BRUSH_PRESETS, DEFAULT_BRUSH_PRESET_ID } from './brushPresets'
@@ -52,6 +52,15 @@ interface FreeformState {
   fillPlacement: FillPlacement
   /** Vector-fill gap-close radius in layer-local px (Blender-style). */
   fillGapClose: number
+
+  // ── Shape tool settings (mirrored into ShapeTool.settings on each set) ─
+  shapeKind: ShapeKind
+  shapeStrokeColor: string | null
+  shapeStrokeWidth: number
+  shapeFillColor: string | null
+  shapeOpacity: number
+  shapeCornerRadius: number
+  shapeSides: number
 
   /** Active raster brush preset id */
   activeBrushPresetId: string
@@ -121,6 +130,15 @@ interface FreeformActions {
   setFillPlacement(placement: FillPlacement): void
   setFillGapClose(gap: number): void
 
+  // ── Shape tool actions (mirror into ShapeTool.settings) ─────────────────
+  setShapeKind(kind: ShapeKind): void
+  setShapeStrokeColor(color: string | null): void
+  setShapeStrokeWidth(w: number): void
+  setShapeFillColor(color: string | null): void
+  setShapeOpacity(o: number): void
+  setShapeCornerRadius(r: number): void
+  setShapeSides(n: number): void
+
   setActiveBrushPreset(id: string): void
 
   setBackground(bg: Background): void
@@ -151,6 +169,12 @@ interface FreeformActions {
   toggleGroupCollapsed(id: string): void
   /** Move `id` to a new parent (null = root) at the given index. */
   moveLayer(id: string, parentId: string | null, index: number): void
+  /**
+   * Lift a layer out of its current group into the group's parent, placed
+   * immediately above the group itself (so it stays nearby in panel order).
+   * No-op for layers already at root.
+   */
+  moveLayerOutOfGroup(id: string): void
   /** Reorder the children of `parentId` (null = root) to the given id sequence. */
   reorderSiblings(orderedIds: string[], parentId: string | null): void
 
@@ -297,6 +321,13 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     fillTolerance: 32,
     fillPlacement: 'back' as FillPlacement,
     fillGapClose: 0,
+    shapeKind: 'rect' as ShapeKind,
+    shapeStrokeColor: '#1a1a1a',
+    shapeStrokeWidth: 2,
+    shapeFillColor: null,
+    shapeOpacity: 1,
+    shapeCornerRadius: 0,
+    shapeSides: 6,
     activeBrushPresetId: DEFAULT_BRUSH_PRESET_ID,
     brushPressureSize: true,
     brushPressureOpacity: false,
@@ -341,6 +372,17 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
         fillTool.settings.tolerance = s.fillTolerance
         fillTool.settings.placement = s.fillPlacement
         fillTool.settings.gapClose = s.fillGapClose
+      }
+
+      const shapeTool = board.getTool<ShapeTool>('shape')
+      if (shapeTool) {
+        shapeTool.settings.kind = s.shapeKind
+        shapeTool.settings.strokeColor = s.shapeStrokeColor
+        shapeTool.settings.strokeWidth = s.shapeStrokeWidth
+        shapeTool.settings.fillColor = s.shapeFillColor
+        shapeTool.settings.opacity = s.shapeOpacity
+        shapeTool.settings.cornerRadius = s.shapeCornerRadius
+        shapeTool.settings.sides = s.shapeSides
       }
 
       board.hooks.layerAdded.tap('store', () => set({ layers: layersToMeta(board.getLayers()) }))
@@ -463,6 +505,43 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const tool = board?.getTool<FillTool>('fill')
       if (tool) tool.settings.gapClose = gap
       set({ fillGapClose: gap })
+    },
+
+    // ── Shape tool ─────────────────────────────────────────────────────────
+    setShapeKind(kind) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.kind = kind
+      set({ shapeKind: kind })
+    },
+    setShapeStrokeColor(color) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.strokeColor = color
+      set({ shapeStrokeColor: color })
+    },
+    setShapeStrokeWidth(w) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.strokeWidth = w
+      set({ shapeStrokeWidth: w })
+    },
+    setShapeFillColor(color) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.fillColor = color
+      set({ shapeFillColor: color })
+    },
+    setShapeOpacity(o) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.opacity = o
+      set({ shapeOpacity: o })
+    },
+    setShapeCornerRadius(r) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.cornerRadius = r
+      set({ shapeCornerRadius: r })
+    },
+    setShapeSides(n) {
+      const t = get().board?.getTool<ShapeTool>('shape')
+      if (t) t.settings.sides = Math.max(3, n)
+      set({ shapeSides: Math.max(3, n) })
     },
 
     // ── UI ────────────────────────────────────────────────────────────────
@@ -673,6 +752,24 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       set({ layers: layersToMeta(board.getLayers()) })
     },
 
+    moveLayerOutOfGroup(id) {
+      const { board, layers } = get()
+      if (!board) return
+      const meta = layers.find((l) => l.id === id)
+      if (!meta || meta.parentId == null) return // already at root
+      // Find the parent group meta to know its position in ITS parent.
+      const groupMeta = layers.find((l) => l.id === meta.parentId)
+      const grandParentId = groupMeta?.parentId ?? null
+      // Place the lifted layer immediately ABOVE the group in the parent's
+      // tree order. Panel reverses siblings, so "above the group in panel" =
+      // index AFTER the group in tree. Use group's tree index + 1.
+      const siblings = layers.filter((l) => l.parentId === grandParentId)
+      const groupIdx = siblings.findIndex((l) => l.id === meta.parentId)
+      const insertAt = groupIdx >= 0 ? groupIdx + 1 : siblings.length
+      board.moveLayer(id, grandParentId, insertAt)
+      set({ layers: layersToMeta(board.getLayers()) })
+    },
+
     reorderSiblings(orderedIds, parentId) {
       const { board } = get()
       if (!board) return
@@ -702,28 +799,30 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       const { board, selectedLayerIds, backgroundLayerId, layers } = get()
       if (!board) return
       const candidate = selectedLayerIds.filter((id) => id !== backgroundLayerId)
-      let overlayId: string | undefined
-      let targetIds: string[] = []
+
+      // Procreate / Photoshop convention: the TOP layer is the one being
+      // clipped (the visible result); the layer BELOW it is the alpha base.
+      // So the top gets a mask reference to the bottom — top.masks = [bottom].
+      // The renderer's destination-in then keeps the TOP layer's pixels only
+      // where the BOTTOM has alpha.
+      let topId: string | undefined
+      let baseId: string | undefined
+
       if (candidate.length >= 2) {
-        // Top of the SELECTION in panel order becomes the overlay.
-        // Panel reverses sibling order; we want the topmost row, which is the
-        // LAST in tree order among the selected ids that share a parent.
+        // Sort selection in tree order (bottom→top). Last is topmost in panel.
         const ordered = layers.filter((l) => candidate.includes(l.id))
-        // Use the topmost in tree order as overlay, rest as targets.
-        const last = ordered[ordered.length - 1]
-        overlayId = last?.id
-        targetIds = candidate.filter((id) => id !== overlayId)
+        topId = ordered[ordered.length - 1]?.id
+        baseId = ordered[0]?.id
       } else if (candidate.length === 1) {
-        overlayId = candidate[0]
-        // Single-select mask: target the layer immediately below in panel order.
+        topId = candidate[0]
+        // Layer immediately below in panel = previous in tree order.
         const flatIds = layers.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
-        const idx = flatIds.indexOf(overlayId!)
-        // Panel reverses siblings, so "below" in panel = previous in tree order.
-        const targetId = idx > 0 ? flatIds[idx - 1] : undefined
-        if (targetId) targetIds = [targetId]
+        const idx = flatIds.indexOf(topId!)
+        baseId = idx > 0 ? flatIds[idx - 1] : undefined
       }
-      if (!overlayId || targetIds.length === 0) return
-      for (const t of targetIds) board.addMask(t, overlayId, 'alpha')
+
+      if (!topId || !baseId || topId === baseId) return
+      board.addMask(topId, baseId, 'alpha')
       set({ layers: layersToMeta(board.getLayers()) })
     },
 

@@ -6,7 +6,7 @@ import {
   PenTool, BrushTool, EraserTool,
   PanTool, EyedropperTool, KeyboardPlugin,
   RasterLayer, VectorLayer, VectorBrushTool, VectorPenTool, SelectTool,
-  FillTool, LassoSelectTool,
+  FillTool, LassoSelectTool, ShapeTool,
 } from '@sketchboard/core'
 import { useBoard } from '@sketchboard/react'
 import { useFreeformStore } from './store'
@@ -44,6 +44,7 @@ function useFreeformSetup(board: Board | null) {
     board.registerTool('brush',      new BrushTool())
     board.registerTool('eraser',     new EraserTool())
     board.registerTool('fill',       new FillTool())
+    board.registerTool('shape',      new ShapeTool())
     board.registerTool('vector',     new VectorBrushTool())
     board.registerTool('vectorpen',  new VectorPenTool())
     board.registerTool('pan',        new PanTool())

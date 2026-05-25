@@ -4,11 +4,14 @@ import React, { useEffect, useRef, useState } from 'react'
 import {
   MousePointer2, Lasso, Paintbrush, Pen, Eraser, PaintBucket,
   Spline, PenTool as PenToolIcon, Pipette, Hand, ChevronDown,
+  Square as RectIcon, Circle as CircleIcon, Hexagon as PolygonIcon,
+  Shapes,
   type LucideIcon,
 } from 'lucide-react'
 
 import type { ToolId, EraserMode } from './types'
-import type { FillPlacement } from '@sketchboard/core'
+import type { FillPlacement, ShapeKind } from '@sketchboard/core'
+import { HexColorPicker } from 'react-colorful'
 import { useFreeformStore } from './store'
 import { DraggableInput } from './components/DraggableInput'
 import { Popover } from './components/Popover'
@@ -217,6 +220,130 @@ function FillOptionsPanel() {
   )
 }
 
+function ShapeOptionsPanel() {
+  const {
+    shapeKind, setShapeKind,
+    shapeStrokeColor, setShapeStrokeColor,
+    shapeStrokeWidth, setShapeStrokeWidth,
+    shapeFillColor, setShapeFillColor,
+    shapeOpacity, setShapeOpacity,
+    shapeCornerRadius, setShapeCornerRadius,
+    shapeSides, setShapeSides,
+  } = useFreeformStore()
+  return (
+    <div className="flex items-center gap-2">
+      {/* Shape kind picker */}
+      <div className="flex rounded-lg overflow-hidden border border-white/10">
+        {([
+          { id: 'rect',    Icon: RectIcon,    title: 'Rectangle' },
+          { id: 'ellipse', Icon: CircleIcon,  title: 'Ellipse'   },
+          { id: 'polygon', Icon: PolygonIcon, title: 'Polygon'   },
+        ] as Array<{ id: ShapeKind; Icon: LucideIcon; title: string }>).map(({ id, Icon, title }) => (
+          <button
+            key={id}
+            onClick={() => setShapeKind(id)}
+            title={title}
+            className={[
+              'flex items-center justify-center px-2.5 py-1 transition-colors',
+              shapeKind === id ? 'bg-white/20 text-white' : 'text-white/45 hover:bg-white/5 hover:text-white/75',
+            ].join(' ')}
+          ><Icon size={12} /></button>
+        ))}
+      </div>
+      <Sep />
+      {shapeKind === 'rect' && (
+        <>
+          <DraggableInput label="Radius" value={shapeCornerRadius} min={0} max={400} unit="px" onChange={setShapeCornerRadius} defaultValue={0} />
+          <Sep />
+        </>
+      )}
+      {shapeKind === 'polygon' && (
+        <>
+          <DraggableInput label="Sides" value={shapeSides} min={3} max={32} unit="" onChange={setShapeSides} defaultValue={6} />
+          <Sep />
+        </>
+      )}
+      <DraggableInput label="Stroke" value={shapeStrokeWidth} min={0} max={64} unit="px" onChange={setShapeStrokeWidth} defaultValue={2} />
+      <Sep />
+      <DraggableInput label="Opacity" value={Math.round(shapeOpacity * 100)} min={0} max={100} unit="%" onChange={(v) => setShapeOpacity(v / 100)} defaultValue={100} />
+      <Sep />
+      <ColorChip label="S" color={shapeStrokeColor} onChange={setShapeStrokeColor} />
+      <ColorChip label="F" color={shapeFillColor} onChange={setShapeFillColor} allowNone />
+    </div>
+  )
+}
+
+/**
+ * Tiny inline color chip — opens a popover with HexColorPicker. Used for
+ * the shape stroke/fill controls so the user doesn't have to leave the
+ * options bar to set them.
+ */
+function ColorChip({ label, color, onChange, allowNone }: {
+  label: string
+  color: string | null
+  onChange: (hex: string | null) => void
+  allowNone?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const popRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (popRef.current?.contains(t)) return
+      if (triggerRef.current?.contains(t)) return
+      setOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [open])
+  const isEmpty = color === null
+  const rect = triggerRef.current?.getBoundingClientRect()
+  return (
+    <>
+      <button
+        ref={triggerRef}
+        onClick={() => setOpen((p) => !p)}
+        title={label}
+        className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 hover:border-white/25 transition"
+      >
+        <span
+          className="h-4 w-4 rounded-sm border border-white/20"
+          style={{
+            backgroundColor: isEmpty ? 'transparent' : (color ?? '#000'),
+            backgroundImage: isEmpty
+              ? 'linear-gradient(135deg, transparent 45%, rgba(255,0,0,0.7) 47%, rgba(255,0,0,0.7) 53%, transparent 55%)'
+              : undefined,
+          }}
+        />
+        <span className="text-[9px] uppercase tracking-widest text-white/55 font-semibold">{label}</span>
+      </button>
+      {open && rect && (
+        <div
+          ref={popRef}
+          className="fixed z-[10100] rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
+          style={{ left: rect.left, top: rect.bottom + 6, width: 220 }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <HexColorPicker
+            color={isEmpty ? '#000000' : (color ?? '#000')}
+            onChange={(hex) => onChange(hex)}
+            style={{ width: '100%' }}
+          />
+          {allowNone && (
+            <button
+              onClick={() => { onChange(null); setOpen(false) }}
+              className="mt-2 w-full rounded-lg border border-white/10 bg-white/5 py-1.5 text-[11px] text-white/65 hover:bg-white/10 transition"
+            >No {label}</button>
+          )}
+        </div>
+      )}
+    </>
+  )
+}
+
 function VectorBrushOptionsPanel() {
   const {
     vectorSize, setVectorSize,
@@ -267,6 +394,7 @@ export const TOOL_DEFS: Record<ToolId, ToolDef> = {
   pen:        { id: 'pen',        label: 'Raster Pen',   Icon: Pen,           OptionsPanel: RasterBrushOptionsPanel },
   eraser:     { id: 'eraser',     label: 'Eraser',       Icon: Eraser,        OptionsPanel: EraserOptionsPanel },
   fill:       { id: 'fill',       label: 'Fill',         Icon: PaintBucket,   OptionsPanel: FillOptionsPanel },
+  shape:      { id: 'shape',      label: 'Shape',        Icon: Shapes,        OptionsPanel: ShapeOptionsPanel },
   vector:     { id: 'vector',     label: 'Vector Brush', Icon: Spline,        OptionsPanel: VectorBrushOptionsPanel },
   vectorpen:  { id: 'vectorpen',  label: 'Vector Pen',   Icon: PenToolIcon,   OptionsPanel: VectorPenOptionsPanel },
   eyedropper: { id: 'eyedropper', label: 'Eyedropper',   Icon: Pipette,       OptionsPanel: null },
@@ -278,6 +406,7 @@ export const TOOLBAR_SLOTS: ToolSlot[] = [
   { ids: ['brush', 'pen'],    shortcut: 'b' },
   { ids: ['eraser'],          shortcut: 'e' },
   { ids: ['fill'],            shortcut: 'f' },
+  { ids: ['shape'],           shortcut: 'r' },
   { ids: ['vector'],          shortcut: 'w' },
   { ids: ['vectorpen'],       shortcut: 'p' },
   { ids: ['eyedropper'],      shortcut: 'i' },
