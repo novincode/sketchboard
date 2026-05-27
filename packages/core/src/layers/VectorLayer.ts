@@ -208,7 +208,17 @@ export class VectorLayer extends Layer {
    * the two tools consistent and lets us add new "operators" (e.g. a
    * scissor tool, knife slicing) without re-implementing geometry.
    */
-  splitByCoverage(isCovered: CoveragePredicate): {
+  splitByCoverage(
+    isCovered: CoveragePredicate,
+    /**
+     * Optional bounding box of the coverage region in layer-local coords.
+     * Elements whose own bbox doesn't intersect are skipped without running
+     * the per-point predicate — turns a fast-cursor sweep across hundreds
+     * of fragments into an O(N) bbox-test pass instead of full geometry.
+     * Omit for non-bounded predicates (e.g. arbitrary functions).
+     */
+    coverageBounds?: { x0: number; y0: number; x1: number; y1: number },
+  ): {
     addedStrokes: VectorStroke[]
     addedPaths: VectorPath[]
     cutStrokes: VectorStroke[]
@@ -223,8 +233,19 @@ export class VectorLayer extends Layer {
     const originalStrokes: VectorStroke[] = []
     const originalPaths: VectorPath[] = []
 
+    const intersects = (b: { x: number; y: number; w: number; h: number }) => {
+      if (!coverageBounds) return true
+      return !(b.x > coverageBounds.x1 || b.x + b.w < coverageBounds.x0
+            || b.y > coverageBounds.y1 || b.y + b.h < coverageBounds.y0)
+    }
+
     const newStrokes: VectorStroke[] = []
     for (const s of this.strokes) {
+      // Bbox reject: skip strokes entirely outside the coverage region.
+      if (coverageBounds) {
+        const b = this.getBounds(s.id)
+        if (b && !intersects(b)) { newStrokes.push(s); continue }
+      }
       const result = splitStroke(s, isCovered)
       if (!result) { newStrokes.push(s); continue }
       originalStrokes.push(s)
@@ -242,6 +263,10 @@ export class VectorLayer extends Layer {
 
     const newPaths: VectorPath[] = []
     for (const p of this.paths) {
+      if (coverageBounds) {
+        const b = this.getBounds(p.id)
+        if (b && !intersects(b)) { newPaths.push(p); continue }
+      }
       const result = splitPath(p, isCovered)
       if (!result || !result.changed) { newPaths.push(p); continue }
       originalPaths.push(p)
@@ -360,7 +385,17 @@ export class VectorLayer extends Layer {
     return null
   }
 
-  /** Scale a stroke or path from an origin point in layer-local coords. */
+  /**
+   * Scale a stroke or path from an origin point in layer-local coords.
+   *
+   * Shape-bearing paths (rect/ellipse/polygon created via ShapeTool) get
+   * special treatment: instead of scaling each anchor individually (which
+   * would distort the corner-radius arcs), we scale the shape's BOUNDING
+   * BOX and regenerate anchors via `buildShapeAnchors`. The cornerRadius
+   * stays at its original value (just clamped to the new half-min), so
+   * resizing a rounded rectangle preserves the radius — matching Figma /
+   * Illustrator behavior where radius is independent of size.
+   */
   scaleElement(id: string, sx: number, sy: number, originX: number, originY: number): void {
     const scaleX = (x: number) => originX + (x - originX) * sx
     const scaleY = (y: number) => originY + (y - originY) * sy
@@ -370,12 +405,34 @@ export class VectorLayer extends Layer {
       return
     }
     const path = this.paths.find((p) => p.id === id)
-    if (path) {
-      for (const a of path.anchors) {
-        a.x = scaleX(a.x); a.y = scaleY(a.y)
-        if (a.handleIn) { a.handleIn.x = scaleX(a.handleIn.x); a.handleIn.y = scaleY(a.handleIn.y) }
-        if (a.handleOut) { a.handleOut.x = scaleX(a.handleOut.x); a.handleOut.y = scaleY(a.handleOut.y) }
+    if (!path) return
+
+    if (path.shape) {
+      // Shape-aware resize: compute the new bbox from the original shape's
+      // bounds and regenerate anchors with the same radius/sides/rotation.
+      const s = path.shape
+      const tlX = scaleX(s.x),         tlY = scaleY(s.y)
+      const brX = scaleX(s.x + s.width), brY = scaleY(s.y + s.height)
+      const nx = Math.min(tlX, brX), ny = Math.min(tlY, brY)
+      const nw = Math.max(1, Math.abs(brX - tlX))
+      const nh = Math.max(1, Math.abs(brY - tlY))
+      const maxR = Math.min(nw, nh) / 2
+      const next: VectorShape = {
+        ...s,
+        x: nx, y: ny, width: nw, height: nh,
+        cornerRadius: s.cornerRadius
+          ? s.cornerRadius.map((r) => Math.max(0, Math.min(r, maxR))) as [number, number, number, number]
+          : undefined,
       }
+      path.shape = next
+      path.anchors = buildShapeAnchors(next)
+      return
+    }
+
+    for (const a of path.anchors) {
+      a.x = scaleX(a.x); a.y = scaleY(a.y)
+      if (a.handleIn) { a.handleIn.x = scaleX(a.handleIn.x); a.handleIn.y = scaleY(a.handleIn.y) }
+      if (a.handleOut) { a.handleOut.x = scaleX(a.handleOut.x); a.handleOut.y = scaleY(a.handleOut.y) }
     }
   }
 
@@ -412,6 +469,11 @@ export class VectorLayer extends Layer {
         if (a.handleIn) { a.handleIn.x += dx; a.handleIn.y += dy }
         if (a.handleOut) { a.handleOut.x += dx; a.handleOut.y += dy }
       })
+      // Mirror translation into shape descriptor so later parametric edits
+      // (radius drag, side count) start from the new position.
+      if (path.shape) {
+        path.shape = { ...path.shape, x: path.shape.x + dx, y: path.shape.y + dy }
+      }
     }
   }
 

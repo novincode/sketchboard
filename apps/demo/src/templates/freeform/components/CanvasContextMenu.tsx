@@ -1,7 +1,7 @@
 'use client'
 
 import React, { useEffect, useState } from 'react'
-import { Copy, Scissors, ClipboardPaste, Trash2 } from 'lucide-react'
+import { Copy, Scissors, ClipboardPaste, Trash2, SquareDashed } from 'lucide-react'
 import type { SelectTool } from '@sketchboard/core'
 import { useFreeformStore } from '../store'
 import { ContextMenu } from './ContextMenu'
@@ -90,7 +90,8 @@ export function CanvasContextMenu() {
         { label: 'Copy',  icon: <Copy size={13} />,            shortcut: '⌘C', disabled: !hasSelection, onClick: () => select?.copySelected() },
         { label: 'Paste', icon: <ClipboardPaste size={13} />,  shortcut: '⌘V', disabled: !hasClipboard, onClick: () => select?.pasteClipboard() },
         { separator: true as const },
-        { label: 'Delete', icon: <Trash2 size={13} />, shortcut: '⌫', danger: true, disabled: !hasSelection, onClick: () => select?.deleteSelected() },
+        { label: 'Deselect', icon: <SquareDashed size={13} />, shortcut: 'Esc', disabled: !hasSelection, onClick: () => select?.deselect() },
+        { label: 'Delete',   icon: <Trash2 size={13} />,       shortcut: '⌫',   danger: true, disabled: !hasSelection, onClick: () => select?.deleteSelected() },
       ]}
     />
   )

@@ -29,7 +29,14 @@ export interface ToolDef {
 
 export interface ToolSlot {
   ids: [ToolId, ...ToolId[]]
+  /** Primary shortcut for the slot (cycles siblings via Shift). */
   shortcut: string
+  /**
+   * Optional per-tool extra shortcuts (Figma-style direct picks: R rect,
+   * O ellipse, Y polygon, etc.). When omitted, only the primary shortcut
+   * exists for the slot.
+   */
+  individualShortcuts?: Partial<Record<ToolId, string>>
 }
 
 // ─── Brush preset dropdown ────────────────────────────────────────────────────
@@ -222,7 +229,7 @@ function FillOptionsPanel() {
 
 function ShapeOptionsPanel() {
   const {
-    shapeKind, setShapeKind,
+    shapeKind,
     shapeStrokeColor, setShapeStrokeColor,
     shapeStrokeWidth, setShapeStrokeWidth,
     shapeFillColor, setShapeFillColor,
@@ -230,27 +237,10 @@ function ShapeOptionsPanel() {
     shapeCornerRadius, setShapeCornerRadius,
     shapeSides, setShapeSides,
   } = useFreeformStore()
+  // Shape KIND is now picked from the main toolbar (virtual shape-rect / -ellipse
+  // / -polygon entries). Options panel only carries the params that vary by kind.
   return (
     <div className="flex items-center gap-2">
-      {/* Shape kind picker */}
-      <div className="flex rounded-lg overflow-hidden border border-white/10">
-        {([
-          { id: 'rect',    Icon: RectIcon,    title: 'Rectangle' },
-          { id: 'ellipse', Icon: CircleIcon,  title: 'Ellipse'   },
-          { id: 'polygon', Icon: PolygonIcon, title: 'Polygon'   },
-        ] as Array<{ id: ShapeKind; Icon: LucideIcon; title: string }>).map(({ id, Icon, title }) => (
-          <button
-            key={id}
-            onClick={() => setShapeKind(id)}
-            title={title}
-            className={[
-              'flex items-center justify-center px-2.5 py-1 transition-colors',
-              shapeKind === id ? 'bg-white/20 text-white' : 'text-white/45 hover:bg-white/5 hover:text-white/75',
-            ].join(' ')}
-          ><Icon size={12} /></button>
-        ))}
-      </div>
-      <Sep />
       {shapeKind === 'rect' && (
         <>
           <DraggableInput label="Radius" value={shapeCornerRadius} min={0} max={400} unit="px" onChange={setShapeCornerRadius} defaultValue={0} />
@@ -412,31 +402,110 @@ function SelectOptionsPanel() {
   )
 }
 
+// ─── Shortcut auto-builder ────────────────────────────────────────────────────
+
+/**
+ * Build the ShortcutOverrides object the KeyboardPlugin expects from our
+ * TOOLBAR_SLOTS declaration. For each slot we register:
+ *   - `slot-<id>`        : primary shortcut → activates slot[0] (or the
+ *                          last-active sibling, depending on the handler)
+ *   - `slot-<id>-cycle`  : Shift+key → cycles through siblings
+ *   - `tool-<id>`        : per-id direct shortcuts from `individualShortcuts`
+ *
+ * Single source of truth — new tools added to TOOL_DEFS/TOOLBAR_SLOTS pick
+ * up their shortcuts automatically without touching FreeformTemplate.
+ *
+ * The caller passes a small adapter that knows how to activate a virtual
+ * vs. real tool (typically `useFreeformStore.getState().setActiveToolId`).
+ */
+export interface AutoShortcutHandlers {
+  activate: (id: ToolId) => void
+  getActive: () => ToolId
+}
+
+export function buildToolShortcuts(handlers: AutoShortcutHandlers): Record<string, {
+  key: string
+  shift?: boolean
+  description: string
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  handler: (b: any) => void
+}> {
+  const out: Record<string, { key: string; shift?: boolean; description: string; handler: () => void }> = {}
+  for (const slot of TOOLBAR_SLOTS) {
+    const slotKey = slot.shortcut
+    const slotIds = slot.ids
+    const primaryId = slotIds[0]
+    const primaryLabel = TOOL_DEFS[primaryId]?.label ?? primaryId
+    out[`slot-${primaryId}`] = {
+      key: slotKey,
+      description: primaryLabel,
+      handler: () => handlers.activate(primaryId),
+    }
+    if (slotIds.length > 1) {
+      out[`slot-${primaryId}-cycle`] = {
+        key: slotKey,
+        shift: true,
+        description: `Cycle ${slotIds.map((id) => TOOL_DEFS[id]?.label ?? id).join(' / ')}`,
+        handler: () => {
+          const cur = handlers.getActive()
+          const idx = slotIds.indexOf(cur)
+          const nextId = slotIds[(idx + 1) % slotIds.length]!
+          handlers.activate(nextId)
+        },
+      }
+    }
+    // Per-tool individual shortcuts (Figma-style direct picks)
+    if (slot.individualShortcuts) {
+      for (const [toolId, key] of Object.entries(slot.individualShortcuts)) {
+        if (!key) continue
+        const label = TOOL_DEFS[toolId as ToolId]?.label ?? toolId
+        out[`tool-${toolId}`] = {
+          key: key.toLowerCase(),
+          description: label,
+          handler: () => handlers.activate(toolId as ToolId),
+        }
+      }
+    }
+  }
+  return out
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 export const TOOL_DEFS: Record<ToolId, ToolDef> = {
-  select:     { id: 'select',     label: 'Select',       Icon: MousePointer2, OptionsPanel: SelectOptionsPanel },
-  lasso:      { id: 'lasso',      label: 'Lasso Select', Icon: Lasso,         OptionsPanel: SelectOptionsPanel },
-  brush:      { id: 'brush',      label: 'Brush',        Icon: Paintbrush,    OptionsPanel: RasterBrushOptionsPanel },
-  pen:        { id: 'pen',        label: 'Raster Pen',   Icon: Pen,           OptionsPanel: RasterBrushOptionsPanel },
-  eraser:     { id: 'eraser',     label: 'Eraser',       Icon: Eraser,        OptionsPanel: EraserOptionsPanel },
-  fill:       { id: 'fill',       label: 'Fill',         Icon: PaintBucket,   OptionsPanel: FillOptionsPanel },
-  shape:      { id: 'shape',      label: 'Shape',        Icon: Shapes,        OptionsPanel: ShapeOptionsPanel },
-  vector:     { id: 'vector',     label: 'Vector Brush', Icon: Spline,        OptionsPanel: VectorBrushOptionsPanel },
-  vectorpen:  { id: 'vectorpen',  label: 'Vector Pen',   Icon: PenToolIcon,   OptionsPanel: VectorPenOptionsPanel },
-  eyedropper: { id: 'eyedropper', label: 'Eyedropper',   Icon: Pipette,       OptionsPanel: null },
-  pan:        { id: 'pan',        label: 'Hand',         Icon: Hand,          OptionsPanel: null },
+  select:        { id: 'select',        label: 'Select',       Icon: MousePointer2, OptionsPanel: SelectOptionsPanel },
+  lasso:         { id: 'lasso',         label: 'Lasso Select', Icon: Lasso,         OptionsPanel: SelectOptionsPanel },
+  brush:         { id: 'brush',         label: 'Brush',        Icon: Paintbrush,    OptionsPanel: RasterBrushOptionsPanel },
+  pen:           { id: 'pen',           label: 'Raster Pen',   Icon: Pen,           OptionsPanel: RasterBrushOptionsPanel },
+  eraser:        { id: 'eraser',        label: 'Eraser',       Icon: Eraser,        OptionsPanel: EraserOptionsPanel },
+  fill:          { id: 'fill',          label: 'Fill',         Icon: PaintBucket,   OptionsPanel: FillOptionsPanel },
+  // Virtual shape entries — each surfaces a different icon in the toolbar
+  // and selects the shape tool with the corresponding kind. The base 'shape'
+  // entry is kept for completeness but isn't used directly by the toolbar.
+  shape:         { id: 'shape',         label: 'Shape',        Icon: Shapes,        OptionsPanel: ShapeOptionsPanel },
+  'shape-rect':    { id: 'shape-rect',    label: 'Rectangle', Icon: RectIcon,    OptionsPanel: ShapeOptionsPanel },
+  'shape-ellipse': { id: 'shape-ellipse', label: 'Ellipse',   Icon: CircleIcon,  OptionsPanel: ShapeOptionsPanel },
+  'shape-polygon': { id: 'shape-polygon', label: 'Polygon',   Icon: PolygonIcon, OptionsPanel: ShapeOptionsPanel },
+  vector:        { id: 'vector',        label: 'Vector Brush', Icon: Spline,        OptionsPanel: VectorBrushOptionsPanel },
+  vectorpen:     { id: 'vectorpen',     label: 'Vector Pen',   Icon: PenToolIcon,   OptionsPanel: VectorPenOptionsPanel },
+  eyedropper:    { id: 'eyedropper',    label: 'Eyedropper',   Icon: Pipette,       OptionsPanel: null },
+  pan:           { id: 'pan',           label: 'Hand',         Icon: Hand,          OptionsPanel: null },
 }
 
 export const TOOLBAR_SLOTS: ToolSlot[] = [
-  { ids: ['select', 'lasso'], shortcut: 'v' },
-  { ids: ['brush', 'pen'],    shortcut: 'b' },
-  { ids: ['eraser'],          shortcut: 'e' },
-  { ids: ['fill'],            shortcut: 'f' },
-  { ids: ['shape'],           shortcut: 'r' },
-  { ids: ['vector'],          shortcut: 'w' },
-  { ids: ['vectorpen'],       shortcut: 'p' },
-  { ids: ['eyedropper'],      shortcut: 'i' },
+  { ids: ['select', 'lasso'],                                shortcut: 'v',
+    individualShortcuts: { lasso: 'L' } },
+  { ids: ['brush', 'pen'],                                   shortcut: 'b' },
+  { ids: ['eraser'],                                         shortcut: 'e' },
+  { ids: ['fill'],                                           shortcut: 'f' },
+  // Three switchable shape kinds in one slot — Shift+R cycles, R picks
+  // the most-recently-used. Per-tool Figma-style direct shortcuts:
+  //   R = rectangle, O = ellipse, Y = polygon.
+  { ids: ['shape-rect', 'shape-ellipse', 'shape-polygon'],   shortcut: 'r',
+    individualShortcuts: { 'shape-rect': 'R', 'shape-ellipse': 'O', 'shape-polygon': 'Y' } },
+  { ids: ['vector'],                                         shortcut: 'w' },
+  { ids: ['vectorpen'],                                      shortcut: 'p' },
+  { ids: ['eyedropper'],                                     shortcut: 'i' },
   { ids: ['pan'],             shortcut: 'h' },
 ]
 

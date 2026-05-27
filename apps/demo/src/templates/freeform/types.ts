@@ -1,9 +1,23 @@
+/**
+ * Tool ids the demo UI distinguishes.
+ *
+ * Some entries are *virtual* — they don't correspond to a registered Board
+ * tool. They proxy to a real tool plus side-effects (e.g. `shape-rect` calls
+ * `setActiveTool('shape')` after setting `shapeKind = 'rect'`). The mapping
+ * lives in `virtualToolMap` (store.ts).
+ *
+ * Virtual ids let us expose Figma-style toolbar slots that switch between
+ * concrete shape kinds without registering 3 duplicate ShapeTool instances.
+ */
 export type ToolId =
   | 'brush'
   | 'pen'        // raster pen — sibling of brush (Shift+B cycles)
   | 'eraser'
   | 'fill'       // fill bucket
-  | 'shape'      // rect / ellipse / polygon — creates parametric VectorPath
+  | 'shape'      // base shape tool (rarely the activeToolId — see virtuals)
+  | 'shape-rect'     // virtual — selects shape tool with kind=rect
+  | 'shape-ellipse'  // virtual — selects shape tool with kind=ellipse
+  | 'shape-polygon'  // virtual — selects shape tool with kind=polygon
   | 'vector'
   | 'vectorpen'
   | 'select'

@@ -1,6 +1,6 @@
 import { BrushTool } from './BrushTool'
 import { VectorLayer, type VectorStroke, type VectorPath } from '../layers/VectorLayer'
-import { diskCoverage } from '../vector/vectorSplit'
+import { diskCoverage, capsuleCoverage } from '../vector/vectorSplit'
 import { Color } from '../math/Color'
 import type { PointerData } from '../types'
 
@@ -25,6 +25,8 @@ export class EraserTool extends BrushTool {
   /** Element IDs added during the gesture — used for redo. */
   private _gestureAdded: { strokes: string[]; paths: string[] } | null = null
   private _vectorLayer: VectorLayer | null = null
+  /** Last erase point in layer-local coords — used for capsule sweep. */
+  private _lastEraseLocal: { x: number; y: number } | null = null
 
   /**
    * Vector eraser sub-mode. `'stroke'` removes whole elements (original
@@ -57,6 +59,7 @@ export class EraserTool extends BrushTool {
       this._gestureOriginal = { strokes: [], paths: [] }
       this._gestureAdded = { strokes: [], paths: [] }
       this._vectorLayer = layer as VectorLayer
+      this._lastEraseLocal = null
       this._eraseVector(e)
     } else {
       super.onPointerDown(e)
@@ -104,19 +107,30 @@ export class EraserTool extends BrushTool {
         this._gestureOriginal.paths.push(...paths)
         board.markDirty()
       }
+      this._lastEraseLocal = { x: lx, y: ly }
       return
     }
 
-    // Pixel-precise split: use the unified VectorLayer.splitByCoverage so
-    // this stays consistent with LassoSelectTool's split semantics. The
-    // "cut" pieces are simply discarded here — eraser doesn't preserve them.
-    const isCovered = diskCoverage(lx, ly, radius)
-    const result = layer.splitByCoverage(isCovered)
+    // Pixel-precise split: sweep a CAPSULE from the previous sample to the
+    // current one (degenerate first stamp = disk). The capsule catches any
+    // strokes the cursor flew past between samples (fast drags) AND yields
+    // a clean parallel cut edge instead of N scalloped circles. A bounding
+    // box around the capsule lets splitByCoverage skip 95%+ of unaffected
+    // elements without testing geometry — critical perf win as a path
+    // fragments into many sub-pieces during a long erase gesture.
+    const prev = this._lastEraseLocal
+    const isCovered = prev
+      ? capsuleCoverage(prev.x, prev.y, lx, ly, radius)
+      : diskCoverage(lx, ly, radius)
+    const x0 = prev ? Math.min(prev.x, lx) - radius : lx - radius
+    const y0 = prev ? Math.min(prev.y, ly) - radius : ly - radius
+    const x1 = prev ? Math.max(prev.x, lx) + radius : lx + radius
+    const y1 = prev ? Math.max(prev.y, ly) + radius : ly + radius
+    this._lastEraseLocal = { x: lx, y: ly }
+    const result = layer.splitByCoverage(isCovered, { x0, y0, x1, y1 })
     if (result.originalStrokes.length === 0 && result.originalPaths.length === 0) return
-    // We deliberately don't track the cut pieces (they're erased). For
-    // undo/redo, we need: original elements + ids of new replacement
-    // pieces. Track both incrementally so a long gesture still has one
-    // undo entry on pointer-up.
+    // Aggregate originals AND replacement-ids so a long gesture commits as
+    // one undo entry on pointer-up.
     this._gestureOriginal.strokes.push(...result.originalStrokes)
     this._gestureOriginal.paths.push(...result.originalPaths)
     this._gestureAdded.strokes.push(...result.addedStrokes.map((s) => s.id))
@@ -132,6 +146,7 @@ export class EraserTool extends BrushTool {
     this._gestureOriginal = null
     this._gestureAdded = null
     this._vectorLayer = null
+    this._lastEraseLocal = null
     if (!board || !original || !layer) return
     if (original.strokes.length === 0 && original.paths.length === 0) return
 

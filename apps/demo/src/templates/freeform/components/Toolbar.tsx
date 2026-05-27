@@ -1,9 +1,10 @@
 'use client'
 
-import React, { useRef, useCallback, useEffect } from 'react'
+import React, { useRef, useCallback, useEffect, useState } from 'react'
 import type { ToolId } from '../types'
 import { useFreeformStore } from '../store'
-import { TOOL_DEFS, TOOLBAR_SLOTS } from '../toolDefs'
+import { TOOL_DEFS, TOOLBAR_SLOTS, type ToolSlot } from '../toolDefs'
+import { ToolbarFlyout, type FlyoutSide } from './ToolbarFlyout'
 
 // ─── Snap geometry ────────────────────────────────────────────────────────────
 
@@ -11,9 +12,9 @@ type SnapEdge = 'bottom' | 'left' | 'right' | 'top'
 const SNAP_THRESHOLD = 80
 const EDGE_MARGIN = 12
 const TOP_BAR_H = 52
-const TOOLBAR_CROSS_AXIS = 52
 const TOOLBAR_MAIN_ESTIMATED_H = 360
 const TOOLBAR_MAIN_ESTIMATED_W = 400
+const LONG_PRESS_MS = 380
 
 function computeSnap(x: number, y: number): { snap: SnapEdge; offset: number } {
   const vw = window.innerWidth, vh = window.innerHeight
@@ -106,9 +107,10 @@ export function Toolbar() {
         {TOOLBAR_SLOTS.map((slot) => (
           <ToolButton
             key={slot.ids[0]}
-            slot={slot.ids}
+            slot={slot}
             activeToolId={activeToolId}
             vertical={isVertical}
+            flyoutSide={toolbarSnap as FlyoutSide}
             onSelect={setActiveToolId}
           />
         ))}
@@ -120,56 +122,124 @@ export function Toolbar() {
 // ─── ToolButton ───────────────────────────────────────────────────────────────
 
 function ToolButton({
-  slot, activeToolId, vertical, onSelect,
+  slot, activeToolId, vertical, flyoutSide, onSelect,
 }: {
-  slot: ToolId[]
+  slot: ToolSlot
   activeToolId: ToolId
   vertical: boolean
+  flyoutSide: FlyoutSide
   onSelect: (id: ToolId) => void
 }) {
-  const activeInSlot = slot.find((id) => id === activeToolId)
-  const displayId = activeInSlot ?? slot[0]!
+  const ids = slot.ids
+  const activeInSlot = ids.find((id) => id === activeToolId)
+  const displayId = activeInSlot ?? ids[0]
   const def = TOOL_DEFS[displayId]
-  if (!def) return null
-
-  const Icon = def.Icon
+  const Icon = def?.Icon
   const isActive = !!activeInSlot
-  const hasSiblings = slot.length > 1
+  const hasSiblings = ids.length > 1
+
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const [flyoutOpen, setFlyoutOpen] = useState(false)
+  const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null)
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const longPressFired = useRef(false)
+
+  const openFlyout = useCallback(() => {
+    if (!hasSiblings) return
+    if (btnRef.current) setAnchorRect(btnRef.current.getBoundingClientRect())
+    setFlyoutOpen(true)
+  }, [hasSiblings])
+
+  const cancelLongPress = useCallback(() => {
+    if (longPressTimer.current) { clearTimeout(longPressTimer.current); longPressTimer.current = null }
+  }, [])
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return
+    longPressFired.current = false
+    if (hasSiblings) {
+      longPressTimer.current = setTimeout(() => {
+        longPressFired.current = true
+        openFlyout()
+      }, LONG_PRESS_MS)
+    }
+  }
+  const handlePointerUp = () => cancelLongPress()
+  const handlePointerLeave = () => cancelLongPress()
 
   const handleClick = (e: React.MouseEvent) => {
+    if (longPressFired.current) {
+      // Long-press already opened the flyout; suppress this click.
+      longPressFired.current = false
+      return
+    }
+    cancelLongPress()
     if (hasSiblings && e.shiftKey) {
-      // Shift+click: cycle to the next sibling in the slot
-      const currentIdx = slot.indexOf(displayId)
-      const nextId = slot[(currentIdx + 1) % slot.length]!
+      const currentIdx = ids.indexOf(displayId)
+      const nextId = ids[(currentIdx + 1) % ids.length]!
       onSelect(nextId)
     } else {
-      // Plain click always activates the primary (first) tool in the slot
-      onSelect(slot[0]!)
+      // Plain click activates the currently-shown sibling (so the user can
+      // click back to whatever they last picked from the flyout).
+      onSelect(displayId)
     }
   }
 
-  const slotLabel = slot.map((id) => TOOL_DEFS[id]?.label ?? id).join(' / ')
+  const handleContextMenu = (e: React.MouseEvent) => {
+    if (!hasSiblings) return
+    e.preventDefault()
+    openFlyout()
+  }
+
+  if (!Icon) return null
+
+  const slotLabel = ids.map((id) => TOOL_DEFS[id]?.label ?? id).join(' / ')
 
   return (
-    <button
-      onClick={handleClick}
-      title={hasSiblings ? `${slotLabel} (Shift+click to cycle)` : def.label}
-      aria-pressed={isActive}
-      className={[
-        'relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-100 focus:outline-none select-none',
-        isActive
-          ? 'bg-white/15 text-white ring-1 ring-white/35'
-          : 'text-white/40 hover:bg-white/8 hover:text-white/75',
-      ].join(' ')}
-    >
-      <Icon size={16} strokeWidth={1.75} />
-      {isActive && !vertical && (
-        <span className="absolute -bottom-1 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full bg-white/55" />
+    <>
+      <button
+        ref={btnRef}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerUp}
+        onPointerLeave={handlePointerLeave}
+        onClick={handleClick}
+        onContextMenu={handleContextMenu}
+        title={hasSiblings ? `${slotLabel} (right-click or long-press for options)` : def!.label}
+        aria-pressed={isActive}
+        className={[
+          'relative flex h-9 w-9 items-center justify-center rounded-xl transition-all duration-100 focus:outline-none select-none',
+          isActive
+            ? 'bg-white/15 text-white ring-1 ring-white/35'
+            : 'text-white/40 hover:bg-white/8 hover:text-white/75',
+        ].join(' ')}
+      >
+        <Icon size={16} strokeWidth={1.75} />
+        {isActive && !vertical && (
+          <span className="absolute -bottom-1 left-1/2 h-0.5 w-3 -translate-x-1/2 rounded-full bg-white/55" />
+        )}
+        {hasSiblings && (
+          <span
+            className={[
+              'absolute h-1 w-1 rounded-full transition-colors',
+              vertical ? 'bottom-1 right-1' : 'bottom-1 right-1',
+              flyoutOpen ? 'bg-blue-300' : 'bg-white/35',
+            ].join(' ')}
+          />
+        )}
+      </button>
+
+      {flyoutOpen && (
+        <ToolbarFlyout
+          anchorRect={anchorRect}
+          ids={ids}
+          activeId={displayId}
+          toolbarSide={flyoutSide}
+          shortcuts={slot.individualShortcuts}
+          onPick={onSelect}
+          onClose={() => setFlyoutOpen(false)}
+        />
       )}
-      {hasSiblings && (
-        <span className="absolute bottom-1 right-1 h-1 w-1 rounded-full bg-white/35" />
-      )}
-    </button>
+    </>
   )
 }
 
@@ -200,24 +270,16 @@ function GripIcon({ vertical }: { vertical: boolean }) {
 const COLOR_DRAG_THRESHOLD = 6  // px
 
 function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
-  // We tracked drag state in local refs before, which left CSS :active / cursor
-  // styles "stuck" when a drag ended on the canvas (no pointerup on the swatch
-  // because we'd released pointer capture). Now the *store* is the single
-  // source of truth for "is a color drag in flight"; the button's visual
-  // state derives from it and resets atomically when the store does.
   const isDragging = useFreeformStore((s) => s.colorDrag !== null)
   const downRef = useRef<{ x: number; y: number; pointerId: number; armed: boolean } | null>(null)
   const initiatedDragRef = useRef(false)
 
-  // Watch for the global drag ending and clear local "initiated" flag so the
-  // next tap behaves cleanly even if the user releases over the canvas.
   useEffect(() => {
     if (!isDragging && initiatedDragRef.current) initiatedDragRef.current = false
   }, [isDragging])
 
   const handlePointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return
-    // Only one drag at a time — ignore if another is already in flight.
     if (useFreeformStore.getState().colorDrag) return
     downRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId, armed: true }
     initiatedDragRef.current = false
@@ -230,7 +292,6 @@ function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
       d.armed = false
       initiatedDragRef.current = true
       try { (e.currentTarget as Element).releasePointerCapture?.(e.pointerId) } catch { /* no-op */ }
-      // Blur the button so :focus-visible / sticky :active CSS clears cleanly.
       ;(e.currentTarget as HTMLElement).blur()
       useFreeformStore.getState().beginColorDrag(color, e.clientX, e.clientY)
     }
@@ -240,17 +301,11 @@ function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
     const d = downRef.current
     downRef.current = null
     if (!d) return
-    if (d.armed && !initiatedDragRef.current) {
-      // Released without crossing the drag threshold → treat as a tap.
-      onTap()
-    }
-    // Otherwise ColorDropOverlay's window pointerup did the drop work.
+    if (d.armed && !initiatedDragRef.current) onTap()
     ;(e.currentTarget as HTMLElement).blur()
   }
 
-  const handlePointerCancel = () => {
-    downRef.current = null
-  }
+  const handlePointerCancel = () => { downRef.current = null }
 
   return (
     <button
@@ -258,8 +313,6 @@ function ColorSwatch({ color, onTap }: { color: string; onTap: () => void }) {
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerCancel}
-      // No :active scaling and no sticky grab cursor — both caused the
-      // stuck-style bug after a drag that ended away from the button.
       className={[
         'h-7 w-7 rounded-full border-2 shadow-inner shrink-0 select-none touch-none transition-colors',
         isDragging

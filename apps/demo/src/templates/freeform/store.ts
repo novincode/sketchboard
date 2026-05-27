@@ -209,6 +209,31 @@ interface FreeformActions {
   exportPng(filename?: string): void
 }
 
+// ─── Virtual tool registry ───────────────────────────────────────────────────
+
+/**
+ * Map of virtual ToolIds → underlying base ToolId + side effects to run
+ * before activating it. Used by `setActiveToolId` and the toolChanged hook
+ * in FreeformTemplate so the UI can expose Figma-style toolbar entries
+ * (one per shape kind, etc.) without registering duplicate Tool instances.
+ *
+ * Keep keys synced with the virtual entries in `types.ts → ToolId`.
+ */
+export interface VirtualToolEntry {
+  base: ToolId
+  apply: (board: Board, state: FreeformState & FreeformActions) => void
+}
+export const VIRTUAL_TOOLS: Partial<Record<ToolId, VirtualToolEntry>> = {
+  'shape-rect':    { base: 'shape', apply: (_b, s) => s.setShapeKind('rect') },
+  'shape-ellipse': { base: 'shape', apply: (_b, s) => s.setShapeKind('ellipse') },
+  'shape-polygon': { base: 'shape', apply: (_b, s) => s.setShapeKind('polygon') },
+}
+
+/** Resolve a possibly-virtual ToolId to the underlying real Board tool name. */
+export function resolveBaseTool(id: ToolId): ToolId {
+  return VIRTUAL_TOOLS[id]?.base ?? id
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function applyBrushColor(board: Board, hex: string) {
@@ -418,7 +443,13 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     // ── Tool ──────────────────────────────────────────────────────────────
     setActiveToolId(id) {
       const { board } = get()
-      if (board && board.hasTool(id)) {
+      const virtual = VIRTUAL_TOOLS[id]
+      if (virtual) {
+        // Run side-effects (e.g. setShapeKind) BEFORE switching the board tool
+        // so the tool sees the right settings when it activates.
+        virtual.apply(board!, get())
+        if (board && board.hasTool(virtual.base)) board.setActiveTool(virtual.base)
+      } else if (board && board.hasTool(id)) {
         board.setActiveTool(id)
       }
       set({ activeToolId: id })

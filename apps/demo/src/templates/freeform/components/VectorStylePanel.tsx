@@ -3,7 +3,8 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { HexColorPicker } from 'react-colorful'
-import type { SelectTool } from '@sketchboard/core'
+import { Link2, Link2Off } from 'lucide-react'
+import type { SelectTool, VectorShape } from '@sketchboard/core'
 import { useFreeformStore } from '../store'
 import { DraggableInput } from './DraggableInput'
 
@@ -24,24 +25,27 @@ export function VectorStylePanel() {
   const activeToolId = useFreeformStore((s) => s.activeToolId)
 
   const [style, setStyle] = useState<ReturnType<SelectTool['getElementStyle']>>(null)
+  const [shape, setShape] = useState<VectorShape | null>(null)
   const [hasRasterLasso, setHasRasterLasso] = useState(false)
 
   useEffect(() => {
-    if (!board) { setStyle(null); setHasRasterLasso(false); return }
+    if (!board) { setStyle(null); setShape(null); setHasRasterLasso(false); return }
     const select = board.getTool<SelectTool>('select')
-    if (!select) { setStyle(null); setHasRasterLasso(false); return }
+    if (!select) { setStyle(null); setShape(null); setHasRasterLasso(false); return }
 
     const refresh = () => {
       setStyle(select.getElementStyle())
+      setShape(select.getSelectedShape())
       setHasRasterLasso(select.getRasterLassoSelection() !== null)
     }
     const unsub = board.hooks.selectionChanged.tap('vector-style-sidebar', refresh)
-    // Also refresh on activeLayer changes — if the user manually changes the
-    // active layer in the panel, the current selection may now point at a
-    // different layer's elements (shouldn't, but we want to stay safe).
+    // Refresh on every render too — a shape edit (radius drag) doesn't change
+    // selection, but the displayed values still need to update. Cheap because
+    // afterRender only fires when the layer is actually dirty.
+    const unsubRender = board.hooks.afterRender.tap('vector-style-sidebar-rerender', refresh)
     const unsubLayer = board.hooks.activeLayerChanged.tap('vector-style-sidebar', refresh)
     refresh()
-    return () => { unsub(); unsubLayer() }
+    return () => { unsub(); unsubRender(); unsubLayer() }
   }, [board])
 
   // Only show on selection-capable tools.
@@ -49,11 +53,12 @@ export function VectorStylePanel() {
   if (!toolOk) return null
   if (!style && !hasRasterLasso) return null
 
-  return <Sidebar style={style} hasRasterLasso={hasRasterLasso} board={board!} />
+  return <Sidebar style={style} shape={shape} hasRasterLasso={hasRasterLasso} board={board!} />
 }
 
-function Sidebar({ style, hasRasterLasso, board }: {
+function Sidebar({ style, shape, hasRasterLasso, board }: {
   style: ReturnType<SelectTool['getElementStyle']>
+  shape: VectorShape | null
   hasRasterLasso: boolean
   board: NonNullable<ReturnType<typeof useFreeformStore.getState>['board']>
 }) {
@@ -122,6 +127,26 @@ function Sidebar({ style, hasRasterLasso, board }: {
             />
           </FieldGroup>
 
+          {shape && shape.kind === 'rect' && (
+            <GeometryGroup
+              label="Corner radius"
+              shape={shape}
+              onChange={(patch) => select.setSelectedShape(patch)}
+            />
+          )}
+          {shape && shape.kind === 'polygon' && (
+            <FieldGroup label="Polygon">
+              <DraggableInput
+                label="Sides"
+                value={shape.sides ?? 6}
+                min={3}
+                max={32}
+                unit=""
+                onChange={(v) => select.setSelectedShape({ sides: v })}
+              />
+            </FieldGroup>
+          )}
+
           <FieldGroup label="Actions">
             <ActionRow>
               <button
@@ -137,6 +162,10 @@ function Sidebar({ style, hasRasterLasso, board }: {
                 className="flex-1 rounded-lg border border-rose-400/30 bg-rose-500/15 py-1.5 text-[11px] text-rose-200 hover:bg-rose-500/25 transition"
               >Delete</button>
             </ActionRow>
+            <button
+              onClick={() => select.deselect()}
+              className="rounded-lg border border-white/10 bg-white/5 py-1.5 text-[11px] text-white/65 hover:bg-white/10 transition"
+            >Deselect</button>
           </FieldGroup>
         </>
       )}
@@ -161,6 +190,102 @@ function Sidebar({ style, hasRasterLasso, board }: {
         </>
       )}
     </aside>
+  )
+}
+
+/**
+ * Figma-style corner-radius editor.
+ *
+ *   - Linked mode (default): one slider drives all 4 corners uniformly. Icon
+ *     shows a closed link. Click the icon to switch to per-corner mode.
+ *   - Unlinked mode: 4 small inputs in a 2x2 grid mirroring the rectangle's
+ *     corner positions (TL TR / BL BR). Click the icon (now an open link) to
+ *     re-link — re-link uses the first corner's value as the new uniform value.
+ */
+function GeometryGroup({
+  label, shape, onChange,
+}: {
+  label: string
+  shape: VectorShape
+  onChange: (patch: Partial<VectorShape>) => void
+}) {
+  const radii = shape.cornerRadius ?? [0, 0, 0, 0]
+  const allEqual = radii[0] === radii[1] && radii[1] === radii[2] && radii[2] === radii[3]
+  const [linked, setLinked] = useState(allEqual)
+
+  // Whenever radii become non-uniform externally, automatically switch to unlinked.
+  useEffect(() => {
+    if (!allEqual && linked) setLinked(false)
+  }, [allEqual, linked])
+
+  const maxR = Math.floor(Math.min(shape.width, shape.height) / 2)
+  const setAll = (v: number) => onChange({ cornerRadius: [v, v, v, v] })
+  const setOne = (idx: 0 | 1 | 2 | 3, v: number) => {
+    const next = [...radii] as [number, number, number, number]
+    next[idx] = v
+    onChange({ cornerRadius: next })
+  }
+
+  return (
+    <div className="flex flex-col gap-2 pb-3 border-b border-white/6 last:border-b-0 last:pb-0">
+      <div className="flex items-center justify-between">
+        <span className="text-[9px] uppercase tracking-widest text-white/35 font-semibold">{label}</span>
+        <button
+          onClick={() => {
+            const nextLinked = !linked
+            setLinked(nextLinked)
+            if (nextLinked) setAll(radii[0])  // re-link with TL value
+          }}
+          title={linked ? 'Edit corners independently' : 'Link all corners'}
+          className={[
+            'flex h-6 w-6 items-center justify-center rounded-md border transition',
+            linked
+              ? 'border-blue-400/50 bg-blue-500/15 text-blue-300'
+              : 'border-white/15 bg-white/5 text-white/45 hover:text-white/80',
+          ].join(' ')}
+        >
+          {linked ? <Link2 size={11} /> : <Link2Off size={11} />}
+        </button>
+      </div>
+      {linked ? (
+        <DraggableInput
+          label="All"
+          value={Math.round(radii[0])}
+          min={0}
+          max={maxR}
+          unit="px"
+          onChange={(v) => setAll(v)}
+        />
+      ) : (
+        <div className="grid grid-cols-2 gap-1.5">
+          <CornerInput corner="TL" value={radii[0]} max={maxR} onChange={(v) => setOne(0, v)} />
+          <CornerInput corner="TR" value={radii[1]} max={maxR} onChange={(v) => setOne(1, v)} />
+          <CornerInput corner="BL" value={radii[3]} max={maxR} onChange={(v) => setOne(3, v)} />
+          <CornerInput corner="BR" value={radii[2]} max={maxR} onChange={(v) => setOne(2, v)} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CornerInput({ corner, value, max, onChange }: {
+  corner: 'TL' | 'TR' | 'BL' | 'BR'
+  value: number
+  max: number
+  onChange: (v: number) => void
+}) {
+  return (
+    <div className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-1.5 py-1">
+      <span className="text-[9px] font-mono text-white/30">{corner}</span>
+      <DraggableInput
+        label=""
+        value={Math.round(value)}
+        min={0}
+        max={max}
+        unit=""
+        onChange={onChange}
+      />
+    </div>
   )
 }
 

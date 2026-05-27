@@ -236,6 +236,39 @@ export function diskCoverage(cx: number, cy: number, r: number): CoveragePredica
 }
 
 /**
+ * Predicate: inside a capsule (swept disk) — the set of points within
+ * distance `r` from any point on the line segment (x0,y0)→(x1,y1).
+ * Used by EraserTool to cover the entire path between two consecutive
+ * pointermove samples in ONE split call rather than stamping many separate
+ * disks. Two benefits:
+ *   1. Catches strokes the cursor flew over between samples (fast drags).
+ *   2. Cuts at the actual capsule edge, not at N disjoint circles, so the
+ *      kept piece has a clean parallel edge instead of a scalloped one.
+ */
+export function capsuleCoverage(x0: number, y0: number, x1: number, y1: number, r: number): CoveragePredicate {
+  const dx = x1 - x0, dy = y1 - y0
+  const lenSq = dx * dx + dy * dy
+  const r2 = r * r
+  if (lenSq < 1e-6) {
+    // Degenerate: zero-length segment → fall back to disk.
+    return (x, y) => {
+      const px = x - x0, py = y - y0
+      return px * px + py * py <= r2
+    }
+  }
+  return (x, y) => {
+    // Distance from (x,y) to the closest point on the segment.
+    const px = x - x0, py = y - y0
+    let t = (px * dx + py * dy) / lenSq
+    if (t < 0) t = 0
+    else if (t > 1) t = 1
+    const cx = x0 + t * dx, cy = y0 + t * dy
+    const ex = x - cx, ey = y - cy
+    return ex * ex + ey * ey <= r2
+  }
+}
+
+/**
  * Predicate: inside a polygon (raycast). `poly` is a flat list of {x,y}
  * vertices defining a single non-self-intersecting outline.
  */

@@ -247,8 +247,10 @@ export class FillTool extends Tool {
    * Once the user pauses scrubbing for this many ms, we redo the flood at
    * FULL resolution so the preview matches what would commit. Set to 0 to
    * disable (preview stays low-res until pointerup commits).
+   * Kept short (40ms = ~2 frames) so the visible jitter from low-res
+   * previews disappears almost immediately on any pause in cursor motion.
    */
-  scrubAccuratePreviewDelayMs: number = 120
+  scrubAccuratePreviewDelayMs: number = 40
 
   // rAF coalescing for drag-scrub: pointermove fires far more often than we
   // can re-flood. We record the latest desired tolerance and run exactly one
@@ -639,12 +641,17 @@ export class FillTool extends Tool {
 
   /**
    * Full-resolution fill stamped onto the (just-restored) layer pixels.
-   * Reads the layer's current bytes for flood input — assumes the caller
-   * already called _restoreFromBackup() this frame.
+   * Uses the stored pristine bytes (`s.before`) directly — bypasses
+   * `getImageData()` which is the slow GPU-readback path. With the layer
+   * already restored from backup, `s.before` IS the current state, so
+   * reusing it is correct and saves ~5–20ms per scrub frame on big canvases.
    */
   private _stampFullFill(tolerance: number): void {
     const s = this._scrub!
-    const data = s.layer.getImageData()
+    // Clone the pristine bytes so each flood writes into a fresh buffer —
+    // never mutating `s.before` which the history entry relies on.
+    const bytes = new Uint8ClampedArray(s.before)
+    const data = new ImageData(bytes, s.width, s.height)
     if (s.refData) {
       floodFillWithRef(data.data, s.refData.data, s.width, s.height, s.px, s.py, s.fillR, s.fillG, s.fillB, s.fillA, tolerance)
     } else {

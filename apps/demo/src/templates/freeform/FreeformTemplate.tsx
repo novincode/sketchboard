@@ -9,7 +9,8 @@ import {
   FillTool, LassoSelectTool, ShapeTool,
 } from '@sketchboard/core'
 import { useBoard } from '@sketchboard/react'
-import { useFreeformStore } from './store'
+import { useFreeformStore, resolveBaseTool } from './store'
+import { buildToolShortcuts } from './toolDefs'
 import { TopBar } from './components/TopBar'
 import { Toolbar } from './components/Toolbar'
 import { ColorPickerPopup } from './components/ColorPickerPopup'
@@ -52,29 +53,19 @@ function useFreeformSetup(board: Board | null) {
     board.setActiveTool('brush')
 
     // 2. Keyboard shortcuts via plugin (guard against hot-reload double-registration)
+    // Tool slot shortcuts are AUTO-GENERATED from TOOLBAR_SLOTS via
+    // `buildToolShortcuts` — single source of truth lives in toolDefs.tsx.
+    // Special non-tool actions (Delete, Copy, Group, etc.) are spelled out
+    // inline below.
+    const autoShortcuts = buildToolShortcuts({
+      activate: (id) => useFreeformStore.getState().setActiveToolId(id),
+      getActive: () => useFreeformStore.getState().activeToolId,
+    })
     if (!board.plugins.has('keyboard')) board.use(new KeyboardPlugin({
-      pencil:      null,  // not registered
-      pen:         null,  // raster pen has no standalone shortcut — cycled via Shift+B
-      // B = always brush; Shift+B = cycle through brush/pen slot
-      brush:       { key: 'b', description: 'Raster brush', handler: (b) => b.setActiveTool('brush') },
-      rasterPen:   { key: 'b', shift: true, description: 'Cycle brush slot (Shift+B)', handler: (b) => {
-        const cur = useFreeformStore.getState().activeToolId
-        const slot: ToolId[] = ['brush', 'pen']
-        const idx = slot.indexOf(cur as ToolId)
-        b.setActiveTool(slot[(idx + 1) % slot.length]!)
-      }},
-      // V = rect select; Shift+V = cycle through select/lasso slot
-      selectTool:  { key: 'v', description: 'Select', handler: (b) => b.setActiveTool('select') },
-      lassoTool:   { key: 'v', shift: true, description: 'Cycle select slot (Shift+V)', handler: (b) => {
-        const cur = useFreeformStore.getState().activeToolId
-        const slot: ToolId[] = ['select', 'lasso']
-        const idx = slot.indexOf(cur as ToolId)
-        b.setActiveTool(slot[(idx + 1) % slot.length]!)
-      }},
-      // Other tools
-      vectorBrush: { key: 'w', description: 'Vector brush', handler: (b) => b.setActiveTool('vector') },
-      vectorPen:   { key: 'p', description: 'Vector pen',   handler: (b) => b.setActiveTool('vectorpen') },
-      fillTool:    { key: 'f', description: 'Fill',         handler: (b) => b.setActiveTool('fill') },
+      pencil:      null,
+      pen:         null,
+      brush:       null,
+      ...autoShortcuts,
       deleteEl:    { key: 'Delete',    description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       deleteElBS:  { key: 'Backspace', description: 'Delete selected', handler: (b) => b.getTool<SelectTool>('select')?.deleteSelected() },
       finishPath:  { key: 'Enter',  description: 'Finish vector path', handler: (b) => b.getTool<VectorPenTool>('vectorpen')?.finishPath() },
@@ -111,6 +102,12 @@ function useFreeformSetup(board: Board | null) {
       setBrushColor(color.toHex())
     })
     const unsubTool = board.hooks.toolChanged.tap('freeform', ({ name }) => {
+      // Don't clobber a virtual toolbar id when the underlying tool is the
+      // same. e.g. when user picks "Rectangle" we set activeToolId='shape-rect'
+      // and the board fires toolChanged('shape') — we want to KEEP the
+      // virtual id so the toolbar shows the right icon.
+      const current = useFreeformStore.getState().activeToolId
+      if (resolveBaseTool(current) === name) return
       useFreeformStore.setState({ activeToolId: name as ToolId })
     })
 

@@ -32,6 +32,14 @@ interface ElementSnapshot {
   id: string
   strokePoints?: Array<{ x: number; y: number; pressure: number }>
   pathAnchors?: BezierAnchor[]
+  /**
+   * Snapshot of the path's shape descriptor (rect/ellipse/polygon metadata).
+   * Required for resize-stable corner radius: each frame of an interactive
+   * resize restores BOTH the original anchors AND the original shape so the
+   * subsequent scale math always sees the same starting bounds, and corner
+   * radius regenerates from the original value at the new bbox.
+   */
+  pathShape?: VectorShape
 }
 
 const DRAG_THRESHOLD = 4   // px of movement before rect-select activates
@@ -745,14 +753,21 @@ export class SelectTool extends Tool {
     // exists, the user's most-recent intent was the lasso. Clear the pixels
     // inside the polygon and drop the selection.
     if (this._rasterLasso) {
-      const layer = board.getLayerById(this._rasterLasso.layerId)
+      const lasso = this._rasterLasso
+      const layer = board.getLayerById(lasso.layerId)
       if (layer instanceof RasterLayer) {
-        const before = layer.getImageData()
+        const W = layer.width, H = layer.height
+        // Defensive deep-clone of the pixel bytes so neither before/after can
+        // be aliased by a later read of the same buffer. (Browser ImageData
+        // objects share the underlying buffer with the canvas in some
+        // implementations, which made undo behave unpredictably.)
+        const beforeImg = layer.getImageData()
+        const beforeBytes = new Uint8ClampedArray(beforeImg.data)
         const ctx = layer.ctx
         ctx.save()
         ctx.globalCompositeOperation = 'destination-out'
         ctx.beginPath()
-        const poly = this._rasterLasso.polygon
+        const poly = lasso.polygon
         if (poly.length >= 3) {
           ctx.moveTo(poly[0]!.x, poly[0]!.y)
           for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i]!.x, poly[i]!.y)
@@ -761,10 +776,17 @@ export class SelectTool extends Tool {
           ctx.fill()
         }
         ctx.restore()
-        const after = layer.getImageData()
+        const afterImg = layer.getImageData()
+        const afterBytes = new Uint8ClampedArray(afterImg.data)
         board.history.push({
-          undo: () => { layer.putImageData(before); board.markDirty() },
-          redo: () => { layer.putImageData(after);  board.markDirty() },
+          undo: () => {
+            layer.putImageData(new ImageData(new Uint8ClampedArray(beforeBytes), W, H))
+            board.markDirty()
+          },
+          redo: () => {
+            layer.putImageData(new ImageData(new Uint8ClampedArray(afterBytes), W, H))
+            board.markDirty()
+          },
         })
       }
       this._rasterLasso = null
@@ -956,6 +978,58 @@ export class SelectTool extends Tool {
     }
   }
 
+  /**
+   * Return the shape descriptor of the currently selected element when it's
+   * a single shape-bearing path; null otherwise. The sidebar uses this to
+   * expose corner-radius / sides / etc. controls.
+   */
+  getSelectedShape(): VectorShape | null {
+    if (!this.board) return null
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return null
+    const ids = this.getSelectedIds()
+    if (ids.length !== 1) return null
+    const p = layer.paths.find((p) => p.id === ids[0])
+    return p?.shape ?? null
+  }
+
+  /**
+   * Patch the selected single-element's shape descriptor and regenerate
+   * anchors. Pushes one history entry. Returns false if no single shape
+   * is selected.
+   */
+  setSelectedShape(patch: Partial<VectorShape>): boolean {
+    if (!this.board) return false
+    const board = this.board
+    const layer = board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return false
+    const ids = this.getSelectedIds()
+    if (ids.length !== 1) return false
+    const id = ids[0]!
+    const path = layer.paths.find((p) => p.id === id)
+    if (!path || !path.shape) return false
+    const beforeShape = { ...path.shape, cornerRadius: path.shape.cornerRadius ? [...path.shape.cornerRadius] as [number, number, number, number] : undefined }
+    const beforeAnchors = path.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+    if (!layer.updateShape(id, patch)) return false
+    const afterShape = { ...path.shape, cornerRadius: path.shape.cornerRadius ? [...path.shape.cornerRadius] as [number, number, number, number] : undefined }
+    const afterAnchors = path.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+    board.markDirty()
+    this.scheduleOverlayRedraw()
+    board.history.push({
+      undo: () => {
+        const p = (layer as VectorLayer).paths.find((p) => p.id === id)
+        if (p) { p.shape = beforeShape; p.anchors = beforeAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+        board.markDirty(); this.scheduleOverlayRedraw()
+      },
+      redo: () => {
+        const p = (layer as VectorLayer).paths.find((p) => p.id === id)
+        if (p) { p.shape = afterShape; p.anchors = afterAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+        board.markDirty(); this.scheduleOverlayRedraw()
+      },
+    })
+    return true
+  }
+
   /** True if there is content currently on the internal clipboard. */
   hasClipboard(): boolean {
     return !!this._clipboard && (this._clipboard.strokes.length > 0 || this._clipboard.paths.length > 0)
@@ -1000,6 +1074,19 @@ export class SelectTool extends Tool {
   cutSelected(): void {
     this.copySelected()
     this.deleteSelected()
+  }
+
+  /**
+   * Clear the current selection (vector OR raster lasso) without modifying
+   * any pixels or elements. Mirrors clicking on empty canvas. Fires
+   * selectionChanged so UI panels close.
+   */
+  deselect(): void {
+    if (this.state.kind !== 'idle') this.state = { kind: 'idle' }
+    this._rasterLasso = null
+    this.board?.clearStrokeCanvas()
+    this._fireSelectionChanged()
+    this.scheduleOverlayRedraw()
   }
 
   pasteClipboard(): void {
@@ -1471,11 +1558,16 @@ export class SelectTool extends Tool {
     if (stroke) return { id, strokePoints: stroke.points.map((p) => ({ ...p })) }
     const path = layer.paths.find((p) => p.id === id)
     if (path) return {
-      id, pathAnchors: path.anchors.map((a) => ({
+      id,
+      pathAnchors: path.anchors.map((a) => ({
         ...a,
         handleIn: a.handleIn ? { ...a.handleIn } : null,
         handleOut: a.handleOut ? { ...a.handleOut } : null,
       })),
+      pathShape: path.shape ? {
+        ...path.shape,
+        cornerRadius: path.shape.cornerRadius ? [...path.shape.cornerRadius] as [number, number, number, number] : undefined,
+      } : undefined,
     }
     return { id }
   }
@@ -1490,6 +1582,14 @@ export class SelectTool extends Tool {
         handleIn: a.handleIn ? { ...a.handleIn } : null,
         handleOut: a.handleOut ? { ...a.handleOut } : null,
       }))
+      // Shape metadata also restored so subsequent scale math operates from
+      // the same starting bounds across frames (resize-stable corner radius).
+      if (snap.pathShape) {
+        path.shape = {
+          ...snap.pathShape,
+          cornerRadius: snap.pathShape.cornerRadius ? [...snap.pathShape.cornerRadius] as [number, number, number, number] : undefined,
+        }
+      }
     }
   }
 

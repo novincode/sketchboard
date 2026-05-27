@@ -1,16 +1,30 @@
 'use client'
 
 import React, { useRef, useState, useEffect } from 'react'
-import { MoreHorizontal, Undo2, Redo2, Layers, Download, type LucideIcon } from 'lucide-react'
+import { MoreHorizontal, Undo2, Redo2, Layers, Download, KeyRound, type LucideIcon } from 'lucide-react'
 import { useFreeformStore } from '../store'
 import { TOOL_DEFS } from '../toolDefs'
+import { ShortcutsDialog } from './ShortcutsDialog'
 
 // ─── TopBar ───────────────────────────────────────────────────────────────────
 
 export function TopBar() {
   const { board, activeToolId, showLayerPanel, toggleLayerPanel, exportPng } = useFreeformStore()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+
+  // Keyboard shortcut for the manager itself (Cmd/Ctrl+/ — same as VSCode/Figma).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === '/') {
+        e.preventDefault()
+        setShortcutsOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -46,13 +60,16 @@ export function TopBar() {
           </Pill>
 
           {menuOpen && (
-            <div className="absolute left-0 top-full mt-1.5 z-50 flex flex-col overflow-hidden rounded-xl border border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur-xl min-w-40">
+            <div className="absolute left-0 top-full mt-1.5 z-50 flex flex-col overflow-hidden rounded-xl border border-white/10 bg-[#111]/95 shadow-2xl backdrop-blur-xl min-w-48">
               <MenuAction Icon={Undo2} label="Undo" shortcut="⌘Z" onClick={() => { board?.history.undo(); setMenuOpen(false) }} />
               <MenuAction Icon={Redo2} label="Redo" shortcut="⌘⇧Z" onClick={() => { board?.history.redo(); setMenuOpen(false) }} />
+              <div className="h-px bg-white/8 mx-2 my-1" />
+              <MenuAction Icon={KeyRound} label="Keyboard shortcuts" shortcut="⌘/" onClick={() => { setShortcutsOpen(true); setMenuOpen(false) }} />
             </div>
           )}
         </div>
       </div>
+      <ShortcutsDialog open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
 
       {/* Center: active tool name + options — auto-width, centered */}
       {def && (
