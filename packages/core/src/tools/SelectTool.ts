@@ -1,15 +1,30 @@
 import { Tool } from './Tool'
 import type { PointerData } from '../types'
 import { VectorLayer } from '../layers/VectorLayer'
-import type { BezierAnchor, VectorStroke, VectorPath } from '../layers/VectorLayer'
+import { RasterLayer } from '../layers/RasterLayer'
+import type { BezierAnchor, VectorStroke, VectorPath, VectorShape } from '../layers/VectorLayer'
+import { buildShapeAnchors } from '../shapes/shapeAnchors'
 import type { Camera } from '../Camera'
+
+/** Persistent raster "lasso" selection — polygon in layer-local coords. */
+interface RasterLassoSelection {
+  layerId: string
+  /** Polygon vertices in layer-local pixel coords. */
+  polygon: Array<{ x: number; y: number }>
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type SelectMode = 'rect'   // 'lasso' is future work
 export type ResizeHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+/** Which corner of a shape rectangle a radius-handle controls. */
+export type CornerId = 0 | 1 | 2 | 3   // tl, tr, br, bl
 const ROTATE_HANDLE_OFFSET = 22   // screen px above the top edge
 const ROTATE_SNAP_DEG = 15        // snap angle when shift is held
+/** Pixel inset for radius handles when corner radius is 0 — keeps them clickable. */
+const RADIUS_HANDLE_MIN_INSET = 10
+/** Maximum on-screen distance from the corner the radius handle can sit (prevents handles flying off when zoomed in). */
+const RADIUS_HANDLE_MAX_INSET = 60
 
 interface Bounds { x: number; y: number; w: number; h: number }
 
@@ -34,6 +49,9 @@ type SelectState =
   | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot; createHandles?: boolean }
   | { kind: 'editing-stroke'; id: string }
   | { kind: 'dragging-stroke-point'; id: string; pointIdx: number; snap: ElementSnapshot }
+  // Dragging a corner-radius handle on a shape-bearing path. `corner` is which
+  // corner is being dragged; `applyAll` is true unless Alt is held at grab.
+  | { kind: 'dragging-radius'; id: string; corner: CornerId; applyAll: boolean; startShape: VectorShape; startAnchors: BezierAnchor[] }
 
 const HANDLE_SIZE = 8        // screen px, half-size of each resize handle square
 const HIT_RADIUS = 10        // screen px, pointer hit tolerance for handles/elements
@@ -46,7 +64,18 @@ export class SelectTool extends Tool {
   state: SelectState = { kind: 'idle' }
   mode: SelectMode = 'rect'
 
+  /**
+   * When true (default), a click that misses every element on the active
+   * vector layer falls through to any other VectorLayer in the document —
+   * the first hit switches active layer AND selects that element. Set to
+   * false to scope selection to the active layer only (Procreate-style).
+   * Rect-select always stays per-layer to keep semantics simple.
+   */
+  selectAcrossLayers: boolean = true
+
   private _clipboard: { strokes: VectorStroke[]; paths: VectorPath[] } | null = null
+  /** Persistent raster lasso selection (polygon). Cleared on deactivate or new selection. */
+  private _rasterLasso: RasterLassoSelection | null = null
   private _overlayPending = false
   private _afterRenderUnsub: (() => void) | null = null
   private _lastDownTime = 0
@@ -62,10 +91,18 @@ export class SelectTool extends Tool {
   private get _altActive(): boolean { return this._altDown || this._stickyAlt }
   private get _shiftActive(): boolean { return this._shiftDown || this._stickyShift }
 
+  /** Last selection set the tool fired on `selectionChanged` — used to suppress duplicate fires. */
+  private _lastFiredIdsKey: string = ''
+
   /** UI hook: pin/unpin a modifier so subsequent gestures behave as if it's held. */
   setStickyModifier(mod: 'alt' | 'shift', on: boolean): void {
     if (mod === 'alt') this._stickyAlt = on
     else this._stickyShift = on
+  }
+
+  /** Toggle whether clicks cross layer boundaries. Default true. */
+  setSelectAcrossLayers(on: boolean): void {
+    this.selectAcrossLayers = on
   }
   private _onKeyDown: ((e: KeyboardEvent) => void) | null = null
   private _onKeyUp: ((e: KeyboardEvent) => void) | null = null
@@ -93,11 +130,53 @@ export class SelectTool extends Tool {
     this._afterRenderUnsub?.(); this._afterRenderUnsub = null
     this.board?.clearStrokeCanvas()
     this.state = { kind: 'idle' }
+    this._fireSelectionChanged()
     this._altDown = false
     this._shiftDown = false
     if (this._onKeyDown) window.removeEventListener('keydown', this._onKeyDown)
     if (this._onKeyUp) window.removeEventListener('keyup', this._onKeyUp)
     this._onKeyDown = null; this._onKeyUp = null
+  }
+
+  /**
+   * Notify external listeners (UI panels) that the selection set or focused
+   * element changed. Idempotent — repeat calls with the same id key are
+   * suppressed so panels don't re-render on every overlay redraw.
+   */
+  private _fireSelectionChanged(): void {
+    if (!this.board) return
+    const ids = this.getSelectedIds()
+    const key = ids.join(',') + '|' + (this.board.getActiveLayer()?.id ?? '')
+    if (key === this._lastFiredIdsKey) return
+    this._lastFiredIdsKey = key
+    this.board.hooks.selectionChanged.call({ ids, layerId: this.board.getActiveLayer()?.id ?? null })
+  }
+
+  /**
+   * Cross-layer click hit test: probe every VectorLayer in the document
+   * (top→bottom in panel order, i.e. last → first in tree). Returns the
+   * first hit's layer + element id, or null. Skips invisible layers.
+   * Uses each layer's own transform so clicks across translated layers
+   * still register correctly.
+   */
+  private _hitTestAcrossLayers(sx: number, sy: number): { layer: VectorLayer; id: string } | null {
+    if (!this.board) return null
+    const board = this.board
+    const W = board.logicalWidth, H = board.logicalHeight
+    const world = board.camera.screenToWorld(sx, sy, W, H)
+    const radius = HIT_RADIUS / board.camera.zoom
+    // Walk top→bottom (panel reverses tree, so iterate reverse here)
+    const all = board.getAllLayers()
+    for (let i = all.length - 1; i >= 0; i--) {
+      const l = all[i]
+      if (!l || !l.visible) continue
+      if (!(l instanceof VectorLayer)) continue
+      const lx = world.x - l.transform.x
+      const ly = world.y - l.transform.y
+      const hit = l.hitTest(lx, ly, radius)
+      if (hit) return { layer: l, id: hit }
+    }
+    return null
   }
 
   onPointerDown(e: PointerData): void {
@@ -177,6 +256,29 @@ export class SelectTool extends Tool {
     }
     if (this.state.kind === 'dragging-stroke-point') return
 
+    // ── Check corner-radius handles (only for a single rect-shape selection) ──
+    if (this.state.kind === 'selected' && isVec && this.state.ids.length === 1) {
+      const selectedId = this.state.ids[0]
+      const vl = layer as VectorLayer
+      const path = vl.paths.find((p) => p.id === selectedId)
+      if (path && path.shape && path.shape.kind === 'rect') {
+        const corner = this.hitTestRadiusHandle(e.x, e.y, path.shape, vl)
+        if (corner !== null) {
+          const startShape = { ...path.shape, cornerRadius: path.shape.cornerRadius ? [...path.shape.cornerRadius] as [number, number, number, number] : undefined }
+          const startAnchors = path.anchors.map((a) => ({
+            ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null,
+          }))
+          this.state = {
+            kind: 'dragging-radius', id: path.id, corner,
+            applyAll: !this._altActive,   // default = all corners; Alt = single
+            startShape, startAnchors,
+          }
+          board.canvas.style.cursor = 'pointer'
+          return
+        }
+      }
+    }
+
     // ── Check rotate handle first (sits above the bounds) ────────────────
     if (this.state.kind === 'selected' && isVec) {
       const ids = this.state.ids
@@ -245,35 +347,58 @@ export class SelectTool extends Tool {
       }
     }
 
-    // ── Hit test elements ──────────────────────────────────────────────────
+    // ── Hit test elements (active layer first, then cross-layer if enabled) ──
+    // Cross-layer click: if the active layer misses but another VectorLayer
+    // has an element under the cursor, switch active layer and grab THAT
+    // element. Lets users select objects without first hunting for the right
+    // layer (Figma-style). Disable via `selectAcrossLayers = false`.
+    let resolved: { layer: VectorLayer; lx: number; ly: number; id: string } | null = null
     if (isVec) {
       const vl = layer as VectorLayer
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
       const lx = world.x - vl.transform.x
       const ly = world.y - vl.transform.y
       const hitRadius = HIT_RADIUS / board.camera.zoom
-
       const hitId = vl.hitTest(lx, ly, hitRadius)
-      if (hitId) {
-        // Double-click on any element → immediately enter edit mode
-        if (doubleClick) {
-          const path = vl.paths.find((p) => p.id === hitId)
-          if (path) { this.state = { kind: 'editing', id: hitId }; this.scheduleOverlayRedraw(); return }
-          const stroke = vl.strokes.find((s) => s.id === hitId)
-          if (stroke) { this.state = { kind: 'editing-stroke', id: hitId }; this.scheduleOverlayRedraw(); return }
+      if (hitId) resolved = { layer: vl, lx, ly, id: hitId }
+    }
+    if (!resolved && this.selectAcrossLayers) {
+      const cross = this._hitTestAcrossLayers(e.x, e.y)
+      if (cross) {
+        // Switch active layer so all subsequent state (move/resize) operates on it.
+        board.setActiveLayer(cross.layer.id)
+        const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+        resolved = {
+          layer: cross.layer,
+          lx: world.x - cross.layer.transform.x,
+          ly: world.y - cross.layer.transform.y,
+          id: cross.id,
         }
-        const ids = [hitId]
-        const snaps = ids.map((id) => this.snapshotElement(vl, id))
-        this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps, hasMoved: false }
-        board.canvas.style.cursor = 'move'
-        this.scheduleOverlayRedraw()
-        return
       }
+    }
+
+    if (resolved) {
+      const { layer: vl, lx, ly, id: hitId } = resolved
+      // Double-click on any element → immediately enter edit mode
+      if (doubleClick) {
+        const path = vl.paths.find((p) => p.id === hitId)
+        if (path) { this.state = { kind: 'editing', id: hitId }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
+        const stroke = vl.strokes.find((s) => s.id === hitId)
+        if (stroke) { this.state = { kind: 'editing-stroke', id: hitId }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
+      }
+      const ids = [hitId]
+      const snaps = ids.map((id) => this.snapshotElement(vl, id))
+      this.state = { kind: 'moving', ids, startLX: lx, startLY: ly, snaps, hasMoved: false }
+      board.canvas.style.cursor = 'move'
+      this._fireSelectionChanged()
+      this.scheduleOverlayRedraw()
+      return
     }
 
     // ── Click on empty space: deselect now, start rect-select only if user drags ─
     this.state = { kind: 'pending-select', sx: e.x, sy: e.y }
     board.canvas.style.cursor = 'default'
+    this._fireSelectionChanged()
     this.scheduleOverlayRedraw()
   }
 
@@ -375,6 +500,49 @@ export class SelectTool extends Tool {
       const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
       const pt = stroke.points[st.pointIdx]
       if (pt) { pt.x = lx; pt.y = ly }
+      board.markDirty(); this.scheduleOverlayRedraw()
+      return
+    }
+
+    if (this.state.kind === 'dragging-radius') {
+      const st = this.state
+      const layer = board.getActiveLayer()
+      if (!(layer instanceof VectorLayer)) return
+      const path = layer.paths.find((p) => p.id === st.id)
+      if (!path || !path.shape || path.shape.kind !== 'rect') return
+      const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
+      const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
+      // Each corner contributes radius = distance from corner to cursor,
+      // projected onto the inward 45° diagonal so dragging "into" the rect
+      // grows the radius and "outside" shrinks it. Clamped to [0, min/2].
+      const shape = st.startShape
+      const cornerPos = this._cornerWorldPos(shape, st.corner)
+      // Inward direction (unit) — into the rect.
+      const cx = shape.x + shape.width / 2
+      const cy = shape.y + shape.height / 2
+      const dirX = cx - cornerPos.x
+      const dirY = cy - cornerPos.y
+      const dirLen = Math.hypot(dirX, dirY) || 1
+      const ux = dirX / dirLen, uy = dirY / dirLen
+      // Project cursor vector onto inward direction.
+      const dx = lx - cornerPos.x
+      const dy = ly - cornerPos.y
+      const proj = dx * ux + dy * uy
+      const maxR = Math.min(shape.width, shape.height) / 2
+      // The handle sits at distance `radius` along the diagonal from the corner.
+      // proj is in diagonal-projection space; the corner-radius is the
+      // perpendicular distance from the corner to where the curve begins, so
+      // we divide by sqrt(2) to recover it from the diagonal projection.
+      const rDrag = Math.max(0, Math.min(maxR, proj / Math.SQRT2))
+      const existing = (shape.cornerRadius ?? [0, 0, 0, 0]).slice() as [number, number, number, number]
+      if (st.applyAll) {
+        existing[0] = existing[1] = existing[2] = existing[3] = rDrag
+      } else {
+        existing[st.corner] = rDrag
+      }
+      const next: VectorShape = { ...shape, cornerRadius: existing }
+      path.shape = next
+      path.anchors = buildShapeAnchors(next)
       board.markDirty(); this.scheduleOverlayRedraw()
       return
     }
@@ -482,6 +650,32 @@ export class SelectTool extends Tool {
       const ids = this.state.ids
       this.state = { kind: 'selected', ids }
       board.canvas.style.cursor = 'default'
+    } else if (this.state.kind === 'dragging-radius') {
+      const st = this.state
+      if (layer instanceof VectorLayer) {
+        const path = layer.paths.find((p) => p.id === st.id)
+        if (path && path.shape) {
+          // Snapshot AFTER state for redo; the START state is captured in `st`.
+          const afterShape: VectorShape = { ...path.shape, cornerRadius: path.shape.cornerRadius ? [...path.shape.cornerRadius] as [number, number, number, number] : undefined }
+          const afterAnchors = path.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+          const beforeShape = st.startShape
+          const beforeAnchors = st.startAnchors
+          board.history.push({
+            undo: () => {
+              const p = (layer as VectorLayer).paths.find((p) => p.id === st.id)
+              if (p) { p.shape = beforeShape; p.anchors = beforeAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+              board.markDirty(); this.scheduleOverlayRedraw()
+            },
+            redo: () => {
+              const p = (layer as VectorLayer).paths.find((p) => p.id === st.id)
+              if (p) { p.shape = afterShape; p.anchors = afterAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+              board.markDirty(); this.scheduleOverlayRedraw()
+            },
+          })
+        }
+      }
+      this.state = { kind: 'selected', ids: [st.id] }
+      board.canvas.style.cursor = 'default'
     } else if (this.state.kind === 'dragging-point') {
       const st = this.state
       if (layer instanceof VectorLayer) {
@@ -506,13 +700,15 @@ export class SelectTool extends Tool {
       this.state = { kind: 'editing-stroke', id: st.id }
     }
 
+    this._fireSelectionChanged()
     this.scheduleOverlayRedraw()
   }
 
   onPointerCancel(_e: PointerData): void {
-    if (this.state.kind === 'pending-select') { this.state = { kind: 'idle' }; this.scheduleOverlayRedraw(); return }
+    if (this.state.kind === 'pending-select') { this.state = { kind: 'idle' }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
     this.state = { kind: 'idle' }
     this.board?.canvas.style.cursor ? (this.board.canvas.style.cursor = 'default') : null
+    this._fireSelectionChanged()
     this.scheduleOverlayRedraw()
   }
 
@@ -526,6 +722,7 @@ export class SelectTool extends Tool {
     } else {
       this.state = { kind: 'selected', ids }
     }
+    this._fireSelectionChanged()
     this.scheduleOverlayRedraw()
   }
 
@@ -535,20 +732,90 @@ export class SelectTool extends Tool {
     if (k === 'editing' || k === 'dragging-point' || k === 'editing-stroke' || k === 'dragging-stroke-point' || k === 'selected') {
       this.state = { kind: 'idle' }
     }
+    this._rasterLasso = null
     this.board?.clearStrokeCanvas()
+    this._fireSelectionChanged()
     this.scheduleOverlayRedraw()
   }
 
   deleteSelected(): void {
-    const layer = this.board?.getActiveLayer()
+    const board = this.board
+    if (!board) return
+    // Raster lasso selection takes priority — even if a vector selection
+    // exists, the user's most-recent intent was the lasso. Clear the pixels
+    // inside the polygon and drop the selection.
+    if (this._rasterLasso) {
+      const layer = board.getLayerById(this._rasterLasso.layerId)
+      if (layer instanceof RasterLayer) {
+        const before = layer.getImageData()
+        const ctx = layer.ctx
+        ctx.save()
+        ctx.globalCompositeOperation = 'destination-out'
+        ctx.beginPath()
+        const poly = this._rasterLasso.polygon
+        if (poly.length >= 3) {
+          ctx.moveTo(poly[0]!.x, poly[0]!.y)
+          for (let i = 1; i < poly.length; i++) ctx.lineTo(poly[i]!.x, poly[i]!.y)
+          ctx.closePath()
+          ctx.fillStyle = '#000'
+          ctx.fill()
+        }
+        ctx.restore()
+        const after = layer.getImageData()
+        board.history.push({
+          undo: () => { layer.putImageData(before); board.markDirty() },
+          redo: () => { layer.putImageData(after);  board.markDirty() },
+        })
+      }
+      this._rasterLasso = null
+      board.markDirty()
+      this._fireSelectionChanged()
+      this.scheduleOverlayRedraw()
+      return
+    }
+
+    const layer = board.getActiveLayer()
     if (!(layer instanceof VectorLayer)) return
     const st = this.state
     if (st.kind !== 'selected' && st.kind !== 'editing' && st.kind !== 'editing-stroke') return
     const ids = st.kind === 'selected' ? st.ids : [st.id]
+    // Capture originals so deletion is undoable.
+    const removedStrokes: VectorStroke[] = []
+    const removedPaths: VectorPath[] = []
+    for (const id of ids) {
+      const s = layer.strokes.find((x) => x.id === id); if (s) removedStrokes.push(s)
+      const p = layer.paths.find((x) => x.id === id);   if (p) removedPaths.push(p)
+    }
     for (const id of ids) { layer.removeStroke(id); layer.removePath(id) }
+    board.history.push({
+      undo: () => {
+        for (const s of removedStrokes) layer.addStroke(s)
+        for (const p of removedPaths)   layer.addPath(p)
+        board.markDirty()
+      },
+      redo: () => {
+        for (const s of removedStrokes) layer.removeStroke(s.id)
+        for (const p of removedPaths)   layer.removePath(p.id)
+        board.markDirty()
+      },
+    })
     this.state = { kind: 'idle' }
-    this.board?.markDirty(); this.scheduleOverlayRedraw()
+    board.markDirty()
+    this._fireSelectionChanged()
+    this.scheduleOverlayRedraw()
   }
+
+  /**
+   * Replace the persistent raster lasso selection. Called by LassoSelectTool
+   * after committing a polygon on a raster layer. Pass null to clear.
+   */
+  setRasterLassoSelection(sel: RasterLassoSelection | null): void {
+    this._rasterLasso = sel
+    this._fireSelectionChanged()
+    this.scheduleOverlayRedraw()
+  }
+
+  getRasterLassoSelection(): RasterLassoSelection | null { return this._rasterLasso }
 
   /**
    * Snapshot of the currently selected element ids (vector strokes/paths).
@@ -701,6 +968,7 @@ export class SelectTool extends Tool {
    */
   hasSelection(): boolean {
     const k = this.state.kind
+    if (this._rasterLasso) return true
     return k === 'selected' || k === 'editing' || k === 'editing-stroke'
   }
 
@@ -768,6 +1036,7 @@ export class SelectTool extends Tool {
     this.board.markDirty()
     if (newIds.length > 0) {
       this.state = { kind: 'selected', ids: newIds }
+      this._fireSelectionChanged()
       this.scheduleOverlayRedraw()
       const board = this.board
       this.pushDupeHistory(board, layer, newIds)
@@ -810,6 +1079,26 @@ export class SelectTool extends Tool {
       const ids = 'ids' in this.state ? this.state.ids : []
       const bounds = this.getCombinedBounds(layer, ids)
       if (bounds) this.drawBoundingBox(strokeCtx, bounds, layer, board.camera, W, H)
+
+      // Corner-radius handles for a single rect-shape selection.
+      if (ids.length === 1) {
+        const path = layer.paths.find((p) => p.id === ids[0])
+        if (path && path.shape && path.shape.kind === 'rect') {
+          this.drawRadiusHandles(strokeCtx, path.shape, layer)
+        }
+      }
+    }
+
+    // While actively dragging a radius handle, keep the bounding box visible.
+    if (this.state.kind === 'dragging-radius' && layer instanceof VectorLayer) {
+      const draggingId = this.state.id
+      const draggingCorner = this.state.corner
+      const path = layer.paths.find((p) => p.id === draggingId)
+      if (path && path.shape && path.shape.kind === 'rect') {
+        const bounds = layer.getBounds(path.id)
+        if (bounds) this.drawBoundingBox(strokeCtx, bounds, layer, board.camera, W, H)
+        this.drawRadiusHandles(strokeCtx, path.shape, layer, draggingCorner)
+      }
     }
 
     // Edit mode handles (path)
@@ -818,6 +1107,34 @@ export class SelectTool extends Tool {
       if (layer instanceof VectorLayer) {
         const path = layer.paths.find((p) => p.id === id)
         if (path) this.drawEditHandles(strokeCtx, path.anchors, layer, board.camera, W, H)
+      }
+    }
+
+    // Persistent raster lasso selection — render the polygon as
+    // marching-ants. Layer-local coords → world (add layer.transform) →
+    // screen (camera.worldToScreen).
+    if (this._rasterLasso) {
+      const ll = board.getLayerById(this._rasterLasso.layerId)
+      if (ll) {
+        strokeCtx.save()
+        strokeCtx.strokeStyle = 'rgba(99,179,237,0.95)'
+        strokeCtx.lineWidth = 1.5
+        strokeCtx.setLineDash([5, 4])
+        const poly = this._rasterLasso.polygon
+        if (poly.length >= 3) {
+          strokeCtx.beginPath()
+          const p0 = board.camera.worldToScreen(poly[0]!.x + ll.transform.x, poly[0]!.y + ll.transform.y, W, H)
+          strokeCtx.moveTo(p0.x, p0.y)
+          for (let i = 1; i < poly.length; i++) {
+            const ps = board.camera.worldToScreen(poly[i]!.x + ll.transform.x, poly[i]!.y + ll.transform.y, W, H)
+            strokeCtx.lineTo(ps.x, ps.y)
+          }
+          strokeCtx.closePath()
+          strokeCtx.stroke()
+          strokeCtx.fillStyle = 'rgba(99,179,237,0.05)'
+          strokeCtx.fill()
+        }
+        strokeCtx.restore()
       }
     }
 
@@ -881,6 +1198,25 @@ export class SelectTool extends Tool {
     ctx.beginPath()
     ctx.arc(rotPos.x, rotPos.y, 5, 0, Math.PI * 2)
     ctx.fill(); ctx.stroke()
+  }
+
+  /**
+   * Draw the 4 corner-radius handles inside the rect's corners — only when
+   * the selection is a single rect-shape. `activeCorner` (if provided) is
+   * drawn larger and brighter to indicate the corner currently being dragged.
+   */
+  private drawRadiusHandles(ctx: CanvasRenderingContext2D, shape: VectorShape, layer: VectorLayer, activeCorner?: CornerId): void {
+    for (const c of [0, 1, 2, 3] as CornerId[]) {
+      const pos = this.radiusHandleScreenPos(shape, c, layer)
+      if (!pos) continue
+      const isActive = activeCorner === c
+      ctx.beginPath()
+      ctx.arc(pos.x, pos.y, isActive ? 7 : 5, 0, Math.PI * 2)
+      ctx.fillStyle = isActive ? 'rgba(74, 222, 128, 1)' : 'rgba(255,255,255,1)'
+      ctx.strokeStyle = 'rgba(34,197,94,0.95)'  // green so it visually differs from the resize handles
+      ctx.lineWidth = 2
+      ctx.fill(); ctx.stroke()
+    }
   }
 
   private getHandleScreenPositions(tl: {x:number;y:number}, tr: {x:number;y:number}, bl: {x:number;y:number}, br: {x:number;y:number}) {
@@ -973,6 +1309,64 @@ export class SelectTool extends Tool {
     if (!pos) return false
     const dx = sx - pos.x, dy = sy - pos.y
     return dx * dx + dy * dy <= HIT_RADIUS * HIT_RADIUS
+  }
+
+  /**
+   * Get the world-local position of the given corner of a rectangle shape.
+   * Corner index: 0=tl, 1=tr, 2=br, 3=bl.
+   */
+  private _cornerWorldPos(shape: VectorShape, corner: CornerId): { x: number; y: number } {
+    const { x, y, width: w, height: h } = shape
+    if (corner === 0) return { x: x,     y: y     }
+    if (corner === 1) return { x: x + w, y: y     }
+    if (corner === 2) return { x: x + w, y: y + h }
+    return                  { x: x,     y: y + h }
+  }
+
+  /**
+   * Screen position of a corner-radius handle for the given corner. The handle
+   * sits inside the rect along the corner's inward diagonal, at distance
+   * proportional to the current cornerRadius (with a minimum on-screen inset
+   * so the handle is always grabbable even at radius 0).
+   */
+  private radiusHandleScreenPos(shape: VectorShape, corner: CornerId, layer: VectorLayer): { x: number; y: number } | null {
+    if (!this.board) return null
+    const { camera, logicalWidth: W, logicalHeight: H } = this.board
+    const cornerLocal = this._cornerWorldPos(shape, corner)
+    const cx = shape.x + shape.width / 2
+    const cy = shape.y + shape.height / 2
+    const dirX = cx - cornerLocal.x
+    const dirY = cy - cornerLocal.y
+    const dirLen = Math.hypot(dirX, dirY) || 1
+    const ux = dirX / dirLen, uy = dirY / dirLen
+    const r = shape.cornerRadius ? shape.cornerRadius[corner] : 0
+    // Distance along the diagonal where the inner radius point sits.
+    const worldDist = r * Math.SQRT2
+    const screenCorner = camera.worldToScreen(cornerLocal.x + layer.transform.x, cornerLocal.y + layer.transform.y, W, H)
+    const screenInner = camera.worldToScreen(cornerLocal.x + ux * worldDist + layer.transform.x, cornerLocal.y + uy * worldDist + layer.transform.y, W, H)
+    const dx = screenInner.x - screenCorner.x
+    const dy = screenInner.y - screenCorner.y
+    const screenDist = Math.hypot(dx, dy)
+    // Clamp inset to keep handle inside a sane on-screen band even when r=0.
+    const targetDist = Math.max(RADIUS_HANDLE_MIN_INSET, Math.min(screenDist, RADIUS_HANDLE_MAX_INSET))
+    const norm = screenDist > 0.01 ? targetDist / screenDist : 0
+    return {
+      x: screenCorner.x + (dx === 0 && dy === 0 ? ux : dx) * (screenDist > 0.01 ? norm : RADIUS_HANDLE_MIN_INSET),
+      y: screenCorner.y + (dx === 0 && dy === 0 ? uy : dy) * (screenDist > 0.01 ? norm : RADIUS_HANDLE_MIN_INSET),
+    }
+  }
+
+  /**
+   * Hit-test all 4 corner-radius handles. Returns the corner index or null.
+   */
+  private hitTestRadiusHandle(sx: number, sy: number, shape: VectorShape, layer: VectorLayer): CornerId | null {
+    const r2 = HIT_RADIUS * HIT_RADIUS
+    for (const c of [0, 1, 2, 3] as CornerId[]) {
+      const pos = this.radiusHandleScreenPos(shape, c, layer)
+      if (!pos) continue
+      if ((sx - pos.x) ** 2 + (sy - pos.y) ** 2 <= r2) return c
+    }
+    return null
   }
 
   private hitTestResizeHandle(sx: number, sy: number, bounds: Bounds, layer: VectorLayer): ResizeHandle | null {

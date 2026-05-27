@@ -1,6 +1,7 @@
 import { Layer } from './Layer'
 import type { Camera } from '../Camera'
 import { buildShapeAnchors } from '../shapes/shapeAnchors'
+import { splitStroke, splitPath, type CoveragePredicate } from '../vector/vectorSplit'
 
 // ─── Brush stroke (free-draw, many auto-smooth points) ────────────────────────
 
@@ -186,6 +187,80 @@ export class VectorLayer extends Layer {
     })
 
     return { strokes: removedStrokes, paths: removedPaths }
+  }
+
+  /**
+   * Apply a coverage predicate (eraser disk, lasso polygon, etc.) precisely
+   * to the layer's strokes and paths — splitting each touched element into
+   * the parts OUTSIDE coverage, dropping the parts INSIDE. The lifted
+   * (cut-out) pieces are returned separately so a caller can use them as a
+   * lasso selection. Returns mappings the caller can replay for undo/redo:
+   *   - `replacedStrokes`: original stroke ids that were touched (need
+   *     re-insertion on undo)
+   *   - `replacedPaths`: original path ids similarly
+   *   - `addedStrokeIds` / `addedPathIds`: ids of new sub-elements
+   *   - `originalStrokes` / `originalPaths`: snapshots of replaced originals
+   *   - `cutStrokes` / `cutPaths`: the inside-coverage pieces (not added to
+   *     the layer — caller decides what to do with them)
+   *
+   * NOTE: this is the unified primitive used by both EraserTool (vector
+   * pixel mode) and LassoSelectTool. Coupling the split logic here keeps
+   * the two tools consistent and lets us add new "operators" (e.g. a
+   * scissor tool, knife slicing) without re-implementing geometry.
+   */
+  splitByCoverage(isCovered: CoveragePredicate): {
+    addedStrokes: VectorStroke[]
+    addedPaths: VectorPath[]
+    cutStrokes: VectorStroke[]
+    cutPaths: VectorPath[]
+    originalStrokes: VectorStroke[]
+    originalPaths: VectorPath[]
+  } {
+    const addedStrokes: VectorStroke[] = []
+    const addedPaths: VectorPath[] = []
+    const cutStrokes: VectorStroke[] = []
+    const cutPaths: VectorPath[] = []
+    const originalStrokes: VectorStroke[] = []
+    const originalPaths: VectorPath[] = []
+
+    const newStrokes: VectorStroke[] = []
+    for (const s of this.strokes) {
+      const result = splitStroke(s, isCovered)
+      if (!result) { newStrokes.push(s); continue }
+      originalStrokes.push(s)
+      for (const pts of result.keep) {
+        const replaced = this.createStroke(pts.map((p) => ({ ...p })), s.color, s.lineWidth, s.opacity, s.compositeOperation)
+        newStrokes.push(replaced)
+        addedStrokes.push(replaced)
+      }
+      for (const pts of result.cut) {
+        const lift = this.createStroke(pts.map((p) => ({ ...p })), s.color, s.lineWidth, s.opacity, s.compositeOperation)
+        cutStrokes.push(lift)
+      }
+    }
+    this.strokes = newStrokes
+
+    const newPaths: VectorPath[] = []
+    for (const p of this.paths) {
+      const result = splitPath(p, isCovered)
+      if (!result || !result.changed) { newPaths.push(p); continue }
+      originalPaths.push(p)
+      for (const anchors of result.keep) {
+        // Touched paths become open polylines for the outside portion.
+        // Drop the shape descriptor — it no longer describes the geometry
+        // after a cut. Stroke/fill style preserved.
+        const replaced = this.createPath(anchors, false, p.strokeColor, p.strokeWidth, p.fillColor, p.opacity, p.compositeOperation)
+        newPaths.push(replaced)
+        addedPaths.push(replaced)
+      }
+      for (const anchors of result.cut) {
+        const lift = this.createPath(anchors, false, p.strokeColor, p.strokeWidth, p.fillColor, p.opacity, p.compositeOperation)
+        cutPaths.push(lift)
+      }
+    }
+    this.paths = newPaths
+
+    return { addedStrokes, addedPaths, cutStrokes, cutPaths, originalStrokes, originalPaths }
   }
 
   // ── Hit testing ───────────────────────────────────────────────────────────

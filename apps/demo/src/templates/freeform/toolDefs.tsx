@@ -385,11 +385,38 @@ function VectorPenOptionsPanel() {
   )
 }
 
+function SelectOptionsPanel() {
+  const { selectAcrossLayers, setSelectAcrossLayers } = useFreeformStore()
+  return (
+    <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1.5">
+        <span className="text-[9px] uppercase tracking-widest text-white/30 font-semibold">Scope</span>
+        <div className="flex rounded-lg overflow-hidden border border-white/10">
+          {([
+            { v: true,  label: 'All layers', title: 'Click selects across every vector layer (switches active layer)' },
+            { v: false, label: 'Active only', title: 'Click only selects elements on the active layer' },
+          ]).map((opt) => (
+            <button
+              key={String(opt.v)}
+              onClick={() => setSelectAcrossLayers(opt.v)}
+              title={opt.title}
+              className={[
+                'px-2.5 py-1 text-[10px] capitalize transition-colors',
+                selectAcrossLayers === opt.v ? 'bg-white/20 text-white' : 'text-white/35 hover:bg-white/5',
+              ].join(' ')}
+            >{opt.label}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 export const TOOL_DEFS: Record<ToolId, ToolDef> = {
-  select:     { id: 'select',     label: 'Select',       Icon: MousePointer2, OptionsPanel: null },
-  lasso:      { id: 'lasso',      label: 'Lasso Select', Icon: Lasso,         OptionsPanel: null },
+  select:     { id: 'select',     label: 'Select',       Icon: MousePointer2, OptionsPanel: SelectOptionsPanel },
+  lasso:      { id: 'lasso',      label: 'Lasso Select', Icon: Lasso,         OptionsPanel: SelectOptionsPanel },
   brush:      { id: 'brush',      label: 'Brush',        Icon: Paintbrush,    OptionsPanel: RasterBrushOptionsPanel },
   pen:        { id: 'pen',        label: 'Raster Pen',   Icon: Pen,           OptionsPanel: RasterBrushOptionsPanel },
   eraser:     { id: 'eraser',     label: 'Eraser',       Icon: Eraser,        OptionsPanel: EraserOptionsPanel },

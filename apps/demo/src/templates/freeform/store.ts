@@ -2,7 +2,7 @@
 
 import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
-import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool, FillTool, FillPlacement, ShapeTool, ShapeKind } from '@sketchboard/core'
+import type { Board, BrushTool, VectorBrushTool, Layer, VectorPenTool, FillTool, FillPlacement, ShapeTool, ShapeKind, EraserTool, SelectTool } from '@sketchboard/core'
 import { Color, RasterLayer, VectorLayer, GroupLayer } from '@sketchboard/core'
 import type { ToolId, Background, EraserMode, LayerType } from './types'
 import { RASTER_BRUSH_PRESETS, DEFAULT_BRUSH_PRESET_ID } from './brushPresets'
@@ -42,6 +42,9 @@ interface FreeformState {
 
   eraserSize: number
   eraserMode: EraserMode
+
+  /** SelectTool: hit-test across other vector layers (true) or only active (false). */
+  selectAcrossLayers: boolean
 
   vectorSize: number
   vectorOpacity: number
@@ -120,6 +123,8 @@ interface FreeformActions {
 
   setEraserSize(size: number): void
   setEraserMode(mode: EraserMode): void
+
+  setSelectAcrossLayers(on: boolean): void
 
   setVectorSize(size: number): void
   setVectorOpacity(opacity: number): void
@@ -314,6 +319,7 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
     brushColor: '#1a1a1a',
     eraserSize: 24,
     eraserMode: 'pixel',
+    selectAcrossLayers: true,
     vectorSize: 4,
     vectorOpacity: 1,
     vectorBrushMerge: false,
@@ -373,6 +379,12 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
         fillTool.settings.placement = s.fillPlacement
         fillTool.settings.gapClose = s.fillGapClose
       }
+
+      const eraserTool = board.getTool<EraserTool>('eraser')
+      if (eraserTool) eraserTool.setVectorMode(s.eraserMode)
+
+      const selectTool = board.getTool<SelectTool>('select')
+      if (selectTool) selectTool.setSelectAcrossLayers(s.selectAcrossLayers)
 
       const shapeTool = board.getTool<ShapeTool>('shape')
       if (shapeTool) {
@@ -459,7 +471,21 @@ export const useFreeformStore = create<FreeformState & FreeformActions>()(
       if (tool) tool.settings.size = size
       set({ eraserSize: size })
     },
-    setEraserMode(mode) { set({ eraserMode: mode }) },
+    setEraserMode(mode) {
+      const { board } = get()
+      const tool = board?.getTool<EraserTool>('eraser')
+      // Eraser's vector sub-mode mirrors the same pixel/stroke names — pixel =
+      // precise split per disk, stroke = remove whole element on touch.
+      if (tool) tool.setVectorMode(mode)
+      set({ eraserMode: mode })
+    },
+
+    setSelectAcrossLayers(on) {
+      const { board } = get()
+      const tool = board?.getTool<SelectTool>('select')
+      if (tool) tool.setSelectAcrossLayers(on)
+      set({ selectAcrossLayers: on })
+    },
 
     // ── Vector brush ──────────────────────────────────────────────────────
     setVectorSize(size) {

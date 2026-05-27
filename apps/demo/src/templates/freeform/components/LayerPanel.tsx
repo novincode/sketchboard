@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useEffect, useRef, useState, forwardRef } from 'react'
+import React, { useEffect, useMemo, useRef, useState, forwardRef } from 'react'
 import { createPortal } from 'react-dom'
 import {
   Eye, EyeOff, Plus, Layers, PenLine,
@@ -10,8 +10,8 @@ import {
 import { HexColorPicker } from 'react-colorful'
 import {
   DndContext, MouseSensor, TouchSensor, useSensor, useSensors,
-  DragOverlay, closestCenter,
-  type DragStartEvent, type DragEndEvent, type DragOverEvent,
+  DragOverlay, pointerWithin, useDroppable,
+  type DragStartEvent, type DragEndEvent, type DragOverEvent, type CollisionDetection,
 } from '@dnd-kit/core'
 import {
   SortableContext, useSortable, verticalListSortingStrategy,
@@ -27,29 +27,46 @@ const BLEND_MODES = [
   'hard-light', 'soft-light', 'difference', 'exclusion',
 ]
 
-const INDENT_PX = 14
+const INDENT_PX = 16
+
+// ─── Drop targets ──────────────────────────────────────────────────────────────
+/**
+ * Distinct droppable targets the panel exposes during a drag:
+ *
+ *   row::<id>::before        Insert above this row, same parent
+ *   row::<id>::after         Insert below this row, same parent
+ *   group::<id>::into        Drop into this group as the new top child
+ *   root::end                Append to root (always-visible bottom strip)
+ *   root::start              Insert at top of root (just below Background)
+ *
+ * Using string-coded ids lets us read intent without juggling extra state —
+ * the active droppable is whichever the cursor is over according to the
+ * dnd-kit collision detector. Each target is rendered as a small invisible
+ * `<DropZone>` so dnd-kit's collision system finds it.
+ */
+type DropTargetId = string
+
+function dropId(kind: 'before' | 'after', rowId: string): DropTargetId { return `row::${rowId}::${kind}` }
+function intoId(groupId: string): DropTargetId { return `group::${groupId}::into` }
+const ROOT_START: DropTargetId = 'root::start'
+const ROOT_END: DropTargetId = 'root::end'
+
+// Custom collision detection: prefer pointer-within (matches the cursor's
+// exact position vs. the droppable rect) for snappy precision, then fall
+// back to the closest center if no zone contains the pointer. This is the
+// dnd-kit recommended pattern for "interactive layout" cases like ours.
+const collisionDetection: CollisionDetection = (args) => {
+  // Try pointer-within first; if it finds nothing, fall back to the
+  // sortable items themselves (which dnd-kit ranks by closest-center).
+  const within = pointerWithin(args)
+  if (within.length > 0) return within
+  // No drop zone hit — but the user might be hovering a row directly.
+  // Return [] so dnd-kit reports `over = null`, and our active-drag
+  // panel listener can decide what to do (e.g. show the root-end hint).
+  return []
+}
 
 // ─── LayerPanel ───────────────────────────────────────────────────────────────
-
-/**
- * Where a drag would land if the user released right now. Computed on every
- * dragOver from the cursor's Y position relative to the over-row's rect:
- *   top third    → 'before'  (drop above the over-row, same parent)
- *   middle third → 'into'    (drop INTO the over-row — groups only)
- *   bottom third → 'after'   (drop below the over-row, same parent)
- * For non-group rows the middle third collapses to whichever third is closer.
- *
- * Plus: 'outdent' — cursor drifted significantly left of the over-row's
- * indented content while the active layer is inside a group. The drop will
- * lift the active layer out of its current group into the group's parent
- * (Figma-style "drag-left to outdent").
- */
-type DropPos = 'before' | 'after' | 'into' | 'outdent'
-interface DropHint {
-  overId: string
-  pos: DropPos
-}
-const OUTDENT_THRESHOLD_PX = 24  // how far left the cursor must drift
 
 export function LayerPanel() {
   const {
@@ -68,24 +85,14 @@ export function LayerPanel() {
   const ref = useRef<HTMLDivElement>(null)
   const [showAddMenu, setShowAddMenu] = useState(false)
   const [activeDragId, setActiveDragId] = useState<string | null>(null)
-  const [dropHint, setDropHint] = useState<DropHint | null>(null)
+  const [overDropId, setOverDropId] = useState<DropTargetId | null>(null)
 
-  // Cursor X/Y during a drag — dnd-kit doesn't natively expose the live
-  // pointer position to the dragOver handler, but we need it to decide
-  // before/into/after (Y) and outdent-to-parent (X).
-  const cursorYRef = useRef<number>(0)
-  const cursorXRef = useRef<number>(0)
-  useEffect(() => {
-    if (!activeDragId) return
-    const onMove = (e: PointerEvent) => {
-      cursorYRef.current = e.clientY
-      cursorXRef.current = e.clientX
-    }
-    window.addEventListener('pointermove', onMove)
-    return () => window.removeEventListener('pointermove', onMove)
-  }, [activeDragId])
+  // Auto-expand collapsed groups when hovered for >= AUTO_EXPAND_MS (Figma-style).
+  const autoExpandTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastHoveredGroupRef = useRef<string | null>(null)
+  const AUTO_EXPAND_MS = 600
 
-  // Click-outside dismisses the panel (existing behavior).
+  // Click-outside dismisses the panel.
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) toggleLayerPanel()
@@ -94,8 +101,13 @@ export function LayerPanel() {
     return () => document.removeEventListener('mousedown', handler)
   }, [toggleLayerPanel])
 
-  const displayOrder = reverseSiblings(layers)
-  const sortableIds = displayOrder.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
+  // Visual order = tree, with each parent's siblings reversed so the top of
+  // panel is the topmost layer. Background is special-cased and always pinned
+  // to the bottom of the list (it's the bottom of the canvas).
+  const displayOrder = useMemo(() => reverseSiblings(layers), [layers])
+  const sortableIds = useMemo(() =>
+    displayOrder.filter((l) => l.id !== backgroundLayerId).map((l) => l.id),
+  [displayOrder, backgroundLayerId])
 
   const sensors = useSensors(
     useSensor(MouseSensor, { activationConstraint: { distance: 4 } }),
@@ -104,107 +116,125 @@ export function LayerPanel() {
 
   const onDragStart = (e: DragStartEvent) => {
     setActiveDragId(String(e.active.id))
-    setDropHint(null)
+    setOverDropId(null)
   }
+
   const onDragOver = (e: DragOverEvent) => {
     const over = e.over
-    if (!over) { setDropHint(null); return }
-    const overId = String(over.id)
-    if (overId === String(e.active.id)) { setDropHint(null); return }
-    const overMeta = layers.find((l) => l.id === overId)
-    if (!overMeta) { setDropHint(null); return }
-
-    const rect = over.rect
-    const top = rect.top
-    const h = rect.height
-    const cy = cursorYRef.current || (top + h / 2)
-    const cx = cursorXRef.current || rect.left
-    const rel = (cy - top) / h
-    const isGroup = overMeta.type === 'group'
-
-    // Outdent hint: cursor is well to the left of the over-row's left edge
-    // AND the active layer is inside a group (otherwise outdent is meaningless).
-    const activeMeta = layers.find((l) => l.id === String(e.active.id))
-    const activeInsideGroup = !!activeMeta && activeMeta.parentId != null
-    const draggedLeft = (rect.left - cx) > OUTDENT_THRESHOLD_PX
-
-    let pos: DropPos
-    if (activeInsideGroup && draggedLeft) pos = 'outdent'
-    else if (isGroup && rel >= 0.33 && rel <= 0.66) pos = 'into'
-    else if (rel < 0.5)                              pos = 'before'
-    else                                              pos = 'after'
-
-    setDropHint((prev) => (prev?.overId === overId && prev?.pos === pos ? prev : { overId, pos }))
+    if (!over) { setOverDropId(null); cancelAutoExpand(); return }
+    const id = String(over.id) as DropTargetId
+    if (id === overDropId) return
+    setOverDropId(id)
+    handleAutoExpand(id)
   }
-  const onDragEnd = (e: DragEndEvent) => {
-    const activeId = String(e.active.id)
-    const hint = dropHint
-    setActiveDragId(null)
-    setDropHint(null)
-    if (!hint || hint.overId === activeId) return
 
-    const overMeta = layers.find((l) => l.id === hint.overId)
-    const activeMeta = layers.find((l) => l.id === activeId)
-    if (!overMeta || !activeMeta) return
-
-    // Drop INTO a group: move to the end of that group's children (top of panel).
-    if (hint.pos === 'into' && overMeta.type === 'group') {
-      moveLayer(activeId, overMeta.id, Number.MAX_SAFE_INTEGER)
-      return
-    }
-
-    // Outdent: lift active out of its current group regardless of which row
-    // is under the cursor — the user's intent was "move me to a shallower
-    // level", anchored at the active layer's own current group.
-    if (hint.pos === 'outdent') {
-      useFreeformStore.getState().moveLayerOutOfGroup(activeId)
-      return
-    }
-
-    // Mask-stack drop: dropping a layer between an overlay row and a target
-    // row that share a mask relationship joins the dropped layer to the mask.
-    // We approximate this: if the row IMMEDIATELY ABOVE the drop position (in
-    // panel order) is currently masking the row below it, join the dropped
-    // layer to that same target.
-    const panelIds = sortableIds
-    const overPanelIdx = panelIds.indexOf(hint.overId)
-    if (overPanelIdx !== -1) {
-      // The visual "between" position depends on pos:
-      //   'before' = inserting ABOVE overId in panel → above is panelIds[overPanelIdx-1]
-      //   'after'  = inserting BELOW overId in panel → above is overId itself
-      const aboveId = hint.pos === 'before' ? panelIds[overPanelIdx - 1] : hint.overId
-      const belowId = hint.pos === 'before' ? hint.overId : panelIds[overPanelIdx + 1]
-      const aboveMeta = aboveId ? layers.find((l) => l.id === aboveId) : null
-      const belowMeta = belowId ? layers.find((l) => l.id === belowId) : null
-      if (aboveMeta && belowMeta && belowMeta.maskOverlayIds.includes(aboveMeta.id)) {
-        // We're dropping into the mask gap → add active as another overlay.
-        joinMask(belowMeta.id, activeId)
+  const handleAutoExpand = (id: DropTargetId) => {
+    if (id.startsWith('group::') && id.endsWith('::into')) {
+      const groupId = id.slice('group::'.length, -'::into'.length)
+      const meta = layers.find((l) => l.id === groupId)
+      if (meta?.type === 'group' && meta.collapsed) {
+        if (lastHoveredGroupRef.current === groupId) return  // already armed
+        cancelAutoExpand()
+        lastHoveredGroupRef.current = groupId
+        autoExpandTimerRef.current = setTimeout(() => {
+          toggleGroupCollapsed(groupId)
+        }, AUTO_EXPAND_MS)
         return
       }
     }
+    cancelAutoExpand()
+  }
 
-    // Otherwise: reorder/reparent relative to overMeta.
-    const parentId = overMeta.parentId
-    const parentLayers = layers.filter((l) => l.parentId === parentId)
-    const treeOrderIds = parentLayers.map((l) => l.id)
-    const filtered = treeOrderIds.filter((id) => id !== activeId)
-    const overIdx = filtered.indexOf(hint.overId)
+  const cancelAutoExpand = () => {
+    if (autoExpandTimerRef.current) clearTimeout(autoExpandTimerRef.current)
+    autoExpandTimerRef.current = null
+    lastHoveredGroupRef.current = null
+  }
 
-    // Panel reverses sibling order, so:
-    //   pos 'before' (above overRow in panel) → AFTER overRow in tree
-    //   pos 'after'  (below overRow in panel) → BEFORE overRow in tree
-    const insertAt = hint.pos === 'before' ? overIdx + 1 : overIdx
+  const onDragEnd = (e: DragEndEvent) => {
+    const activeId = String(e.active.id)
+    const target = overDropId
+    cancelAutoExpand()
+    setActiveDragId(null)
+    setOverDropId(null)
+    if (!target) return
+    if (target === `row::${activeId}::before` || target === `row::${activeId}::after`) return
 
-    if (activeMeta.parentId !== parentId) {
-      moveLayer(activeId, parentId, insertAt)
-    } else {
-      const newOrder = [...filtered]
-      newOrder.splice(insertAt, 0, activeId)
-      reorderSiblings(newOrder, parentId)
+    const activeMeta = layers.find((l) => l.id === activeId)
+    if (!activeMeta) return
+
+    // ── root::end / root::start: move to root, append (or insert at top after BG) ──
+    if (target === ROOT_END) {
+      const rootSiblings = layers.filter((l) => l.parentId == null)
+      moveLayer(activeId, null, rootSiblings.length)
+      return
+    }
+    if (target === ROOT_START) {
+      // "Top of panel" = end of root in tree order (panel reverses).
+      // BG layer is at root index 0; we insert at end of root so it shows at top.
+      const rootSiblings = layers.filter((l) => l.parentId == null)
+      moveLayer(activeId, null, rootSiblings.length)
+      return
+    }
+
+    // ── group::<id>::into ──
+    if (target.startsWith('group::') && target.endsWith('::into')) {
+      const groupId = target.slice('group::'.length, -'::into'.length)
+      const groupMeta = layers.find((l) => l.id === groupId)
+      if (!groupMeta || groupMeta.type !== 'group') return
+      // Insert at the TOP of the group's children (= end of tree-order children
+      // because panel reverses siblings).
+      const childCount = layers.filter((l) => l.parentId === groupId).length
+      moveLayer(activeId, groupId, childCount)
+      return
+    }
+
+    // ── row::<id>::before / row::<id>::after ──
+    if (target.startsWith('row::')) {
+      const parts = target.split('::')
+      const overId = parts[1]!
+      const pos = parts[2] as 'before' | 'after'
+      const overMeta = layers.find((l) => l.id === overId)
+      if (!overMeta || overId === activeId) return
+
+      // Mask-stack join: if the user dropped into the visible gap between
+      // a layer and the layer below it that is already a mask base for the
+      // layer above, attach the active layer to the SAME mask target.
+      const panelIds = displayOrder.filter((l) => l.id !== backgroundLayerId).map((l) => l.id)
+      const overPanelIdx = panelIds.indexOf(overId)
+      if (overPanelIdx !== -1) {
+        const aboveId = pos === 'before' ? panelIds[overPanelIdx - 1] : overId
+        const belowId = pos === 'before' ? overId : panelIds[overPanelIdx + 1]
+        const aboveMeta = aboveId ? layers.find((l) => l.id === aboveId) : null
+        const belowMeta = belowId ? layers.find((l) => l.id === belowId) : null
+        if (aboveMeta && belowMeta && belowMeta.maskOverlayIds.includes(aboveMeta.id)) {
+          joinMask(belowMeta.id, activeId)
+          return
+        }
+      }
+
+      const parentId = overMeta.parentId
+      const parentLayers = layers.filter((l) => l.parentId === parentId)
+      const treeOrderIds = parentLayers.map((l) => l.id)
+      const filtered = treeOrderIds.filter((id) => id !== activeId)
+      const overIdx = filtered.indexOf(overId)
+      // Panel reverses sibling order, so:
+      //   pos 'before' (above overRow in panel)  → AFTER overRow in tree
+      //   pos 'after'  (below overRow in panel)  → BEFORE overRow in tree
+      const insertAt = pos === 'before' ? overIdx + 1 : overIdx
+
+      if (activeMeta.parentId !== parentId) {
+        moveLayer(activeId, parentId, insertAt)
+      } else {
+        const newOrder = [...filtered]
+        newOrder.splice(insertAt, 0, activeId)
+        reorderSiblings(newOrder, parentId)
+      }
     }
   }
 
   const activeMeta = activeDragId ? layers.find((l) => l.id === activeDragId) : null
+  const activeDragInsideGroup = !!activeMeta && activeMeta.parentId != null
 
   return (
     <div
@@ -282,84 +312,111 @@ export function LayerPanel() {
       </div>
 
       {/* Layer list — scrollable */}
-      <div className="flex flex-col overflow-y-auto p-2 gap-0.5 min-h-0">
+      <div className="flex flex-col overflow-y-auto min-h-0">
         <DndContext
           sensors={sensors}
-          collisionDetection={closestCenter}
+          collisionDetection={collisionDetection}
           onDragStart={onDragStart}
           onDragOver={onDragOver}
           onDragEnd={onDragEnd}
+          onDragCancel={() => { cancelAutoExpand(); setActiveDragId(null); setOverDropId(null) }}
         >
           <SortableContext items={sortableIds} strategy={verticalListSortingStrategy}>
-            {displayOrder.map((meta) => {
-              const isBg = meta.id === backgroundLayerId
-              if (isBg) {
+            <div className="flex flex-col p-2 gap-0.5">
+              {/* ROOT START — pinned at very top of panel. Only an active drop
+                  target during a drag; otherwise zero-height for layout. */}
+              {activeDragId && (
+                <PanelDropZone
+                  id={ROOT_START}
+                  active={overDropId === ROOT_START}
+                  hint="Move to top of root"
+                />
+              )}
+
+              {displayOrder.map((meta) => {
+                const isBg = meta.id === backgroundLayerId
+                if (isBg) {
+                  return (
+                    <BackgroundLayerRow
+                      key={meta.id}
+                      color={backgroundLayerColor}
+                      visible={meta.visible}
+                      isActive={meta.id === activeLayerId}
+                      onSelect={() => selectLayer(meta.id, false)}
+                      onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
+                      onColorChange={setBackgroundColor}
+                    />
+                  )
+                }
+                if (meta.type === 'group') {
+                  return (
+                    <SortableGroupRow
+                      key={meta.id}
+                      id={meta.id}
+                      name={meta.name}
+                      depth={meta.depth}
+                      visible={meta.visible}
+                      opacity={meta.opacity}
+                      collapsed={!!meta.collapsed}
+                      childCount={meta.childCount ?? 0}
+                      isActive={meta.id === activeLayerId}
+                      isSelected={selectedLayerIds.includes(meta.id)}
+                      activeDragId={activeDragId}
+                      overDropId={overDropId}
+                      selectionMode={selectionMode}
+                      isReference={meta.id === referenceLayerId}
+                      maskOverlayIds={meta.maskOverlayIds}
+                      maskTargetIds={meta.maskTargetIds}
+                      onSelect={(e) => onSelect(e, meta.id, selectionMode, selectLayer, selectRange, toggleLayerInSelection)}
+                      onToggleCollapsed={() => toggleGroupCollapsed(meta.id)}
+                      onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
+                      onRename={(n) => setLayerName(meta.id, n)}
+                      onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
+                    />
+                  )
+                }
                 return (
-                  <BackgroundLayerRow
-                    key={meta.id}
-                    color={backgroundLayerColor}
-                    visible={meta.visible}
-                    isActive={meta.id === activeLayerId}
-                    onSelect={() => selectLayer(meta.id, false)}
-                    onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
-                    onColorChange={setBackgroundColor}
-                  />
-                )
-              }
-              const indicator: 'before' | 'after' | 'into' | 'outdent' | null =
-                dropHint?.overId === meta.id ? dropHint.pos : null
-              if (meta.type === 'group') {
-                return (
-                  <SortableGroupRow
+                  <SortableLayerRow
                     key={meta.id}
                     id={meta.id}
                     name={meta.name}
                     depth={meta.depth}
                     visible={meta.visible}
                     opacity={meta.opacity}
-                    collapsed={!!meta.collapsed}
-                    childCount={meta.childCount ?? 0}
+                    blendMode={meta.blendMode}
+                    layerType={meta.type}
                     isActive={meta.id === activeLayerId}
                     isSelected={selectedLayerIds.includes(meta.id)}
-                    indicator={indicator}
-                    selectionMode={selectionMode}
                     isReference={meta.id === referenceLayerId}
+                    activeDragId={activeDragId}
+                    overDropId={overDropId}
+                    selectionMode={selectionMode}
                     maskOverlayIds={meta.maskOverlayIds}
                     maskTargetIds={meta.maskTargetIds}
                     onSelect={(e) => onSelect(e, meta.id, selectionMode, selectLayer, selectRange, toggleLayerInSelection)}
-                    onToggleCollapsed={() => toggleGroupCollapsed(meta.id)}
                     onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
-                    onRename={(n) => setLayerName(meta.id, n)}
                     onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
+                    onBlendModeChange={(m) => setLayerBlendMode(meta.id, m)}
+                    onRename={(n) => setLayerName(meta.id, n)}
+                    onToggleReference={() => setReferenceLayerId(meta.id === referenceLayerId ? null : meta.id)}
                   />
                 )
-              }
-              return (
-                <SortableLayerRow
-                  key={meta.id}
-                  id={meta.id}
-                  name={meta.name}
-                  depth={meta.depth}
-                  visible={meta.visible}
-                  opacity={meta.opacity}
-                  blendMode={meta.blendMode}
-                  layerType={meta.type}
-                  isActive={meta.id === activeLayerId}
-                  isSelected={selectedLayerIds.includes(meta.id)}
-                  isReference={meta.id === referenceLayerId}
-                  indicator={indicator}
-                  selectionMode={selectionMode}
-                  maskOverlayIds={meta.maskOverlayIds}
-                  maskTargetIds={meta.maskTargetIds}
-                  onSelect={(e) => onSelect(e, meta.id, selectionMode, selectLayer, selectRange, toggleLayerInSelection)}
-                  onVisibilityToggle={() => setLayerVisibility(meta.id, !meta.visible)}
-                  onOpacityChange={(v) => setLayerOpacity(meta.id, v)}
-                  onBlendModeChange={(m) => setLayerBlendMode(meta.id, m)}
-                  onRename={(n) => setLayerName(meta.id, n)}
-                  onToggleReference={() => setReferenceLayerId(meta.id === referenceLayerId ? null : meta.id)}
+              })}
+
+              {/* ROOT END — only active during drag. This is THE big "drop-out-
+                  of-group" target. Sits at the bottom of the panel and grows
+                  visually so it's impossible to miss. */}
+              {activeDragId && activeDragInsideGroup && (
+                <RootEndDropZone active={overDropId === ROOT_END} />
+              )}
+              {activeDragId && !activeDragInsideGroup && (
+                <PanelDropZone
+                  id={ROOT_END}
+                  active={overDropId === ROOT_END}
+                  hint="Move to end of root"
                 />
-              )
-            })}
+              )}
+            </div>
           </SortableContext>
           <DragOverlay dropAnimation={null}>
             {activeMeta ? (
@@ -390,9 +447,7 @@ function onSelect(
   selectLayer(id, e.metaKey || e.ctrlKey)
 }
 
-// ─── Per-row context menu hook (right-click + long-press, both pen & mouse) ──
-// Same primitive the ContextMenu module exposed, repeated here so we can
-// drive the unified LayerContextMenu (which lives in its own component).
+// ─── Per-row context menu hook ────────────────────────────────────────────────
 
 function useLayerContextTrigger() {
   const [menu, setMenu] = React.useState<{ x: number; y: number } | null>(null)
@@ -410,55 +465,101 @@ function useLayerContextTrigger() {
   return { menu, close, onContextMenu, onPointerDown, cancelLongPress }
 }
 
-// Thin colored line indicating drop-above / drop-below.
-function DropLine({ at }: { at: 'top' | 'bottom' }) {
-  return (
-    <div
-      className="pointer-events-none absolute left-2 right-2 z-10 h-[3px] rounded-full bg-blue-400/90 shadow-[0_0_8px_rgba(96,165,250,0.55)]"
-      style={{ [at]: -1, top: at === 'top' ? -1 : undefined, bottom: at === 'bottom' ? -1 : undefined }}
-    />
-  )
-}
+// ─── Drop zones ───────────────────────────────────────────────────────────────
 
-// "Outdent" hint badge — pinned to the row's left edge while the cursor is
-// dragged far left of the row's indent, telling the user the drop will lift
-// their layer out of its current group.
-function OutdentBadge() {
+/**
+ * Thin invisible droppable above/below each row, used to capture "drop before
+ * this row" vs. "drop after this row" without ambiguity. Becomes a visible
+ * blue line when armed (cursor inside).
+ */
+function RowDropZone({
+  id, active, depth,
+}: { id: DropTargetId; active: boolean; depth: number }) {
+  const { setNodeRef } = useDroppable({ id })
   return (
     <div
-      className="pointer-events-none absolute z-20 flex items-center gap-1 rounded-md bg-amber-400/90 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-black shadow-md"
-      style={{ left: -34, top: '50%', transform: 'translateY(-50%)' }}
+      ref={setNodeRef}
+      className="relative h-1.5"
+      style={{ marginLeft: depth * INDENT_PX }}
     >
-      ←Out
+      {active && (
+        <div
+          className="pointer-events-none absolute inset-x-2 top-1/2 h-[3px] -translate-y-1/2 rounded-full bg-blue-400 shadow-[0_0_10px_rgba(96,165,250,0.7)]"
+        >
+          <span className="absolute -left-1.5 -top-1.5 h-3 w-3 rounded-full border-[3px] border-blue-400 bg-[#111]" />
+        </div>
+      )}
     </div>
   )
 }
 
-// ─── Reverse sibling order for visual display (top-most layer at top) ─────────
-
-function reverseSiblings(flat: ReturnType<typeof useFreeformStore.getState>['layers']) {
-  // Group rows by parent, reverse each group, splice back in. Maintain depth/parent.
-  const byParent = new Map<string | null, typeof flat>()
-  for (const l of flat) {
-    const arr = byParent.get(l.parentId) ?? ([] as typeof flat)
-    arr.push(l)
-    byParent.set(l.parentId, arr)
-  }
-  // Rebuild depth-first using reversed siblings at each level
-  const out: typeof flat = []
-  const walk = (parentId: string | null) => {
-    const children = byParent.get(parentId) ?? []
-    const reversed = [...children].reverse()
-    for (const c of reversed) {
-      out.push(c)
-      if (c.type === 'group' && !c.collapsed) walk(c.id)
-    }
-  }
-  walk(null)
-  return out
+/**
+ * Group "into" zone — the body of the group row acts as the drop target.
+ * When armed, the group row pulses with a ring.
+ */
+function GroupIntoZone({
+  id, active, children,
+}: { id: DropTargetId; active: boolean; children: React.ReactNode }) {
+  const { setNodeRef } = useDroppable({ id })
+  return (
+    <div ref={setNodeRef} className={active ? 'ring-2 ring-blue-400/80 bg-blue-500/8 rounded-xl' : ''}>
+      {children}
+    </div>
+  )
 }
 
-// ─── Sortable raster/vector layer row ─────────────────────────────────────────
+/** Generic panel-level drop zone (root::start/root::end). */
+function PanelDropZone({
+  id, active, hint,
+}: { id: DropTargetId; active: boolean; hint: string }) {
+  const { setNodeRef } = useDroppable({ id })
+  return (
+    <div
+      ref={setNodeRef}
+      className={[
+        'relative my-0.5 rounded-lg border border-dashed transition-colors',
+        active ? 'border-blue-400/80 bg-blue-500/10' : 'border-white/15 bg-white/2',
+      ].join(' ')}
+      style={{ minHeight: 24 }}
+    >
+      <span
+        className={[
+          'pointer-events-none absolute inset-0 flex items-center justify-center text-[10px] uppercase tracking-wider transition-opacity',
+          active ? 'text-blue-200 opacity-100' : 'text-white/30 opacity-60',
+        ].join(' ')}
+      >
+        {hint}
+      </span>
+    </div>
+  )
+}
+
+/**
+ * Special "move out of group" drop strip. Renders only while dragging a
+ * layer that's INSIDE a group, pinned to the bottom of the panel. Big and
+ * highly visible — there's no way to miss it.
+ */
+function RootEndDropZone({ active }: { active: boolean }) {
+  const { setNodeRef } = useDroppable({ id: ROOT_END })
+  return (
+    <div
+      ref={setNodeRef}
+      className={[
+        'relative mt-2 flex items-center justify-center gap-2 rounded-xl border-2 border-dashed py-3 transition-all',
+        active
+          ? 'border-amber-400/85 bg-amber-500/12 text-amber-200 scale-[1.02]'
+          : 'border-amber-400/35 bg-amber-500/5 text-amber-200/65',
+      ].join(' ')}
+    >
+      <FolderOpen size={14} />
+      <span className="text-[11px] font-semibold uppercase tracking-wider">
+        Drop here to move out of group
+      </span>
+    </div>
+  )
+}
+
+// ─── Sortable layer/group rows ────────────────────────────────────────────────
 
 function SortableLayerRow(props: LayerRowProps) {
   const {
@@ -474,12 +575,18 @@ function SortableLayerRow(props: LayerRowProps) {
   }
 
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
-      {props.indicator === 'before' && <DropLine at="top" />}
-      {props.indicator === 'outdent' && <OutdentBadge />}
-      <LayerRow {...props} />
-      {props.indicator === 'after' && <DropLine at="bottom" />}
-    </div>
+    <>
+      {/* Drop-before zone — only mounted during an active drag. */}
+      {props.activeDragId && (
+        <RowDropZone id={dropId('before', props.id)} active={props.overDropId === dropId('before', props.id)} depth={props.depth} />
+      )}
+      <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+        <LayerRow {...props} />
+      </div>
+      {props.activeDragId && (
+        <RowDropZone id={dropId('after', props.id)} active={props.overDropId === dropId('after', props.id)} depth={props.depth} />
+      )}
+    </>
   )
 }
 
@@ -496,13 +603,50 @@ function SortableGroupRow(props: GroupRowProps) {
     position: 'relative',
   }
 
+  // The group's "into" zone wraps the entire row body (not the drop-before/
+  // after slivers around it). This way dropping somewhere on the group row
+  // itself = into the group; dropping in the thin slivers above/below =
+  // sibling positioning.
   return (
-    <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
-      {props.indicator === 'before' && <DropLine at="top" />}
-      <GroupRow {...props} />
-      {props.indicator === 'after' && <DropLine at="bottom" />}
-    </div>
+    <>
+      {props.activeDragId && (
+        <RowDropZone id={dropId('before', props.id)} active={props.overDropId === dropId('before', props.id)} depth={props.depth} />
+      )}
+      <div ref={setNodeRef} style={style} {...attributes} {...listeners}>
+        <GroupIntoZone
+          id={intoId(props.id)}
+          active={props.overDropId === intoId(props.id)}
+        >
+          <GroupRow {...props} />
+        </GroupIntoZone>
+      </div>
+      {props.activeDragId && (
+        <RowDropZone id={dropId('after', props.id)} active={props.overDropId === dropId('after', props.id)} depth={props.depth} />
+      )}
+    </>
   )
+}
+
+// ─── Reverse sibling order for visual display (top-most layer at top) ─────────
+
+function reverseSiblings(flat: ReturnType<typeof useFreeformStore.getState>['layers']) {
+  const byParent = new Map<string | null, typeof flat>()
+  for (const l of flat) {
+    const arr = byParent.get(l.parentId) ?? ([] as typeof flat)
+    arr.push(l)
+    byParent.set(l.parentId, arr)
+  }
+  const out: typeof flat = []
+  const walk = (parentId: string | null) => {
+    const children = byParent.get(parentId) ?? []
+    const reversed = [...children].reverse()
+    for (const c of reversed) {
+      out.push(c)
+      if (c.type === 'group' && !c.collapsed) walk(c.id)
+    }
+  }
+  walk(null)
+  return out
 }
 
 // ─── Background layer row ──────────────────────────────────────────────────────
@@ -569,13 +713,12 @@ interface LayerRowProps {
   id: string; name: string; depth: number
   visible: boolean; opacity: number; blendMode: string; layerType: 'raster' | 'vector'
   isActive: boolean; isSelected: boolean; isReference: boolean
-  /** Cursor-aware drop indicator state (or null when no drop is hinted here). */
-  indicator: 'before' | 'after' | 'into' | 'outdent' | null
-  /** When the panel is in selection mode, rows show a checkbox column. */
+  /** Active dnd-kit drag id, or null when nothing is dragging. */
+  activeDragId: string | null
+  /** Active drop target id (matches the `id` prop on the over droppable). */
+  overDropId: DropTargetId | null
   selectionMode: boolean
-  /** Ids of layers used as overlays clipping this row's layer. */
   maskOverlayIds: string[]
-  /** Ids of layers this row's layer is acting as a mask FOR. */
   maskTargetIds: string[]
   onSelect: (e: React.MouseEvent) => void
   onVisibilityToggle: () => void
@@ -589,7 +732,7 @@ function LayerRow(props: LayerRowProps) {
   const {
     id, name, visible, opacity, blendMode, layerType,
     isActive, isSelected, isReference,
-    indicator, selectionMode, maskOverlayIds, maskTargetIds,
+    selectionMode, maskOverlayIds, maskTargetIds,
     onSelect, onVisibilityToggle,
     onOpacityChange, onBlendModeChange, onRename, onToggleReference,
   } = props
@@ -609,11 +752,6 @@ function LayerRow(props: LayerRowProps) {
     if (editing) { setDraft(name); inputRef.current?.focus(); inputRef.current?.select() }
   }, [editing, name])
 
-  // In our clipping-mask convention:
-  //   maskOverlayIds non-empty  → this layer is the CLIPPED one ("CLIP" badge,
-  //                               it appears only where its base has alpha)
-  //   maskTargetIds non-empty   → this layer is the alpha SOURCE / BASE for
-  //                               some clipped layer above ("BASE" badge)
   const isClipped = maskOverlayIds.length > 0
   const isBaseForOthers = maskTargetIds.length > 0
 
@@ -626,7 +764,6 @@ function LayerRow(props: LayerRowProps) {
             : isSelected ? 'bg-white/5 ring-1 ring-white/10'
             : 'hover:bg-white/4',
           isReference ? 'ring-1 ring-amber-400/40' : '',
-          indicator === 'into' ? 'ring-2 ring-blue-400/60 bg-blue-500/8' : '',
         ].join(' ')}
         onContextMenu={onContextMenu}
         onPointerDown={onPointerDown}
@@ -650,7 +787,6 @@ function LayerRow(props: LayerRowProps) {
             </button>
           )}
 
-          {/* Layer type badge */}
           <span className={[
             'shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider',
             layerType === 'vector' ? 'bg-purple-500/20 text-purple-400' : 'bg-blue-500/15 text-blue-400/80',
@@ -658,9 +794,6 @@ function LayerRow(props: LayerRowProps) {
             {layerType === 'vector' ? 'VEC' : 'PX'}
           </span>
 
-          {/* Mask role badges — Procreate convention:
-              CLIP = this layer is clipped to the base below;
-              BASE = this layer's alpha is the clipping shape for layers above */}
           {isClipped && (
             <span title="Clipping mask — this layer only shows where the base below has alpha"
                   className="inline-flex shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold bg-sky-500/20 text-sky-300">
@@ -763,7 +896,8 @@ interface GroupRowProps {
   id: string; name: string; depth: number
   visible: boolean; opacity: number; collapsed: boolean; childCount: number
   isActive: boolean; isSelected: boolean
-  indicator: 'before' | 'after' | 'into' | 'outdent' | null
+  activeDragId: string | null
+  overDropId: DropTargetId | null
   selectionMode: boolean
   isReference: boolean
   maskOverlayIds: string[]
@@ -778,7 +912,7 @@ interface GroupRowProps {
 function GroupRow(props: GroupRowProps) {
   const {
     id, name, visible, opacity, collapsed, childCount,
-    isActive, isSelected, indicator, selectionMode,
+    isActive, isSelected, selectionMode,
     isReference, maskOverlayIds, maskTargetIds,
     onSelect, onToggleCollapsed, onVisibilityToggle, onRename, onOpacityChange,
   } = props
@@ -809,7 +943,6 @@ function GroupRow(props: GroupRowProps) {
             : isSelected ? 'bg-white/5 ring-1 ring-white/10'
             : 'hover:bg-white/4',
           isReference ? 'ring-1 ring-amber-400/40' : '',
-          indicator === 'into' ? 'ring-2 ring-blue-400/60 bg-blue-500/8' : '',
         ].join(' ')}
         onContextMenu={onContextMenu}
         onPointerDown={onPointerDown}
@@ -913,7 +1046,7 @@ function GroupRow(props: GroupRowProps) {
   )
 }
 
-// ─── Panel-scoped animations (in-place keyframes, no extra CSS file) ─────────
+// ─── Panel-scoped animations ──────────────────────────────────────────────────
 
 function PanelStyles() {
   return (

@@ -41,6 +41,13 @@ export class BoardHooks {
    * Use `kind` to discriminate. UI listeners filter on it.
    */
   readonly toolPreview = new Hook<{ tool: string; kind: string; data: Record<string, number | string | boolean> }>()
+  /**
+   * Fired whenever SelectTool's selection set, edit mode, or active-layer
+   * focus changes. UI panels (e.g. the vector style sidebar) tap this to
+   * refresh instead of depending on render-driven afterRender (selection
+   * changes don't mark layers dirty, so afterRender wouldn't fire).
+   */
+  readonly selectionChanged = new Hook<{ ids: string[]; layerId: string | null }>()
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   readonly destroy = new Hook<any>()
 }
