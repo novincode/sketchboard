@@ -8,33 +8,108 @@ import type {
  */
 export type CoveragePredicate = (x: number, y: number) => boolean
 
+/**
+ * Binary-search the exact crossing point on the line segment from `from`
+ * (outside coverage) to `to` (inside coverage), so we can drop a synthetic
+ * point AT the eraser/lasso boundary. Without this, the cut happens at the
+ * last fully-outside sample which can be a noticeable fraction of the
+ * segment away from the actual disk edge — looking like "too much was
+ * erased".
+ *
+ * `iters = 6` gives 1/64 = ~1.5% of segment-length precision which is well
+ * below stroke thickness for typical brush sizes. Cheap and good enough.
+ */
+function findBoundary(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  isCovered: CoveragePredicate,
+  iters = 6,
+): { x: number; y: number; t: number } {
+  // Invariant: isCovered(from) === false, isCovered(to) === true.
+  let lo = 0, hi = 1
+  for (let i = 0; i < iters; i++) {
+    const mid = (lo + hi) / 2
+    const mx = from.x + (to.x - from.x) * mid
+    const my = from.y + (to.y - from.y) * mid
+    if (isCovered(mx, my)) hi = mid
+    else lo = mid
+  }
+  const t = (lo + hi) / 2
+  return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t, t }
+}
+
 // ─── Stroke splitting ────────────────────────────────────────────────────────
 
 /**
  * Walk the stroke's points and split it at every contiguous run of covered
- * samples. Returns an array of sub-strokes (each one or more outside-points).
- * Single-point runs are dropped — a stroke needs at least two points to be
- * renderable. If `keepInsidePoints` is provided, the points removed from each
- * gap are collected into a sibling list (mirror-image of the kept set), used
- * by the lasso "select inside" path.
+ * samples. Returns an array of sub-strokes (each two or more outside-points).
+ *
+ * Transitions are interpolated: when we cross from outside→inside we drop a
+ * synthetic point on the boundary as the LAST point of the kept run; when we
+ * cross from inside→outside we drop a synthetic boundary point as the FIRST
+ * point of the new run. This makes the cut land at the eraser edge rather
+ * than at the previous stored sample — the stroke ends right at the disk
+ * boundary, simulating a clean knife cut.
+ *
+ * If `keepInsidePoints` is provided, the points removed from each gap are
+ * collected into a sibling list (mirror-image of the kept set), used by the
+ * lasso "select inside" path. Inside runs also get boundary interpolation
+ * so the lifted selection lines up with the kept piece exactly.
  */
 export function splitStrokePoints(
   points: VectorStrokePoint[],
   isCovered: CoveragePredicate,
   keepInsidePoints?: { out: VectorStrokePoint[][] },
 ): VectorStrokePoint[][] {
+  if (points.length === 0) return []
+  const lerpPoint = (a: VectorStrokePoint, b: VectorStrokePoint, t: number): VectorStrokePoint => ({
+    x: a.x + (b.x - a.x) * t,
+    y: a.y + (b.y - a.y) * t,
+    pressure: a.pressure + (b.pressure - a.pressure) * t,
+  })
+
   const outside: VectorStrokePoint[][] = []
   const inside: VectorStrokePoint[][] = []
   let curOut: VectorStrokePoint[] = []
   let curIn: VectorStrokePoint[] = []
-  for (const p of points) {
-    if (isCovered(p.x, p.y)) {
-      if (curOut.length) { outside.push(curOut); curOut = [] }
+
+  let prev = points[0]!
+  let prevCovered = isCovered(prev.x, prev.y)
+  if (prevCovered) curIn.push(prev)
+  else curOut.push(prev)
+
+  for (let i = 1; i < points.length; i++) {
+    const p = points[i]!
+    const cov = isCovered(p.x, p.y)
+    if (cov === prevCovered) {
+      if (cov) curIn.push(p)
+      else curOut.push(p)
+    } else if (cov) {
+      // outside → inside: close out the kept run with a boundary point
+      const b = findBoundary(prev, p, isCovered)
+      const bPoint = lerpPoint(prev, p, b.t)
+      curOut.push(bPoint)
+      outside.push(curOut)
+      curOut = []
+      // start the inside run AT the boundary too, so the lasso lift has
+      // the same edge as the kept piece.
+      curIn.push(bPoint)
       curIn.push(p)
     } else {
-      if (curIn.length) { inside.push(curIn); curIn = [] }
+      // inside → outside: close out the inside run with a boundary point
+      const b = findBoundary(p, prev, isCovered)
+      // b is parametrised from p (outside) toward prev (inside) — flip:
+      // actual crossing from inside→outside corresponds to (1 - b.t) from
+      // prev toward p. Re-derive using lerpPoint on the inside→outside leg.
+      const bPoint = lerpPoint(prev, p, 1 - b.t)
+      curIn.push(bPoint)
+      inside.push(curIn)
+      curIn = []
+      curOut.push(bPoint)
       curOut.push(p)
     }
+    prev = p
+    prevCovered = cov
   }
   if (curOut.length) outside.push(curOut)
   if (curIn.length) inside.push(curIn)
@@ -50,14 +125,19 @@ export function splitStrokePoints(
  * The original closed flag is lost (split paths are always open). Bezier
  * smoothness is lost at split points (new anchors are corners).
  *
+ * Like stroke splitting, transitions are boundary-interpolated so the cut
+ * lands at the eraser edge — not at the last fully-outside sample. With
+ * default density=32 + boundary interpolation, the visual cut is sharp
+ * even on long bezier segments.
+ *
  * `density` controls samples per segment — higher = more accurate cuts but
- * more anchors. Default 24 matches our hit-test density (20) with overhead.
+ * more anchors. Default 32 balances fidelity against anchor count.
  */
 export function splitPathAnchors(
   anchors: BezierAnchor[],
   closed: boolean,
   isCovered: CoveragePredicate,
-  density = 24,
+  density = 32,
   keepInsideAnchors?: { out: BezierAnchor[][] },
 ): BezierAnchor[][] {
   if (anchors.length < 2) {
@@ -68,9 +148,8 @@ export function splitPathAnchors(
     return []
   }
 
-  // Flatten to (x, y) samples first; track segment boundaries so we can
-  // re-emit anchors at the sample positions (corner type). For each segment
-  // from anchor i-1 → i, we sample at j/density for j = 0..density.
+  // Flatten to (x, y) samples first. Each segment from anchor i-1 → i is
+  // sampled at j/density for j = 0..density.
   type Sample = { x: number; y: number }
   const samples: Sample[] = []
   const pushBezierSamples = (prev: BezierAnchor, curr: BezierAnchor, includeStart: boolean) => {
@@ -93,39 +172,51 @@ export function splitPathAnchors(
     pushBezierSamples(anchors[anchors.length - 1]!, anchors[0]!, false)
   }
 
-  // Group samples into runs of NOT-covered. Each run becomes a polyline path.
+  // Walk samples with boundary interpolation at each transition (same
+  // pattern as splitStrokePoints).
   const outsideRuns: Sample[][] = []
   const insideRuns: Sample[][] = []
   let curOut: Sample[] = []
   let curIn: Sample[] = []
-  for (const s of samples) {
-    if (isCovered(s.x, s.y)) {
-      if (curOut.length) { outsideRuns.push(curOut); curOut = [] }
-      curIn.push(s)
+
+  let prev = samples[0]!
+  let prevCovered = isCovered(prev.x, prev.y)
+  if (prevCovered) curIn.push(prev)
+  else curOut.push(prev)
+
+  for (let i = 1; i < samples.length; i++) {
+    const s = samples[i]!
+    const cov = isCovered(s.x, s.y)
+    if (cov === prevCovered) {
+      if (cov) curIn.push(s)
+      else curOut.push(s)
+    } else if (cov) {
+      const b = findBoundary(prev, s, isCovered)
+      const bPoint = { x: prev.x + (s.x - prev.x) * b.t, y: prev.y + (s.y - prev.y) * b.t }
+      curOut.push(bPoint)
+      outsideRuns.push(curOut); curOut = []
+      curIn.push(bPoint); curIn.push(s)
     } else {
-      if (curIn.length) { insideRuns.push(curIn); curIn = [] }
-      curOut.push(s)
+      const b = findBoundary(s, prev, isCovered)
+      const tBack = 1 - b.t
+      const bPoint = { x: prev.x + (s.x - prev.x) * tBack, y: prev.y + (s.y - prev.y) * tBack }
+      curIn.push(bPoint)
+      insideRuns.push(curIn); curIn = []
+      curOut.push(bPoint); curOut.push(s)
     }
+    prev = s
+    prevCovered = cov
   }
   if (curOut.length) outsideRuns.push(curOut)
   if (curIn.length) insideRuns.push(curIn)
 
-  const toAnchors = (run: Sample[]): BezierAnchor[] => {
-    // Drop overly-dense runs by keeping at most ~density/2 anchors per
-    // original segment — avoids blowing up node count on big paths.
-    const stride = Math.max(1, Math.floor(density / 4))
-    const result: BezierAnchor[] = []
-    for (let i = 0; i < run.length; i += stride) {
-      const s = run[i]!
-      result.push({ x: s.x, y: s.y, handleIn: null, handleOut: null, type: 'corner' })
-    }
-    // Always include the last sample so we don't lose the run's end.
-    const last = run[run.length - 1]!
-    if (result.length === 0 || result[result.length - 1]!.x !== last.x || result[result.length - 1]!.y !== last.y) {
-      result.push({ x: last.x, y: last.y, handleIn: null, handleOut: null, type: 'corner' })
-    }
-    return result
-  }
+  // Convert a sample run to anchor list. We keep ALL samples so the shape of
+  // the curve survives the cut faithfully — no decimation. Callers that want
+  // a sparser representation can simplify afterwards via Ramer-Douglas-Peucker.
+  // (Previously a stride=density/4 was used; that was the visible "chunk
+  // missing" feel the user reported on long segments.)
+  const toAnchors = (run: Sample[]): BezierAnchor[] =>
+    run.map((s) => ({ x: s.x, y: s.y, handleIn: null, handleOut: null, type: 'corner' as const }))
 
   if (keepInsideAnchors) {
     keepInsideAnchors.out = insideRuns.filter((r) => r.length >= 2).map(toAnchors)
@@ -189,21 +280,16 @@ export function splitStroke(stroke: VectorStroke, isCovered: CoveragePredicate):
 }
 
 export function splitPath(path: VectorPath, isCovered: CoveragePredicate): SplitResult<BezierAnchor[]> | null {
-  // Quick reject: sample only anchors as a cheap pre-test. False negatives
-  // (curve dips into coverage between anchors) get caught by the full sample
-  // pass — which still runs after this test passes. False positives are fine
-  // (we just do extra work; result is correct).
-  let any = false
-  for (const a of path.anchors) { if (isCovered(a.x, a.y)) { any = true; break } }
-  if (!any) {
-    // Anchors are all outside. Curve might still cross; do the full pass.
-    const insideBucket: { out: BezierAnchor[][] } = { out: [] }
-    const keep = splitPathAnchors(path.anchors, path.closed, isCovered, 24, insideBucket)
-    if (insideBucket.out.length === 0 && keep.length === 0) return null
-    if (insideBucket.out.length === 0 && keep.length === 1 && keep[0]!.length === path.anchors.length) return null
-    return { keep, cut: insideBucket.out, changed: insideBucket.out.length > 0 }
-  }
+  // Anchor pre-test is a fast reject for cases where neither the anchors
+  // nor the curve cross coverage. If anchors miss but the curve might still
+  // cross (e.g. a long bezier dipping into the disk between two anchors),
+  // we do the full pass and detect coverage from samples.
+  let anyAnchor = false
+  for (const a of path.anchors) { if (isCovered(a.x, a.y)) { anyAnchor = true; break } }
   const insideBucket: { out: BezierAnchor[][] } = { out: [] }
-  const keep = splitPathAnchors(path.anchors, path.closed, isCovered, 24, insideBucket)
-  return { keep, cut: insideBucket.out, changed: true }
+  const keep = splitPathAnchors(path.anchors, path.closed, isCovered, 32, insideBucket)
+  if (!anyAnchor && insideBucket.out.length === 0) return null
+  // changed = at least one cut happened OR no kept run preserves the original shape
+  const changed = insideBucket.out.length > 0 || keep.length !== 1 || keep[0]!.length !== path.anchors.length
+  return { keep, cut: insideBucket.out, changed }
 }
