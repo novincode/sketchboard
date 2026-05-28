@@ -1,5 +1,84 @@
 import type { BezierAnchor, VectorShape } from '../layers/VectorLayer'
 
+/** Cubic-bezier circle approximation constant (~0.5523). */
+const KAPPA = 0.5522847498307933
+
+/**
+ * Apply Figma-style uniform corner radius to an arbitrary path's anchors.
+ *
+ * For each anchor that's a sharp corner (no incoming OR outgoing handle),
+ * we replace it with TWO anchors offset along the incoming/outgoing edges
+ * by `radius`, with bezier handles forming a circular arc. Anchors that
+ * already have handles (smoothed by the pen tool) are left untouched.
+ *
+ * `closed` mirrors the source path's flag — closed paths round the seam
+ * vertex too; open paths leave the first/last anchors as corners since
+ * they have no "previous" or "next" edge to offset along.
+ *
+ * Result is purely a function of (anchors, closed, radius) — calling it
+ * twice with the same inputs produces the same output. This means the
+ * caller can keep the user's original `baseAnchors` around and re-derive
+ * the rounded `anchors` whenever the radius slider moves; sliding from
+ * 0 → 20 → 5 → 0 always recovers exactly the original shape.
+ */
+export function roundPathCorners(
+  anchors: BezierAnchor[],
+  closed: boolean,
+  radius: number,
+): BezierAnchor[] {
+  if (radius <= 0 || anchors.length < 3) {
+    return anchors.map((a) => ({
+      ...a,
+      handleIn: a.handleIn ? { ...a.handleIn } : null,
+      handleOut: a.handleOut ? { ...a.handleOut } : null,
+    }))
+  }
+  const n = anchors.length
+  const out: BezierAnchor[] = []
+  for (let i = 0; i < n; i++) {
+    const V = anchors[i]!
+    const isSharp = !V.handleIn && !V.handleOut
+    const hasPrev = closed || i > 0
+    const hasNext = closed || i < n - 1
+    if (!isSharp || !hasPrev || !hasNext) {
+      out.push({
+        ...V,
+        handleIn: V.handleIn ? { ...V.handleIn } : null,
+        handleOut: V.handleOut ? { ...V.handleOut } : null,
+      })
+      continue
+    }
+    const P = anchors[(i - 1 + n) % n]!
+    const N = anchors[(i + 1) % n]!
+    const inLen  = Math.hypot(V.x - P.x, V.y - P.y)
+    const outLen = Math.hypot(N.x - V.x, N.y - V.y)
+    const r = Math.min(radius, inLen / 2, outLen / 2)
+    if (r <= 0.01) {
+      out.push({ ...V, handleIn: null, handleOut: null, type: 'corner' })
+      continue
+    }
+    const inUx = (P.x - V.x) / inLen, inUy = (P.y - V.y) / inLen
+    const outUx = (N.x - V.x) / outLen, outUy = (N.y - V.y) / outLen
+    const aStart = { x: V.x + inUx * r, y: V.y + inUy * r }
+    const aEnd   = { x: V.x + outUx * r, y: V.y + outUy * r }
+    // KAPPA approximates a quarter-circle bezier; for non-90° corners it
+    // still produces a visually clean arc within ~0.6% radius error.
+    out.push({
+      x: aStart.x, y: aStart.y,
+      handleIn: null,
+      handleOut: { x: aStart.x - inUx * r * KAPPA, y: aStart.y - inUy * r * KAPPA },
+      type: 'corner',
+    })
+    out.push({
+      x: aEnd.x, y: aEnd.y,
+      handleIn: { x: aEnd.x - outUx * r * KAPPA, y: aEnd.y - outUy * r * KAPPA },
+      handleOut: null,
+      type: 'corner',
+    })
+  }
+  return out
+}
+
 /**
  * Regenerate the BezierAnchor[] for a VectorPath from its shape descriptor.
  *
@@ -21,9 +100,6 @@ export function buildShapeAnchors(shape: VectorShape): BezierAnchor[] {
 }
 
 // ─── Rectangle (with optional per-corner radius) ──────────────────────────────
-
-/** Cubic-bezier circle approximation constant (~0.5523). */
-const KAPPA = 0.5522847498307933
 
 function buildRoundedRect(s: VectorShape): BezierAnchor[] {
   const x = s.x, y = s.y, w = s.width, h = s.height
@@ -70,9 +146,15 @@ function buildRoundedRect(s: VectorShape): BezierAnchor[] {
       outDelta = { x: 0, y: k }
       inDelta  = { x: k, y: 0 }
     } else {                     // BL
+      // aStart sits ABOVE the BL corner on the left edge; its handleOut
+      // must pull DOWN toward the corner (positive y), not up. Same logic
+      // as the other quadrants — the handle deltas always point toward
+      // the corner vertex. The previous (0, -k) flipped the BL handle
+      // away from the corner, producing the misaligned "left side looks
+      // weird" the user reported.
       aStart = { x: cx,     y: cy - r }
       aEnd   = { x: cx + r, y: cy }
-      outDelta = { x: 0, y: -k }
+      outDelta = { x: 0, y: k }
       inDelta  = { x: -k, y: 0 }
     }
     anchors.push({

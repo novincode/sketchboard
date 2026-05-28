@@ -158,17 +158,23 @@ export function splitPathAnchors(
   }
 
   // Flatten to (x, y) samples first. For each segment, use bezier samples
-  // ONLY if at least one endpoint has a handle (otherwise it's a straight
-  // line — sampling N points along it adds no information).
+  // for true curves; STRAIGHT segments get a coarse linear sub-sample so a
+  // disk sitting mid-edge actually registers coverage (the previous
+  // endpoint-only fast path silently missed those eraser hits — the user
+  // could drag the eraser along a long straight side and nothing happened
+  // until the disk reached a corner anchor).
   type Sample = { x: number; y: number }
   const samples: Sample[] = []
   const isStraight = (prev: BezierAnchor, curr: BezierAnchor) =>
     !prev.handleOut && !curr.handleIn
+  const STRAIGHT_SAMPLES = 6
   const pushSegment = (prev: BezierAnchor, curr: BezierAnchor, includeStart: boolean) => {
     if (includeStart) samples.push({ x: prev.x, y: prev.y })
     if (isStraight(prev, curr)) {
-      // No need to sample — endpoint is sufficient.
-      samples.push({ x: curr.x, y: curr.y })
+      for (let j = 1; j <= STRAIGHT_SAMPLES; j++) {
+        const t = j / STRAIGHT_SAMPLES
+        samples.push({ x: prev.x + (curr.x - prev.x) * t, y: prev.y + (curr.y - prev.y) * t })
+      }
       return
     }
     const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
@@ -187,6 +193,15 @@ export function splitPathAnchors(
   }
   if (closed && anchors.length >= 2) {
     pushSegment(anchors[anchors.length - 1]!, anchors[0]!, false)
+    // Drop the trailing duplicate (closing seg's last sample == samples[0]
+    // by construction). Without this, a closed shape with no actual cut
+    // still triggers replacement because the kept-run length differs from
+    // the anchor count by 1.
+    const lastS = samples[samples.length - 1]
+    const firstS = samples[0]
+    if (lastS && firstS && Math.abs(lastS.x - firstS.x) < 1e-6 && Math.abs(lastS.y - firstS.y) < 1e-6) {
+      samples.pop()
+    }
   }
 
   // Walk samples with boundary interpolation at each transition (same
@@ -226,6 +241,33 @@ export function splitPathAnchors(
   }
   if (curOut.length) outsideRuns.push(curOut)
   if (curIn.length) insideRuns.push(curIn)
+
+  // ── Closed-loop wrap-around fix ─────────────────────────────────────────
+  // For a CLOSED path, the walk above produces a START run + END run that
+  // are actually one continuous run going around the loop. Joining them
+  // turns "rectangle cut on one edge → 2 disconnected polylines stacked
+  // back together" into the correct "rectangle cut on one edge → 1 open
+  // polyline starting at the cut, going around, ending at the cut".
+  //
+  // Without this fix, every eraser stamp on a closed shape doubled the
+  // visible piece count, and the user reported "6 instances stacked".
+  //
+  // We can only safely join when the END coverage matches the START
+  // coverage (same continuous run wrapping the seam). When they differ,
+  // there's a hidden transition between samples[N-1] and samples[0] that
+  // we don't synthesise; RDP simplification absorbs the small gap.
+  if (closed) {
+    const startCovered = isCovered(samples[0]!.x, samples[0]!.y)
+    if (startCovered === prevCovered) {
+      const list = startCovered ? insideRuns : outsideRuns
+      if (list.length >= 2) {
+        const head = list[0]!
+        const tail = list[list.length - 1]!
+        list[0] = tail.concat(head)
+        list.length -= 1
+      }
+    }
+  }
 
   // Simplify each kept run with RDP — drops collinear/near-collinear samples
   // so a 200-sample run from a bezier ellipse becomes ~12 anchors that still

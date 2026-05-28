@@ -73,6 +73,18 @@ export interface VectorPath {
   compositeOperation: GlobalCompositeOperation
   /** Optional shape descriptor enabling shape-aware editing. See {@link VectorShape}. */
   shape?: VectorShape
+  /**
+   * Figma-style "round all corners" radius for free-form pen paths. When
+   * set, the renderer-fed `anchors` are the ROUNDED version of `baseAnchors`
+   * — the source-of-truth anchors that survive radius changes. Sliding the
+   * radius from 0 → 20 → 5 → 0 always recovers exactly the original shape.
+   *
+   * Pen-drawn paths use this; ShapeTool paths use the `shape` descriptor
+   * instead (which has its own per-corner radius semantics).
+   */
+  cornerRadius?: number
+  /** Pristine anchors before corner-rounding. Required when `cornerRadius` > 0. */
+  baseAnchors?: BezierAnchor[]
 }
 
 // ─── Layer ────────────────────────────────────────────────────────────────────

@@ -26,16 +26,18 @@ export function VectorStylePanel() {
 
   const [style, setStyle] = useState<ReturnType<SelectTool['getElementStyle']>>(null)
   const [shape, setShape] = useState<VectorShape | null>(null)
+  const [pathRadius, setPathRadius] = useState<number | null>(null)
   const [hasRasterLasso, setHasRasterLasso] = useState(false)
 
   useEffect(() => {
-    if (!board) { setStyle(null); setShape(null); setHasRasterLasso(false); return }
+    if (!board) { setStyle(null); setShape(null); setPathRadius(null); setHasRasterLasso(false); return }
     const select = board.getTool<SelectTool>('select')
-    if (!select) { setStyle(null); setShape(null); setHasRasterLasso(false); return }
+    if (!select) { setStyle(null); setShape(null); setPathRadius(null); setHasRasterLasso(false); return }
 
     const refresh = () => {
       setStyle(select.getElementStyle())
       setShape(select.getSelectedShape())
+      setPathRadius(select.getSelectedPathCornerRadius())
       setHasRasterLasso(select.getRasterLassoSelection() !== null)
     }
     const unsub = board.hooks.selectionChanged.tap('vector-style-sidebar', refresh)
@@ -53,12 +55,13 @@ export function VectorStylePanel() {
   if (!toolOk) return null
   if (!style && !hasRasterLasso) return null
 
-  return <Sidebar style={style} shape={shape} hasRasterLasso={hasRasterLasso} board={board!} />
+  return <Sidebar style={style} shape={shape} pathRadius={pathRadius} hasRasterLasso={hasRasterLasso} board={board!} />
 }
 
-function Sidebar({ style, shape, hasRasterLasso, board }: {
+function Sidebar({ style, shape, pathRadius, hasRasterLasso, board }: {
   style: ReturnType<SelectTool['getElementStyle']>
   shape: VectorShape | null
+  pathRadius: number | null
   hasRasterLasso: boolean
   board: NonNullable<ReturnType<typeof useFreeformStore.getState>['board']>
 }) {
@@ -157,6 +160,22 @@ function Sidebar({ style, shape, hasRasterLasso, board }: {
                 />
               </FieldGroup>
             </>
+          )}
+
+          {/* Free-form pen-tool path corner radius — no shape descriptor.
+              Slider regenerates anchors from a stashed `baseAnchors`
+              snapshot so sliding back to 0 recovers the original geometry. */}
+          {!shape && pathRadius !== null && (
+            <FieldGroup label="Corner radius">
+              <DraggableInput
+                label="All"
+                value={Math.round(pathRadius)}
+                min={0}
+                max={200}
+                unit="px"
+                onChange={(v) => select.setSelectedPathCornerRadius(v)}
+              />
+            </FieldGroup>
           )}
 
           <FieldGroup label="Actions">

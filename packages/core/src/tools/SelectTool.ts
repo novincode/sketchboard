@@ -3,7 +3,7 @@ import type { PointerData } from '../types'
 import { VectorLayer } from '../layers/VectorLayer'
 import { RasterLayer } from '../layers/RasterLayer'
 import type { BezierAnchor, VectorStroke, VectorPath, VectorShape } from '../layers/VectorLayer'
-import { buildShapeAnchors } from '../shapes/shapeAnchors'
+import { buildShapeAnchors, roundPathCorners } from '../shapes/shapeAnchors'
 import type { Camera } from '../Camera'
 
 /** Persistent raster "lasso" selection — polygon in layer-local coords. */
@@ -1033,6 +1033,82 @@ export class SelectTool extends Tool {
       redo: () => {
         const p = (layer as VectorLayer).paths.find((p) => p.id === id)
         if (p) { p.shape = afterShape; p.anchors = afterAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+        board.markDirty(); this.scheduleOverlayRedraw()
+      },
+    })
+    return true
+  }
+
+  /**
+   * Read the corner radius applied to the selected pen-tool path (free-form
+   * VectorPath without `shape` metadata). Returns null when no single such
+   * path is selected. Used to seed the sidebar slider.
+   */
+  getSelectedPathCornerRadius(): number | null {
+    if (!this.board) return null
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return null
+    const ids = this.getSelectedIds()
+    if (ids.length !== 1) return null
+    const p = layer.paths.find((p) => p.id === ids[0])
+    if (!p || p.shape) return null   // shape paths use setSelectedShape instead
+    return p.cornerRadius ?? 0
+  }
+
+  /**
+   * Apply a uniform corner radius to the selected pen-tool path. The path's
+   * pristine anchors are stashed in `baseAnchors` on first use so the
+   * operation is fully reversible — sliding from 0 → 20 → 0 always
+   * recovers the original geometry.
+   *
+   * Single history entry per call so the sidebar slider produces a clean
+   * undo stack when the user releases.
+   */
+  setSelectedPathCornerRadius(radius: number): boolean {
+    if (!this.board) return false
+    const board = this.board
+    const layer = board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return false
+    const ids = this.getSelectedIds()
+    if (ids.length !== 1) return false
+    const id = ids[0]!
+    const path = layer.paths.find((p) => p.id === id)
+    if (!path || path.shape) return false
+
+    const beforeRadius = path.cornerRadius
+    const beforeAnchors = path.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+    const beforeBase = path.baseAnchors?.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+
+    // Ensure baseAnchors snapshots the user's original geometry on first
+    // application. We deliberately snapshot CURRENT anchors (not previous
+    // baseAnchors) when there's no existing radius, so a path edited by
+    // hand before rounding starts from the user's latest layout.
+    const base = path.baseAnchors ?? beforeAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+    path.baseAnchors = base
+    path.cornerRadius = radius
+    path.anchors = roundPathCorners(base, path.closed, Math.max(0, radius))
+
+    const afterRadius = path.cornerRadius
+    const afterAnchors = path.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+    const afterBase = path.baseAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+
+    board.markDirty()
+    this.scheduleOverlayRedraw()
+    board.history.push({
+      undo: () => {
+        const p = (layer as VectorLayer).paths.find((p) => p.id === id)
+        if (!p) return
+        p.cornerRadius = beforeRadius
+        p.baseAnchors = beforeBase
+        p.anchors = beforeAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+        board.markDirty(); this.scheduleOverlayRedraw()
+      },
+      redo: () => {
+        const p = (layer as VectorLayer).paths.find((p) => p.id === id)
+        if (!p) return
+        p.cornerRadius = afterRadius
+        p.baseAnchors = afterBase.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+        p.anchors = afterAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
         board.markDirty(); this.scheduleOverlayRedraw()
       },
     })
