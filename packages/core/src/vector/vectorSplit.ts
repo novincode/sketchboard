@@ -125,13 +125,21 @@ export function splitStrokePoints(
  * The original closed flag is lost (split paths are always open). Bezier
  * smoothness is lost at split points (new anchors are corners).
  *
- * Like stroke splitting, transitions are boundary-interpolated so the cut
- * lands at the eraser edge — not at the last fully-outside sample. With
- * default density=32 + boundary interpolation, the visual cut is sharp
- * even on long bezier segments.
+ * Performance: straight segments (no bezier handles on either endpoint)
+ * bypass the bezier sampler entirely — we just include the endpoint. This
+ * is critical for *repeated* eraser strokes: the first stamp on a curve
+ * produces corner-only anchors, and every subsequent stamp on that fragment
+ * would have used 32 samples per segment, blowing up anchor count
+ * exponentially and hanging the eraser on filled shapes.
  *
- * `density` controls samples per segment — higher = more accurate cuts but
- * more anchors. Default 32 balances fidelity against anchor count.
+ * After splitting we also Ramer-Douglas-Peucker simplify each kept run so
+ * the result is compact — no more "double-click to edit and see 200
+ * non-needed anchor circles" after a lasso cut.
+ *
+ * `density` controls samples per CURVED segment. Default 32 balances
+ * fidelity against anchor count for true bezier curves.
+ * `simplifyEpsilon` is the RDP tolerance in layer-local pixels (0.5 = sub-
+ * pixel; rendering can't tell the difference).
  */
 export function splitPathAnchors(
   anchors: BezierAnchor[],
@@ -139,6 +147,7 @@ export function splitPathAnchors(
   isCovered: CoveragePredicate,
   density = 32,
   keepInsideAnchors?: { out: BezierAnchor[][] },
+  simplifyEpsilon = 0.5,
 ): BezierAnchor[][] {
   if (anchors.length < 2) {
     if (anchors.length === 1) {
@@ -148,15 +157,23 @@ export function splitPathAnchors(
     return []
   }
 
-  // Flatten to (x, y) samples first. Each segment from anchor i-1 → i is
-  // sampled at j/density for j = 0..density.
+  // Flatten to (x, y) samples first. For each segment, use bezier samples
+  // ONLY if at least one endpoint has a handle (otherwise it's a straight
+  // line — sampling N points along it adds no information).
   type Sample = { x: number; y: number }
   const samples: Sample[] = []
-  const pushBezierSamples = (prev: BezierAnchor, curr: BezierAnchor, includeStart: boolean) => {
+  const isStraight = (prev: BezierAnchor, curr: BezierAnchor) =>
+    !prev.handleOut && !curr.handleIn
+  const pushSegment = (prev: BezierAnchor, curr: BezierAnchor, includeStart: boolean) => {
+    if (includeStart) samples.push({ x: prev.x, y: prev.y })
+    if (isStraight(prev, curr)) {
+      // No need to sample — endpoint is sufficient.
+      samples.push({ x: curr.x, y: curr.y })
+      return
+    }
     const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
     const cp2 = curr.handleIn ?? { x: curr.x, y: curr.y }
-    const start = includeStart ? 0 : 1
-    for (let j = start; j <= density; j++) {
+    for (let j = 1; j <= density; j++) {
       const t = j / density
       const mt = 1 - t
       samples.push({
@@ -166,10 +183,10 @@ export function splitPathAnchors(
     }
   }
   for (let i = 1; i < anchors.length; i++) {
-    pushBezierSamples(anchors[i - 1]!, anchors[i]!, i === 1)
+    pushSegment(anchors[i - 1]!, anchors[i]!, i === 1)
   }
   if (closed && anchors.length >= 2) {
-    pushBezierSamples(anchors[anchors.length - 1]!, anchors[0]!, false)
+    pushSegment(anchors[anchors.length - 1]!, anchors[0]!, false)
   }
 
   // Walk samples with boundary interpolation at each transition (same
@@ -210,13 +227,15 @@ export function splitPathAnchors(
   if (curOut.length) outsideRuns.push(curOut)
   if (curIn.length) insideRuns.push(curIn)
 
-  // Convert a sample run to anchor list. We keep ALL samples so the shape of
-  // the curve survives the cut faithfully — no decimation. Callers that want
-  // a sparser representation can simplify afterwards via Ramer-Douglas-Peucker.
-  // (Previously a stride=density/4 was used; that was the visible "chunk
-  // missing" feel the user reported on long segments.)
-  const toAnchors = (run: Sample[]): BezierAnchor[] =>
-    run.map((s) => ({ x: s.x, y: s.y, handleIn: null, handleOut: null, type: 'corner' as const }))
+  // Simplify each kept run with RDP — drops collinear/near-collinear samples
+  // so a 200-sample run from a bezier ellipse becomes ~12 anchors that still
+  // hug the original curve within `simplifyEpsilon` pixels. Without this,
+  // every successive eraser stamp on a split fragment compounds the anchor
+  // count and the editor shows hundreds of nodes after one lasso operation.
+  const toAnchors = (run: Sample[]): BezierAnchor[] => {
+    const simplified = simplifyEpsilon > 0 ? simplifyRDP(run, simplifyEpsilon) : run
+    return simplified.map((s) => ({ x: s.x, y: s.y, handleIn: null, handleOut: null, type: 'corner' as const }))
+  }
 
   if (keepInsideAnchors) {
     keepInsideAnchors.out = insideRuns.filter((r) => r.length >= 2).map(toAnchors)
@@ -266,6 +285,58 @@ export function capsuleCoverage(x0: number, y0: number, x1: number, y1: number, 
     const ex = x - cx, ey = y - cy
     return ex * ex + ey * ey <= r2
   }
+}
+
+/**
+ * Iterative Ramer-Douglas-Peucker simplification. Returns a subset of the
+ * input that hugs the original polyline within `epsilon` pixels. Used to
+ * keep the anchor count low after eraser/lasso splits — the visual result
+ * is indistinguishable but the path stays cheap to render and edit.
+ *
+ * Iterative (stack-based) implementation so a 10k-sample input doesn't
+ * blow the JS recursion limit.
+ */
+export function simplifyRDP<T extends { x: number; y: number }>(
+  points: T[],
+  epsilon: number,
+): T[] {
+  if (points.length <= 2) return points.slice()
+  const keep = new Uint8Array(points.length)
+  keep[0] = 1; keep[points.length - 1] = 1
+  const stack: Array<[number, number]> = [[0, points.length - 1]]
+
+  const perpDistSq = (p: T, a: T, b: T): number => {
+    const dx = b.x - a.x, dy = b.y - a.y
+    const lenSq = dx * dx + dy * dy
+    if (lenSq === 0) {
+      const ex = p.x - a.x, ey = p.y - a.y
+      return ex * ex + ey * ey
+    }
+    // |(p-a) × (b-a)|^2 / |b-a|^2
+    const cross = (p.x - a.x) * dy - (p.y - a.y) * dx
+    return (cross * cross) / lenSq
+  }
+
+  const eps2 = epsilon * epsilon
+  while (stack.length) {
+    const [lo, hi] = stack.pop()!
+    if (hi - lo < 2) continue
+    let maxIdx = -1
+    let maxD2 = 0
+    const a = points[lo]!, b = points[hi]!
+    for (let i = lo + 1; i < hi; i++) {
+      const d2 = perpDistSq(points[i]!, a, b)
+      if (d2 > maxD2) { maxD2 = d2; maxIdx = i }
+    }
+    if (maxD2 > eps2 && maxIdx !== -1) {
+      keep[maxIdx] = 1
+      stack.push([lo, maxIdx])
+      stack.push([maxIdx, hi])
+    }
+  }
+  const out: T[] = []
+  for (let i = 0; i < points.length; i++) if (keep[i]) out.push(points[i]!)
+  return out
 }
 
 /**

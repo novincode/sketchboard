@@ -33,6 +33,7 @@ export interface ShapeSettings {
  * is in flight so the active VectorLayer's canvas isn't dirtied.
  */
 export class ShapeTool extends Tool {
+  readonly requiredLayerType = 'vector' as const
   settings: ShapeSettings = {
     kind: 'rect',
     strokeColor: '#1a1a1a',
@@ -61,17 +62,10 @@ export class ShapeTool extends Tool {
   }
 
   onPointerDown(e: PointerData): void {
-    if (!this.board) return
-    const layer = this.board.getActiveLayer()
-    if (!(layer instanceof VectorLayer)) {
-      this.board.hooks.drawBlocked.call({ reason: 'wrong-layer-type' })
-      return
-    }
-    if (!layer.visible) {
-      this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' })
-      return
-    }
-    const world = this.board.camera.screenToWorld(e.x, e.y, this.board.logicalWidth, this.board.logicalHeight)
+    if (!this.guardActiveLayer()) return
+    const board = this.board!
+    const layer = board.getActiveLayer() as VectorLayer
+    const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
     const startWX = world.x - layer.transform.x
     const startWY = world.y - layer.transform.y
     this._drag = {

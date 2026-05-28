@@ -53,4 +53,10 @@ export const TOOLS: ToolMeta[] = [
 ]
 
 export const BRUSH_TOOLS: ToolId[] = ['pen', 'brush']
-export const VECTOR_TOOLS: ToolId[] = ['vector', 'vectorpen']
+// Vector-layer-requiring tools, including the shape virtuals (which all proxy
+// to the underlying 'shape' tool). Keep in sync with each core tool's
+// `requiredLayerType` — this list drives the LayerMismatchPrompt UI.
+export const VECTOR_TOOLS: ToolId[] = [
+  'vector', 'vectorpen',
+  'shape', 'shape-rect', 'shape-ellipse', 'shape-polygon',
+]

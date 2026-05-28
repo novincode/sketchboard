@@ -1,12 +1,12 @@
 'use client'
 
 import React, { useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import { HexColorPicker } from 'react-colorful'
 import { Link2, Link2Off } from 'lucide-react'
 import type { SelectTool, VectorShape } from '@sketchboard/core'
 import { useFreeformStore } from '../store'
 import { DraggableInput } from './DraggableInput'
+import { AutoPopover } from './AutoPopover'
 
 /**
  * Right-docked Figma-style properties sidebar for the active selection.
@@ -135,16 +135,28 @@ function Sidebar({ style, shape, hasRasterLasso, board }: {
             />
           )}
           {shape && shape.kind === 'polygon' && (
-            <FieldGroup label="Polygon">
-              <DraggableInput
-                label="Sides"
-                value={shape.sides ?? 6}
-                min={3}
-                max={32}
-                unit=""
-                onChange={(v) => select.setSelectedShape({ sides: v })}
-              />
-            </FieldGroup>
+            <>
+              <FieldGroup label="Polygon">
+                <DraggableInput
+                  label="Sides"
+                  value={shape.sides ?? 6}
+                  min={3}
+                  max={32}
+                  unit=""
+                  onChange={(v) => select.setSelectedShape({ sides: v })}
+                />
+                {/* Uniform radius for polygon vertices — single value rounds
+                    every vertex equally. Stored in cornerRadius[0]. */}
+                <DraggableInput
+                  label="Radius"
+                  value={Math.round(shape.cornerRadius?.[0] ?? 0)}
+                  min={0}
+                  max={Math.floor(Math.min(shape.width, shape.height) / 2)}
+                  unit="px"
+                  onChange={(v) => select.setSelectedShape({ cornerRadius: [v, v, v, v] })}
+                />
+              </FieldGroup>
+            </>
           )}
 
           <FieldGroup label="Actions">
@@ -303,46 +315,30 @@ function ActionRow({ children }: { children: React.ReactNode }) {
 }
 
 function Swatch({
-  color, mixed, empty, onChange, onClear, direction,
+  color, mixed, empty, onChange, onClear, direction: _direction,
 }: {
   color: string
   mixed: boolean
   empty?: boolean
   onChange: (hex: string) => void
   onClear?: () => void
-  /** Where to position the popover relative to the swatch. */
+  /** @deprecated — AutoPopover picks the side automatically now. Kept for callsite compat. */
   direction: 'down' | 'left'
 }) {
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement>(null)
-  const popoverRef = useRef<HTMLDivElement>(null)
+  const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null)
 
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: MouseEvent) => {
-      const target = e.target as Node
-      if (popoverRef.current?.contains(target)) return
-      if (triggerRef.current?.contains(target)) return
-      setOpen(false)
-    }
-    document.addEventListener('mousedown', onDown)
-    return () => document.removeEventListener('mousedown', onDown)
-  }, [open])
-
-  const rect = triggerRef.current?.getBoundingClientRect()
-  const popWidth = 240
-  // Sidebar is on the right; popover should open LEFT of the swatch so it
-  // doesn't fall off-screen. `down` keeps default behavior for flexible callers.
-  const popLeft = rect
-    ? (direction === 'left' ? rect.left - popWidth - 8 : rect.left)
-    : 0
-  const popTop = rect ? rect.bottom + 6 : 0
+  const handleToggle = () => {
+    if (!open && triggerRef.current) setAnchorRect(triggerRef.current.getBoundingClientRect())
+    setOpen((p) => !p)
+  }
 
   return (
     <>
       <button
         ref={triggerRef}
-        onClick={() => setOpen((p) => !p)}
+        onClick={handleToggle}
         className={[
           'flex w-full items-center justify-between gap-2 rounded-lg border px-2 py-1.5 transition',
           open ? 'border-blue-400/60 bg-blue-500/10' : 'border-white/10 bg-white/5 hover:border-white/25',
@@ -370,30 +366,31 @@ function Swatch({
         </svg>
       </button>
 
-      {open && createPortal(
-        <div
-          ref={popoverRef}
-          className="fixed z-[10100] rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
-          style={{ left: popLeft, top: popTop, width: popWidth }}
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <HexColorPicker color={empty ? '#000000' : color} onChange={onChange} style={{ width: '100%' }} />
-          <div className="mt-2.5 flex items-center gap-2">
-            <div className="h-7 flex-1 rounded-lg border border-white/10" style={{ backgroundColor: empty ? 'transparent' : color }} />
-            <span className="font-mono text-xs text-white/40">{empty ? 'none' : color.toUpperCase()}</span>
-          </div>
-          {onClear && (
-            <button
-              onClick={() => { onClear(); setOpen(false) }}
-              className="mt-2 w-full rounded-lg border border-white/10 bg-white/5 py-1.5 text-[11px] text-white/65 hover:bg-white/10 transition"
-            >
-              No fill
-            </button>
-          )}
-        </div>,
-        document.body,
-      )}
+      <AutoPopover
+        anchorRect={anchorRect}
+        open={open}
+        onClose={() => setOpen(false)}
+        width={240}
+        // Sidebar lives on the right edge of the screen — prefer opening to
+        // the LEFT so the picker stays on-screen. AutoPopover falls back
+        // to bottom/top if there's somehow no room on the left.
+        preferredSide="left"
+        align="start"
+      >
+        <HexColorPicker color={empty ? '#000000' : color} onChange={onChange} style={{ width: '100%' }} />
+        <div className="mt-2.5 flex items-center gap-2">
+          <div className="h-7 flex-1 rounded-lg border border-white/10" style={{ backgroundColor: empty ? 'transparent' : color }} />
+          <span className="font-mono text-xs text-white/40">{empty ? 'none' : color.toUpperCase()}</span>
+        </div>
+        {onClear && (
+          <button
+            onClick={() => { onClear(); setOpen(false) }}
+            className="mt-2 w-full rounded-lg border border-white/10 bg-white/5 py-1.5 text-[11px] text-white/65 hover:bg-white/10 transition"
+          >
+            No fill
+          </button>
+        )}
+      </AutoPopover>
     </>
   )
 }

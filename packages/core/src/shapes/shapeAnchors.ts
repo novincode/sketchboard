@@ -125,15 +125,56 @@ function buildPolygon(s: VectorShape): BezierAnchor[] {
   const rx = s.width / 2
   const ry = s.height / 2
   const rot = (s.rotation ?? 0) - Math.PI / 2 // start at top
-  const anchors: BezierAnchor[] = []
+  // Vertices around the bounding ellipse.
+  const verts: { x: number; y: number }[] = []
   for (let i = 0; i < n; i++) {
     const t = rot + (i / n) * Math.PI * 2
-    anchors.push({
-      x: cx + Math.cos(t) * rx,
-      y: cy + Math.sin(t) * ry,
-      handleIn: null, handleOut: null,
+    verts.push({ x: cx + Math.cos(t) * rx, y: cy + Math.sin(t) * ry })
+  }
+
+  // Polygon corner radius — uniform across all vertices. We reuse
+  // cornerRadius[0] when present (rectangles use all 4; polygons collapse
+  // to a single value). 0 / undefined → sharp corners (legacy behavior).
+  const radius = Math.max(0, s.cornerRadius?.[0] ?? 0)
+  if (radius <= 0) {
+    return verts.map((v) => ({ x: v.x, y: v.y, handleIn: null, handleOut: null, type: 'corner' as const }))
+  }
+
+  // Rounded polygon: each vertex V becomes two anchors offset along its
+  // incoming/outgoing edges by `r`, with bezier handles forming a circular
+  // arc at the corner. r is clamped to half the shorter adjacent edge so
+  // adjacent rounds never overlap.
+  const out: BezierAnchor[] = []
+  for (let i = 0; i < n; i++) {
+    const V = verts[i]!
+    const P = verts[(i - 1 + n) % n]!
+    const N = verts[(i + 1) % n]!
+    const inLen  = Math.hypot(V.x - P.x, V.y - P.y)
+    const outLen = Math.hypot(N.x - V.x, N.y - V.y)
+    const r = Math.min(radius, inLen / 2, outLen / 2)
+    if (r <= 0.01) {
+      out.push({ x: V.x, y: V.y, handleIn: null, handleOut: null, type: 'corner' })
+      continue
+    }
+    // Unit vectors from V toward P and N.
+    const inUx = (P.x - V.x) / inLen, inUy = (P.y - V.y) / inLen
+    const outUx = (N.x - V.x) / outLen, outUy = (N.y - V.y) / outLen
+    const aStart = { x: V.x + inUx * r,  y: V.y + inUy * r }    // step back along incoming edge
+    const aEnd   = { x: V.x + outUx * r, y: V.y + outUy * r }   // step forward along outgoing edge
+    // Bezier handles approximate a circular arc — pull each anchor's handle
+    // toward V by r*KAPPA which is the classic 1/4-circle approximation.
+    out.push({
+      x: aStart.x, y: aStart.y,
+      handleIn: null,
+      handleOut: { x: aStart.x - inUx * r * KAPPA, y: aStart.y - inUy * r * KAPPA },
+      type: 'corner',
+    })
+    out.push({
+      x: aEnd.x, y: aEnd.y,
+      handleIn: { x: aEnd.x - outUx * r * KAPPA, y: aEnd.y - outUy * r * KAPPA },
+      handleOut: null,
       type: 'corner',
     })
   }
-  return anchors
+  return out
 }

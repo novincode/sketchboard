@@ -17,6 +17,10 @@ import type { PointerData } from '../types'
 export type EraserVectorMode = 'stroke' | 'pixel'
 
 export class EraserTool extends BrushTool {
+  // Eraser handles BOTH raster and vector layers — picks behavior based on
+  // active layer kind in onPointerDown. Override BrushTool's eventual
+  // raster-only requirement so the guard doesn't reject vector clicks.
+  readonly requiredLayerType = 'any' as const
   private _eraseMode: 'raster' | 'vector' = 'raster'
   // Aggregate everything removed during this gesture so a single undo entry
   // restores the entire stroke — matches the raster eraser's UX where you

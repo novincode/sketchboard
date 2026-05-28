@@ -57,9 +57,10 @@ type SelectState =
   | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot; createHandles?: boolean }
   | { kind: 'editing-stroke'; id: string }
   | { kind: 'dragging-stroke-point'; id: string; pointIdx: number; snap: ElementSnapshot }
-  // Dragging a corner-radius handle on a shape-bearing path. `corner` is which
-  // corner is being dragged; `applyAll` is true unless Alt is held at grab.
-  | { kind: 'dragging-radius'; id: string; corner: CornerId; applyAll: boolean; startShape: VectorShape; startAnchors: BezierAnchor[] }
+  // Dragging a corner-radius handle on a shape-bearing path. `corner` is the
+  // vertex index (0..N-1; rect uses 0..3); `applyAll` is true for polygon
+  // (uniform) and rect-without-Alt; false when Alt is held on a rect.
+  | { kind: 'dragging-radius'; id: string; corner: number; applyAll: boolean; startShape: VectorShape; startAnchors: BezierAnchor[] }
 
 const HANDLE_SIZE = 8        // screen px, half-size of each resize handle square
 const HIT_RADIUS = 10        // screen px, pointer hit tolerance for handles/elements
@@ -264,12 +265,12 @@ export class SelectTool extends Tool {
     }
     if (this.state.kind === 'dragging-stroke-point') return
 
-    // ── Check corner-radius handles (only for a single rect-shape selection) ──
+    // ── Check corner-radius handles (rect: 4 corners; polygon: 1 handle) ──
     if (this.state.kind === 'selected' && isVec && this.state.ids.length === 1) {
       const selectedId = this.state.ids[0]
       const vl = layer as VectorLayer
       const path = vl.paths.find((p) => p.id === selectedId)
-      if (path && path.shape && path.shape.kind === 'rect') {
+      if (path && path.shape && (path.shape.kind === 'rect' || path.shape.kind === 'polygon')) {
         const corner = this.hitTestRadiusHandle(e.x, e.y, path.shape, vl)
         if (corner !== null) {
           const startShape = { ...path.shape, cornerRadius: path.shape.cornerRadius ? [...path.shape.cornerRadius] as [number, number, number, number] : undefined }
@@ -278,7 +279,8 @@ export class SelectTool extends Tool {
           }))
           this.state = {
             kind: 'dragging-radius', id: path.id, corner,
-            applyAll: !this._altActive,   // default = all corners; Alt = single
+            // Polygon corner radius is uniform — always applyAll.
+            applyAll: path.shape.kind === 'polygon' ? true : !this._altActive,
             startShape, startAnchors,
           }
           board.canvas.style.cursor = 'pointer'
@@ -517,31 +519,38 @@ export class SelectTool extends Tool {
       const layer = board.getActiveLayer()
       if (!(layer instanceof VectorLayer)) return
       const path = layer.paths.find((p) => p.id === st.id)
-      if (!path || !path.shape || path.shape.kind !== 'rect') return
+      if (!path || !path.shape) return
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
       const lx = world.x - layer.transform.x, ly = world.y - layer.transform.y
-      // Each corner contributes radius = distance from corner to cursor,
-      // projected onto the inward 45° diagonal so dragging "into" the rect
-      // grows the radius and "outside" shrinks it. Clamped to [0, min/2].
       const shape = st.startShape
+      // Direction depends on shape kind:
+      //   rect    → inward along the 45° corner diagonal
+      //   polygon → toward the bounding-ellipse center (perpendicular distance
+      //             from the vertex along the bisector). For uniform polygon
+      //             radius, distance from vertex to cursor projected onto the
+      //             vertex→center direction works well.
       const cornerPos = this._cornerWorldPos(shape, st.corner)
-      // Inward direction (unit) — into the rect.
       const cx = shape.x + shape.width / 2
       const cy = shape.y + shape.height / 2
       const dirX = cx - cornerPos.x
       const dirY = cy - cornerPos.y
       const dirLen = Math.hypot(dirX, dirY) || 1
       const ux = dirX / dirLen, uy = dirY / dirLen
-      // Project cursor vector onto inward direction.
-      const dx = lx - cornerPos.x
-      const dy = ly - cornerPos.y
+      const dx = lx - cornerPos.x, dy = ly - cornerPos.y
       const proj = dx * ux + dy * uy
+      let rDrag: number
       const maxR = Math.min(shape.width, shape.height) / 2
-      // The handle sits at distance `radius` along the diagonal from the corner.
-      // proj is in diagonal-projection space; the corner-radius is the
-      // perpendicular distance from the corner to where the curve begins, so
-      // we divide by sqrt(2) to recover it from the diagonal projection.
-      const rDrag = Math.max(0, Math.min(maxR, proj / Math.SQRT2))
+      if (shape.kind === 'rect') {
+        // For rect: rounded-corner inset is the perpendicular distance from
+        // the corner to where the arc begins — recover from the diagonal
+        // projection by dividing by √2.
+        rDrag = Math.max(0, Math.min(maxR, proj / Math.SQRT2))
+      } else {
+        // For polygon: radius is the offset along each adjacent edge.
+        // Project directly with no √2 (handle sits along the bisector at
+        // distance proportional to r itself rather than r√2).
+        rDrag = Math.max(0, Math.min(maxR, proj))
+      }
       const existing = (shape.cornerRadius ?? [0, 0, 0, 0]).slice() as [number, number, number, number]
       if (st.applyAll) {
         existing[0] = existing[1] = existing[2] = existing[3] = rDrag
@@ -1167,10 +1176,10 @@ export class SelectTool extends Tool {
       const bounds = this.getCombinedBounds(layer, ids)
       if (bounds) this.drawBoundingBox(strokeCtx, bounds, layer, board.camera, W, H)
 
-      // Corner-radius handles for a single rect-shape selection.
+      // Corner-radius handles for any single radius-capable shape (rect / polygon).
       if (ids.length === 1) {
         const path = layer.paths.find((p) => p.id === ids[0])
-        if (path && path.shape && path.shape.kind === 'rect') {
+        if (path && path.shape && (path.shape.kind === 'rect' || path.shape.kind === 'polygon')) {
           this.drawRadiusHandles(strokeCtx, path.shape, layer)
         }
       }
@@ -1181,7 +1190,7 @@ export class SelectTool extends Tool {
       const draggingId = this.state.id
       const draggingCorner = this.state.corner
       const path = layer.paths.find((p) => p.id === draggingId)
-      if (path && path.shape && path.shape.kind === 'rect') {
+      if (path && path.shape && (path.shape.kind === 'rect' || path.shape.kind === 'polygon')) {
         const bounds = layer.getBounds(path.id)
         if (bounds) this.drawBoundingBox(strokeCtx, bounds, layer, board.camera, W, H)
         this.drawRadiusHandles(strokeCtx, path.shape, layer, draggingCorner)
@@ -1292,8 +1301,9 @@ export class SelectTool extends Tool {
    * the selection is a single rect-shape. `activeCorner` (if provided) is
    * drawn larger and brighter to indicate the corner currently being dragged.
    */
-  private drawRadiusHandles(ctx: CanvasRenderingContext2D, shape: VectorShape, layer: VectorLayer, activeCorner?: CornerId): void {
-    for (const c of [0, 1, 2, 3] as CornerId[]) {
+  private drawRadiusHandles(ctx: CanvasRenderingContext2D, shape: VectorShape, layer: VectorLayer, activeCorner?: number): void {
+    const n = this._radiusHandleCount(shape)
+    for (let c = 0; c < n; c++) {
       const pos = this.radiusHandleScreenPos(shape, c, layer)
       if (!pos) continue
       const isActive = activeCorner === c
@@ -1399,24 +1409,49 @@ export class SelectTool extends Tool {
   }
 
   /**
-   * Get the world-local position of the given corner of a rectangle shape.
-   * Corner index: 0=tl, 1=tr, 2=br, 3=bl.
+   * Get the world-local position of the given corner. For rectangles:
+   * 0=TL, 1=TR, 2=BR, 3=BL. For polygons: returns the i-th vertex around
+   * the bounding ellipse (corner % sides). Other shape kinds throw.
    */
-  private _cornerWorldPos(shape: VectorShape, corner: CornerId): { x: number; y: number } {
-    const { x, y, width: w, height: h } = shape
-    if (corner === 0) return { x: x,     y: y     }
-    if (corner === 1) return { x: x + w, y: y     }
-    if (corner === 2) return { x: x + w, y: y + h }
-    return                  { x: x,     y: y + h }
+  private _cornerWorldPos(shape: VectorShape, corner: number): { x: number; y: number } {
+    if (shape.kind === 'rect') {
+      const { x, y, width: w, height: h } = shape
+      if (corner === 0) return { x: x,     y: y     }
+      if (corner === 1) return { x: x + w, y: y     }
+      if (corner === 2) return { x: x + w, y: y + h }
+      return                  { x: x,     y: y + h }
+    }
+    if (shape.kind === 'polygon') {
+      const n = Math.max(3, shape.sides ?? 3)
+      const cx = shape.x + shape.width / 2
+      const cy = shape.y + shape.height / 2
+      const rx = shape.width / 2
+      const ry = shape.height / 2
+      const rot = (shape.rotation ?? 0) - Math.PI / 2
+      const t = rot + ((corner % n) / n) * Math.PI * 2
+      return { x: cx + Math.cos(t) * rx, y: cy + Math.sin(t) * ry }
+    }
+    // Ellipse / unknown — fall through to center.
+    return { x: shape.x + shape.width / 2, y: shape.y + shape.height / 2 }
+  }
+
+  /** Number of radius handles for a given shape (4 for rect, N for polygon, 0 else). */
+  private _radiusHandleCount(shape: VectorShape): number {
+    if (shape.kind === 'rect') return 4
+    if (shape.kind === 'polygon') return Math.max(3, shape.sides ?? 3)
+    return 0
   }
 
   /**
-   * Screen position of a corner-radius handle for the given corner. The handle
-   * sits inside the rect along the corner's inward diagonal, at distance
-   * proportional to the current cornerRadius (with a minimum on-screen inset
-   * so the handle is always grabbable even at radius 0).
+   * Screen position of a corner-radius handle. Sits inside the shape along
+   * the corner→center vector, offset by the corner's current radius (with a
+   * min/max on-screen clamp so the handle is always grabbable).
+   *
+   * Rect uses the 45° diagonal so radius=worldDist/√2. Polygon uses the
+   * direct vertex→center direction so radius=worldDist (no √2 — matches
+   * the dragging math in onPointerMove).
    */
-  private radiusHandleScreenPos(shape: VectorShape, corner: CornerId, layer: VectorLayer): { x: number; y: number } | null {
+  private radiusHandleScreenPos(shape: VectorShape, corner: number, layer: VectorLayer): { x: number; y: number } | null {
     if (!this.board) return null
     const { camera, logicalWidth: W, logicalHeight: H } = this.board
     const cornerLocal = this._cornerWorldPos(shape, corner)
@@ -1426,15 +1461,14 @@ export class SelectTool extends Tool {
     const dirY = cy - cornerLocal.y
     const dirLen = Math.hypot(dirX, dirY) || 1
     const ux = dirX / dirLen, uy = dirY / dirLen
-    const r = shape.cornerRadius ? shape.cornerRadius[corner] : 0
-    // Distance along the diagonal where the inner radius point sits.
-    const worldDist = r * Math.SQRT2
+    const radiusIdx = corner % 4
+    const r = shape.cornerRadius ? shape.cornerRadius[radiusIdx] ?? 0 : 0
+    const worldDist = shape.kind === 'rect' ? r * Math.SQRT2 : r
     const screenCorner = camera.worldToScreen(cornerLocal.x + layer.transform.x, cornerLocal.y + layer.transform.y, W, H)
     const screenInner = camera.worldToScreen(cornerLocal.x + ux * worldDist + layer.transform.x, cornerLocal.y + uy * worldDist + layer.transform.y, W, H)
     const dx = screenInner.x - screenCorner.x
     const dy = screenInner.y - screenCorner.y
     const screenDist = Math.hypot(dx, dy)
-    // Clamp inset to keep handle inside a sane on-screen band even when r=0.
     const targetDist = Math.max(RADIUS_HANDLE_MIN_INSET, Math.min(screenDist, RADIUS_HANDLE_MAX_INSET))
     const norm = screenDist > 0.01 ? targetDist / screenDist : 0
     return {
@@ -1444,11 +1478,13 @@ export class SelectTool extends Tool {
   }
 
   /**
-   * Hit-test all 4 corner-radius handles. Returns the corner index or null.
+   * Hit-test every corner-radius handle on this shape. Returns the corner
+   * index (0..N-1) or null. For polygons the index wraps modulo `sides`.
    */
-  private hitTestRadiusHandle(sx: number, sy: number, shape: VectorShape, layer: VectorLayer): CornerId | null {
+  private hitTestRadiusHandle(sx: number, sy: number, shape: VectorShape, layer: VectorLayer): number | null {
     const r2 = HIT_RADIUS * HIT_RADIUS
-    for (const c of [0, 1, 2, 3] as CornerId[]) {
+    const n = this._radiusHandleCount(shape)
+    for (let c = 0; c < n; c++) {
       const pos = this.radiusHandleScreenPos(shape, c, layer)
       if (!pos) continue
       if ((sx - pos.x) ** 2 + (sy - pos.y) ** 2 <= r2) return c

@@ -15,6 +15,7 @@ import { HexColorPicker } from 'react-colorful'
 import { useFreeformStore } from './store'
 import { DraggableInput } from './components/DraggableInput'
 import { Popover } from './components/Popover'
+import { AutoPopover } from './components/AutoPopover'
 import { RASTER_BRUSH_PRESETS } from './brushPresets'
 import type { BrushPreset } from './brushPresets'
 
@@ -276,25 +277,19 @@ function ColorChip({ label, color, onChange, allowNone }: {
 }) {
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement>(null)
-  const popRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (popRef.current?.contains(t)) return
-      if (triggerRef.current?.contains(t)) return
-      setOpen(false)
-    }
-    document.addEventListener('mousedown', onDown)
-    return () => document.removeEventListener('mousedown', onDown)
-  }, [open])
+  const [anchorRect, setAnchorRect] = useState<DOMRect | null>(null)
   const isEmpty = color === null
-  const rect = triggerRef.current?.getBoundingClientRect()
+
+  const handleToggle = () => {
+    if (!open && triggerRef.current) setAnchorRect(triggerRef.current.getBoundingClientRect())
+    setOpen((p) => !p)
+  }
+
   return (
     <>
       <button
         ref={triggerRef}
-        onClick={() => setOpen((p) => !p)}
+        onClick={handleToggle}
         title={label}
         className="flex items-center gap-1 rounded-lg border border-white/10 bg-white/5 px-1.5 py-1 hover:border-white/25 transition"
       >
@@ -309,27 +304,26 @@ function ColorChip({ label, color, onChange, allowNone }: {
         />
         <span className="text-[9px] uppercase tracking-widest text-white/55 font-semibold">{label}</span>
       </button>
-      {open && rect && (
-        <div
-          ref={popRef}
-          className="fixed z-[10100] rounded-2xl border border-white/10 bg-[#1a1a1a]/95 p-3 shadow-2xl backdrop-blur-xl"
-          style={{ left: rect.left, top: rect.bottom + 6, width: 220 }}
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <HexColorPicker
-            color={isEmpty ? '#000000' : (color ?? '#000')}
-            onChange={(hex) => onChange(hex)}
-            style={{ width: '100%' }}
-          />
-          {allowNone && (
-            <button
-              onClick={() => { onChange(null); setOpen(false) }}
-              className="mt-2 w-full rounded-lg border border-white/10 bg-white/5 py-1.5 text-[11px] text-white/65 hover:bg-white/10 transition"
-            >No {label}</button>
-          )}
-        </div>
-      )}
+      <AutoPopover
+        anchorRect={anchorRect}
+        open={open}
+        onClose={() => setOpen(false)}
+        width={220}
+        preferredSide="bottom"
+        align="start"
+      >
+        <HexColorPicker
+          color={isEmpty ? '#000000' : (color ?? '#000')}
+          onChange={(hex) => onChange(hex)}
+          style={{ width: '100%' }}
+        />
+        {allowNone && (
+          <button
+            onClick={() => { onChange(null); setOpen(false) }}
+            className="mt-2 w-full rounded-lg border border-white/10 bg-white/5 py-1.5 text-[11px] text-white/65 hover:bg-white/10 transition"
+          >No {label}</button>
+        )}
+      </AutoPopover>
     </>
   )
 }

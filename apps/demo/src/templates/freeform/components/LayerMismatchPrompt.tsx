@@ -2,19 +2,25 @@
 
 import React, { useCallback, useState } from 'react'
 import { AlertTriangle, Plus, Layers, PenLine, ChevronDown } from 'lucide-react'
-import { useFreeformStore } from '../store'
+import { useFreeformStore, resolveBaseTool } from '../store'
 import type { LayerType } from '../types'
-import { VECTOR_TOOLS } from '../types'
 
 export function LayerMismatchPrompt() {
-  const { activeToolId, layers, activeLayerId, backgroundLayerId, addLayer, setActiveLayerId } = useFreeformStore()
+  const { board, activeToolId, layers, activeLayerId, backgroundLayerId, addLayer, setActiveLayerId } = useFreeformStore()
   const [showList, setShowList] = useState(false)
 
-  // ALL hooks before any conditional returns
+  // Ask the core tool itself what layer kind it needs — single source of
+  // truth (Tool.requiredLayerType). Falls back to 'any' when the tool is
+  // missing or doesn't declare. Resolves virtuals (shape-rect → shape).
+  const requiredLayerType = (() => {
+    if (!board) return 'any'
+    const baseId = resolveBaseTool(activeToolId)
+    const tool = board.getTool(baseId)
+    return tool?.requiredLayerType ?? 'any'
+  })()
   const activeLayer = layers.find((l) => l.id === activeLayerId)
-  const needsVector = VECTOR_TOOLS.includes(activeToolId)
-  // Eraser works on both raster and vector layers — don't flag it as a mismatch
-  const needsRaster = ['pen', 'brush'].includes(activeToolId)
+  const needsVector = requiredLayerType === 'vector'
+  const needsRaster = requiredLayerType === 'raster'
   const mismatch =
     (needsVector && activeLayer?.type === 'raster') ||
     (needsRaster && activeLayer?.type === 'vector')

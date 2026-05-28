@@ -14,6 +14,7 @@ export interface VectorPenSettings {
 const CLOSE_RADIUS_SCREEN = 12   // px — how close to first anchor to auto-close
 
 export class VectorPenTool extends Tool {
+  readonly requiredLayerType = 'vector' as const
   settings: VectorPenSettings = {
     strokeColor: '#1a1a1a',
     strokeWidth: 2,
@@ -44,25 +45,18 @@ export class VectorPenTool extends Tool {
   }
 
   onPointerDown(e: PointerData): void {
-    if (!this.board) return
-    const layer = this.board.getActiveLayer() as VectorLayer | undefined
-    if (!layer || layer.type !== 'vector') {
-      this.board.hooks.drawBlocked.call({ reason: 'wrong-layer-type' })
-      return
-    }
-    if (!layer.visible) {
-      this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' })
-      return
-    }
+    if (!this.guardActiveLayer()) return
+    const board = this.board!
+    const layer = board.getActiveLayer() as VectorLayer
 
     const world = this.toLayerCoords(e.x, e.y, layer)
 
     // Check close-path: click near first anchor
     if (this.anchors.length >= 2) {
       const first = this.anchors[0]!
-      const fs = this.board.camera.worldToScreen(
+      const fs = board.camera.worldToScreen(
         first.x + layer.transform.x, first.y + layer.transform.y,
-        this.board.logicalWidth, this.board.logicalHeight,
+        board.logicalWidth, board.logicalHeight,
       )
       const dx = e.x - fs.x, dy = e.y - fs.y
       if (dx * dx + dy * dy <= CLOSE_RADIUS_SCREEN * CLOSE_RADIUS_SCREEN) {
