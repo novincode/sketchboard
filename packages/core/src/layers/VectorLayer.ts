@@ -592,6 +592,57 @@ export class VectorLayer extends Layer {
     }
   }
 
+  // ── Snapshot / restore (used by tools that need one history entry per gesture) ──
+
+  /**
+   * Deep-clone every stroke and path on the layer. Cheap enough for typical
+   * vector layers (tens to low hundreds of elements). Used by tools whose
+   * gesture might mutate elements multiple times — they snapshot at
+   * pointerdown + pointerup and push ONE undo/redo entry that restores
+   * from each snapshot, sidestepping all the aggregation pitfalls of
+   * tracking removed-then-re-removed ids by hand.
+   */
+  snapshotElements(): { strokes: VectorStroke[]; paths: VectorPath[] } {
+    return {
+      strokes: this.strokes.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })) })),
+      paths: this.paths.map((p) => ({
+        ...p,
+        anchors: p.anchors.map((a) => ({
+          ...a,
+          handleIn: a.handleIn ? { ...a.handleIn } : null,
+          handleOut: a.handleOut ? { ...a.handleOut } : null,
+        })),
+        baseAnchors: p.baseAnchors
+          ? p.baseAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+          : undefined,
+        shape: p.shape ? {
+          ...p.shape,
+          cornerRadius: p.shape.cornerRadius ? [...p.shape.cornerRadius] as [number, number, number, number] : undefined,
+        } : undefined,
+      })),
+    }
+  }
+
+  /** Replace the layer's elements with a previously taken snapshot. */
+  restoreElementsSnapshot(snap: { strokes: VectorStroke[]; paths: VectorPath[] }): void {
+    this.strokes = snap.strokes.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })) }))
+    this.paths = snap.paths.map((p) => ({
+      ...p,
+      anchors: p.anchors.map((a) => ({
+        ...a,
+        handleIn: a.handleIn ? { ...a.handleIn } : null,
+        handleOut: a.handleOut ? { ...a.handleOut } : null,
+      })),
+      baseAnchors: p.baseAnchors
+        ? p.baseAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null }))
+        : undefined,
+      shape: p.shape ? {
+        ...p.shape,
+        cornerRadius: p.shape.cornerRadius ? [...p.shape.cornerRadius] as [number, number, number, number] : undefined,
+      } : undefined,
+    }))
+  }
+
   // ── Cloning ───────────────────────────────────────────────────────────────
 
   clone(): VectorLayer {

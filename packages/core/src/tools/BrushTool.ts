@@ -27,6 +27,13 @@ interface StrokePoint {
 }
 
 export class BrushTool extends Tool {
+  /**
+   * Raster brush requires a raster layer to draw into. Subclasses that
+   * span layer types (Eraser) override to 'any' and branch internally.
+   * PenTool inherits this requirement.
+   */
+  readonly requiredLayerType: 'raster' | 'vector' | 'any' = 'raster'
+
   settings: BrushSettings = {
     size: 16,
     opacity: 1,
@@ -52,13 +59,10 @@ export class BrushTool extends Tool {
   // ─── Pointer handlers ─────────────────────────────────────────────────────
 
   onPointerDown(e: PointerData): void {
-    if (!this.board) return
-    const layer = this.board.getActiveLayer() as RasterLayer | undefined
-    if (!layer?.ctx) return
-    if (!layer.visible) {
-      this.board.hooks.drawBlocked.call({ reason: 'layer-hidden' })
-      return
-    }
+    if (!this.guardActiveLayer()) return
+    const board = this.board!
+    const layer = board.getActiveLayer() as RasterLayer
+    if (!layer.ctx) return
 
     this.activeLayer = layer
     this.isDrawing = true
@@ -68,11 +72,11 @@ export class BrushTool extends Tool {
     this.addPoint(e)
 
     if (this.usesOverlay) {
-      this.board.clearStrokeCanvas()
+      board.clearStrokeCanvas()
       this.scheduleOverlayRedraw()
     } else {
       this.renderToLayer()
-      this.board.markDirty()
+      board.markDirty()
     }
   }
 

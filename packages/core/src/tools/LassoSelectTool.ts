@@ -99,10 +99,9 @@ export class LassoSelectTool extends Tool {
     const isCovered = polygonCoverage(localPoly)
 
     // Snapshot pre-split state so a single history entry covers the lasso op.
-    const beforeStrokes = layer.strokes.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })) }))
-    const beforePaths = layer.paths.map((p) => ({
-      ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
-    }))
+    // Uses the shared snapshot helpers — same pattern EraserTool uses, so
+    // history reliability stays consistent across tools.
+    const beforeSnap = layer.snapshotElements()
 
     const result = layer.splitByCoverage(isCovered)
 
@@ -112,11 +111,6 @@ export class LassoSelectTool extends Tool {
     const selectionIds: string[] = []
     for (const s of result.cutStrokes) { layer.addStroke(s); selectionIds.push(s.id) }
     for (const p of result.cutPaths) { layer.addPath(p); selectionIds.push(p.id) }
-
-    const afterStrokes = layer.strokes.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })) }))
-    const afterPaths = layer.paths.map((p) => ({
-      ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
-    }))
 
     if (result.originalStrokes.length === 0 && result.originalPaths.length === 0 && selectionIds.length === 0) {
       // Nothing was actually inside the lasso — fall back to legacy center-of-mass
@@ -128,17 +122,10 @@ export class LassoSelectTool extends Tool {
       return
     }
 
+    const afterSnap = layer.snapshotElements()
     board.history.push({
-      undo: () => {
-        layer.strokes = beforeStrokes.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })) }))
-        layer.paths = beforePaths.map((p) => ({ ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }))
-        board.markDirty()
-      },
-      redo: () => {
-        layer.strokes = afterStrokes.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p })) }))
-        layer.paths = afterPaths.map((p) => ({ ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }))
-        board.markDirty()
-      },
+      undo: () => { layer.restoreElementsSnapshot(beforeSnap); board.markDirty() },
+      redo: () => { layer.restoreElementsSnapshot(afterSnap);  board.markDirty() },
     })
 
     this.points = []

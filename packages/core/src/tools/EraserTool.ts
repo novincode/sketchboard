@@ -22,15 +22,25 @@ export class EraserTool extends BrushTool {
   // raster-only requirement so the guard doesn't reject vector clicks.
   readonly requiredLayerType = 'any' as const
   private _eraseMode: 'raster' | 'vector' = 'raster'
-  // Aggregate everything removed during this gesture so a single undo entry
-  // restores the entire stroke — matches the raster eraser's UX where you
-  // get one undo per pointer-down, not one per pixel.
-  private _gestureOriginal: { strokes: VectorStroke[]; paths: VectorPath[] } | null = null
-  /** Element IDs added during the gesture — used for redo. */
-  private _gestureAdded: { strokes: string[]; paths: string[] } | null = null
+  /**
+   * Layer-level snapshot taken at pointerdown. The commit step takes a
+   * second snapshot and pushes ONE undo/redo entry that restores from each.
+   *
+   * This is intentionally NOT incremental tracking of removed/added ids.
+   * Incremental aggregation broke when a single gesture cut a piece that
+   * was itself produced by an earlier stamp in the same gesture — undo
+   * would then re-add the intermediate piece because both its "removed at
+   * stamp N" id and its "added at stamp N-1" id were on the lists. The
+   * symptom was duplicate stacked rectangles after undo. Snapshot-based
+   * history sidesteps the bug entirely: the layer either looks like its
+   * pre-gesture state, or its post-gesture state. Nothing in between.
+   */
+  private _gestureStartSnap: { strokes: VectorStroke[]; paths: VectorPath[] } | null = null
   private _vectorLayer: VectorLayer | null = null
   /** Last erase point in layer-local coords — used for capsule sweep. */
   private _lastEraseLocal: { x: number; y: number } | null = null
+  /** Tracks whether the gesture actually mutated the layer (skip history if not). */
+  private _gestureDirty = false
 
   /**
    * Vector eraser sub-mode. `'stroke'` removes whole elements (original
@@ -60,10 +70,10 @@ export class EraserTool extends BrushTool {
     const layer = this.board?.getActiveLayer()
     this._eraseMode = layer instanceof VectorLayer ? 'vector' : 'raster'
     if (this._eraseMode === 'vector') {
-      this._gestureOriginal = { strokes: [], paths: [] }
-      this._gestureAdded = { strokes: [], paths: [] }
       this._vectorLayer = layer as VectorLayer
       this._lastEraseLocal = null
+      this._gestureDirty = false
+      this._gestureStartSnap = this._vectorLayer.snapshotElements()
       this._eraseVector(e)
     } else {
       super.onPointerDown(e)
@@ -96,7 +106,7 @@ export class EraserTool extends BrushTool {
 
   private _eraseVector(e: PointerData): void {
     const board = this.board
-    if (!board || !this._vectorLayer || !this._gestureOriginal || !this._gestureAdded) return
+    if (!board || !this._vectorLayer) return
     const layer = this._vectorLayer
     const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
     const lx = world.x - layer.transform.x
@@ -104,11 +114,9 @@ export class EraserTool extends BrushTool {
     const radius = (this.settings.size / 2) / board.camera.zoom
 
     if (this.vectorMode === 'stroke') {
-      // Whole-element removal (original behavior). Aggregate for one undo.
       const { strokes, paths } = layer.eraseAt(lx, ly, radius)
       if (strokes.length || paths.length) {
-        this._gestureOriginal.strokes.push(...strokes)
-        this._gestureOriginal.paths.push(...paths)
+        this._gestureDirty = true
         board.markDirty()
       }
       this._lastEraseLocal = { x: lx, y: ly }
@@ -116,12 +124,9 @@ export class EraserTool extends BrushTool {
     }
 
     // Pixel-precise split: sweep a CAPSULE from the previous sample to the
-    // current one (degenerate first stamp = disk). The capsule catches any
-    // strokes the cursor flew past between samples (fast drags) AND yields
-    // a clean parallel cut edge instead of N scalloped circles. A bounding
-    // box around the capsule lets splitByCoverage skip 95%+ of unaffected
-    // elements without testing geometry — critical perf win as a path
-    // fragments into many sub-pieces during a long erase gesture.
+    // current one (degenerate first stamp = disk). Catches strokes the cursor
+    // flew over between samples + clean parallel cut edge. Bbox lets
+    // splitByCoverage skip elements outside the sweep cheaply.
     const prev = this._lastEraseLocal
     const isCovered = prev
       ? capsuleCoverage(prev.x, prev.y, lx, ly, radius)
@@ -132,74 +137,30 @@ export class EraserTool extends BrushTool {
     const y1 = prev ? Math.max(prev.y, ly) + radius : ly + radius
     this._lastEraseLocal = { x: lx, y: ly }
     const result = layer.splitByCoverage(isCovered, { x0, y0, x1, y1 })
-    if (result.originalStrokes.length === 0 && result.originalPaths.length === 0) return
-    // Aggregate originals AND replacement-ids so a long gesture commits as
-    // one undo entry on pointer-up.
-    this._gestureOriginal.strokes.push(...result.originalStrokes)
-    this._gestureOriginal.paths.push(...result.originalPaths)
-    this._gestureAdded.strokes.push(...result.addedStrokes.map((s) => s.id))
-    this._gestureAdded.paths.push(...result.addedPaths.map((p) => p.id))
-    board.markDirty()
+    if (result.originalStrokes.length > 0 || result.originalPaths.length > 0) {
+      this._gestureDirty = true
+      board.markDirty()
+    }
   }
 
   private _commitVectorErase(): void {
     const board = this.board
-    const original = this._gestureOriginal
-    const added = this._gestureAdded
     const layer = this._vectorLayer
-    this._gestureOriginal = null
-    this._gestureAdded = null
+    const startSnap = this._gestureStartSnap
+    const dirty = this._gestureDirty
+    this._gestureStartSnap = null
     this._vectorLayer = null
     this._lastEraseLocal = null
-    if (!board || !original || !layer) return
-    if (original.strokes.length === 0 && original.paths.length === 0) return
+    this._gestureDirty = false
+    if (!board || !layer || !startSnap || !dirty) return
 
-    if (this.vectorMode === 'stroke') {
-      // Whole-element removal undo (original behavior).
-      board.history.push({
-        undo: () => {
-          for (const s of original.strokes) layer.addStroke(s)
-          for (const p of original.paths)   layer.addPath(p)
-          board.markDirty()
-        },
-        redo: () => {
-          for (const s of original.strokes) layer.removeStroke(s.id)
-          for (const p of original.paths)   layer.removePath(p.id)
-          board.markDirty()
-        },
-      })
-      return
-    }
-
-    // Pixel mode: snapshot the current (post-split) state of the layer so
-    // redo can re-apply it precisely without re-running the geometry.
-    const addedStrokeIds = added?.strokes ?? []
-    const addedPathIds = added?.paths ?? []
-    // Capture clone copies of every replacement element so redo works after
-    // they've been removed by undo.
-    const addedStrokes = addedStrokeIds.flatMap((id) => {
-      const s = layer.strokes.find((x) => x.id === id)
-      return s ? [{ ...s, points: s.points.map((p) => ({ ...p })) }] : []
-    })
-    const addedPaths = addedPathIds.flatMap((id) => {
-      const p = layer.paths.find((x) => x.id === id)
-      return p ? [{ ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }] : []
-    })
+    // Snapshot the POST state once and push ONE undo/redo. Snapshot-based
+    // history is identical for stroke and pixel modes — no separate code
+    // paths, no aggregation bugs.
+    const endSnap = layer.snapshotElements()
     board.history.push({
-      undo: () => {
-        for (const id of addedStrokeIds) layer.removeStroke(id)
-        for (const id of addedPathIds)   layer.removePath(id)
-        for (const s of original.strokes) layer.addStroke(s)
-        for (const p of original.paths)   layer.addPath(p)
-        board.markDirty()
-      },
-      redo: () => {
-        for (const s of original.strokes) layer.removeStroke(s.id)
-        for (const p of original.paths)   layer.removePath(p.id)
-        for (const s of addedStrokes) layer.addStroke({ ...s, points: s.points.map((p) => ({ ...p })) })
-        for (const p of addedPaths)   layer.addPath({ ...p, anchors: p.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) })
-        board.markDirty()
-      },
+      undo: () => { layer.restoreElementsSnapshot(startSnap); board.markDirty() },
+      redo: () => { layer.restoreElementsSnapshot(endSnap);   board.markDirty() },
     })
   }
 }

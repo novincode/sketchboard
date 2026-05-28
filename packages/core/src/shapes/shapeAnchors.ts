@@ -106,76 +106,57 @@ function buildRoundedRect(s: VectorShape): BezierAnchor[] {
   const maxR = Math.max(0, Math.min(w, h) / 2)
   const [r0, r1, r2, r3] = (s.cornerRadius ?? [0, 0, 0, 0]).map((r) => Math.max(0, Math.min(r, maxR))) as [number, number, number, number]
 
-  // Corners (TL, TR, BR, BL). Each rounded corner emits ONE anchor at the
-  // arc's midpoint with bezier handles approximating a quarter circle, OR
-  // two corner anchors connected by a straight segment when radius is 0.
+  // Path order matters! Anchors are drawn in array order; the renderer
+  // connects consecutive anchors with bezier segments. For a closed rect
+  // traversed clockwise (TL → TR → BR → BL → close), each corner contributes
+  // two anchors:
+  //   aIn  = where the path ENTERS the corner from the previous edge
+  //   aOut = where the path EXITS the corner onto the next edge
+  // Both handles point TOWARD the corner vertex (KAPPA approximation).
   //
-  // We use the simpler "one anchor per corner at the radius midpoint" only
-  // when r > 0; r=0 corners use a single sharp anchor at the corner vertex.
-  //
-  // For a uniform rectangle (all radii equal and > 0), the path is a
-  // rounded rect; for mixed radii, each corner is handled independently and
-  // the edges between them are straight.
+  // Previous buggy version had TL/BL swapped (aIn on the next-edge side,
+  // aOut on the prev-edge side), so the auto-drawn segment from one corner
+  // to the next went diagonally across the rect instead of along the edge.
+  // That produced the slashed "left side bowing inward" the user reported.
   const anchors: BezierAnchor[] = []
-  const addRoundedCorner = (cx: number, cy: number, r: number, quadrant: 0 | 1 | 2 | 3) => {
+  const addCorner = (
+    cx: number, cy: number, r: number,
+    prevEdge: { dx: number; dy: number },  // unit vector FROM corner toward previous edge
+    nextEdge: { dx: number; dy: number },  // unit vector FROM corner toward next edge
+  ) => {
     if (r <= 0) {
       anchors.push({ x: cx, y: cy, handleIn: null, handleOut: null, type: 'corner' })
       return
     }
-    // Quadrant 0 = TL, 1 = TR, 2 = BR, 3 = BL.
-    // We add TWO anchors per rounded corner: arc start and arc end.
-    // Arc start (along the previous edge) — no incoming handle, outgoing tangent into the arc.
-    // Arc end   (along the next edge)    — incoming tangent out of the arc, no outgoing handle.
     const k = r * KAPPA
-    let aStart: { x: number; y: number }, aEnd: { x: number; y: number }
-    let outDelta: { x: number; y: number }, inDelta: { x: number; y: number }
-    if (quadrant === 0) {       // TL: arc goes from x+r,y → x,y+r (curving over the corner)
-      aStart = { x: cx + r, y: cy }
-      aEnd   = { x: cx,     y: cy + r }
-      outDelta = { x: -k, y: 0 }
-      inDelta  = { x: 0, y: -k }
-    } else if (quadrant === 1) { // TR: from x,y+r... wait re-derive in local center terms.
-      // TR corner vertex is (cx, cy). Previous edge enters from (cx - r, cy); arc to (cx, cy + r).
-      aStart = { x: cx - r, y: cy }
-      aEnd   = { x: cx,     y: cy + r }
-      outDelta = { x: k, y: 0 }
-      inDelta  = { x: 0, y: -k }
-    } else if (quadrant === 2) { // BR
-      aStart = { x: cx,     y: cy - r }
-      aEnd   = { x: cx - r, y: cy }
-      outDelta = { x: 0, y: k }
-      inDelta  = { x: k, y: 0 }
-    } else {                     // BL
-      // aStart sits ABOVE the BL corner on the left edge; its handleOut
-      // must pull DOWN toward the corner (positive y), not up. Same logic
-      // as the other quadrants — the handle deltas always point toward
-      // the corner vertex. The previous (0, -k) flipped the BL handle
-      // away from the corner, producing the misaligned "left side looks
-      // weird" the user reported.
-      aStart = { x: cx,     y: cy - r }
-      aEnd   = { x: cx + r, y: cy }
-      outDelta = { x: 0, y: k }
-      inDelta  = { x: -k, y: 0 }
-    }
+    const aIn  = { x: cx + prevEdge.dx * r, y: cy + prevEdge.dy * r }   // on prev edge
+    const aOut = { x: cx + nextEdge.dx * r, y: cy + nextEdge.dy * r }   // on next edge
+    // handles pull toward the corner (subtract along the outward unit)
     anchors.push({
-      x: aStart.x, y: aStart.y,
+      x: aIn.x, y: aIn.y,
       handleIn: null,
-      handleOut: { x: aStart.x + outDelta.x, y: aStart.y + outDelta.y },
+      handleOut: { x: aIn.x - prevEdge.dx * k, y: aIn.y - prevEdge.dy * k },
       type: 'corner',
     })
     anchors.push({
-      x: aEnd.x, y: aEnd.y,
-      handleIn: { x: aEnd.x + inDelta.x, y: aEnd.y + inDelta.y },
+      x: aOut.x, y: aOut.y,
+      handleIn: { x: aOut.x - nextEdge.dx * k, y: aOut.y - nextEdge.dy * k },
       handleOut: null,
       type: 'corner',
     })
   }
 
-  // Corners in clockwise order: TL → TR → BR → BL
-  addRoundedCorner(x,         y,         r0, 0)
-  addRoundedCorner(x + w,     y,         r1, 1)
-  addRoundedCorner(x + w,     y + h,     r2, 2)
-  addRoundedCorner(x,         y + h,     r3, 3)
+  // Clockwise: at TL we ENTER along the left edge (going up from BL means
+  // prev-edge direction from corner is +y, i.e. "down"); we EXIT along
+  // the top edge (next-edge direction +x).
+  const DOWN  = { dx: 0,  dy: 1 }
+  const UP    = { dx: 0,  dy: -1 }
+  const LEFT  = { dx: -1, dy: 0 }
+  const RIGHT = { dx: 1,  dy: 0 }
+  addCorner(x,     y,     r0, DOWN,  RIGHT) // TL: prev = left edge (toward BL = down); next = top edge (right)
+  addCorner(x + w, y,     r1, LEFT,  DOWN)  // TR: prev = top edge (toward TL = left); next = right edge (down)
+  addCorner(x + w, y + h, r2, UP,    LEFT)  // BR: prev = right edge (toward TR = up); next = bottom edge (left)
+  addCorner(x,     y + h, r3, RIGHT, UP)    // BL: prev = bottom edge (toward BR = right); next = left edge (up)
   return anchors
 }
 

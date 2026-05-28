@@ -189,11 +189,28 @@ export function LayerPanel() {
       return
     }
 
-    // ── row::<id>::before / row::<id>::after ──
+    // ── row::<id>::before / row::<id>::after — fine-grained strip drops ──
+    // Also fall through to here for a PLAIN row id (dropped on the row body
+    // itself rather than a thin strip). dnd-kit's `useSortable` registers
+    // each row as BOTH draggable and droppable, so most realistic drops
+    // land on the row, not the strips. Without this fallback the user's
+    // release silently does nothing and the layer visually snaps back to
+    // its starting position — the bug the user hit.
+    let overId: string | null = null
+    let pos: 'before' | 'after' = 'after'
     if (target.startsWith('row::')) {
       const parts = target.split('::')
-      const overId = parts[1]!
-      const pos = parts[2] as 'before' | 'after'
+      overId = parts[1] ?? null
+      pos = (parts[2] as 'before' | 'after') ?? 'after'
+    } else if (layers.some((l) => l.id === target)) {
+      // Plain row id (sortable item itself). Default to "after in panel"
+      // = before in tree-order, i.e. drop the active layer just above the
+      // over row in the panel. Mirrors what arrayMove would do.
+      overId = target
+      pos = 'after'
+    }
+
+    if (overId) {
       const overMeta = layers.find((l) => l.id === overId)
       if (!overMeta || overId === activeId) return
 
