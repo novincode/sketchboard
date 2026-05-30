@@ -220,6 +220,19 @@ export class SelectTool extends Tool {
     // ── In edit mode: check handles first ──────────────────────────────────
     if (this.state.kind === 'editing' && isVec) {
       const editState = this.state
+      // Double-click on empty space (NOT on a handle) exits edit mode and
+      // deselects the path. Figma-style — gives the user a way out of node
+      // editing without reaching for Escape or switching tools.
+      if (doubleClick) {
+        const hitTest = this.hitTestHandle(e.x, e.y, editState.id, layer as VectorLayer)
+        if (!hitTest) {
+          this.state = { kind: 'idle' }
+          board.canvas.style.cursor = 'default'
+          this._fireSelectionChanged()
+          this.scheduleOverlayRedraw()
+          return
+        }
+      }
       const hit = this.hitTestHandle(e.x, e.y, editState.id, layer as VectorLayer)
       if (hit) {
         const vl = layer as VectorLayer

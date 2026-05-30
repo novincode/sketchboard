@@ -65,14 +65,24 @@ export class VectorPenTool extends Tool {
    * Figma-style continuation: when the user switches to Pen with the Select
    * tool focused on an OPEN path in editing mode, seed `this.anchors` from
    * that path so the next click extends it from the appropriate endpoint.
-   * Detects the endpoint based on which is closer to the cursor on activate.
-   * No-op for closed paths or anything else.
+   *
+   * If exactly ONE anchor is selected via SelectTool's multi-anchor model
+   * AND it's an endpoint (first or last), extend from THAT endpoint.
+   * Otherwise default to the last anchor.
+   *
+   * The original path stays IN the layer untouched during extension — we
+   * just keep a parallel `this.anchors` array and replace the path on
+   * commit. Avoids the previous "hide + re-add on cancel" bookkeeping
+   * (which made the path visibly vanish if the user picked another tool
+   * mid-extension).
    */
   private _maybeBeginExtending(): void {
     const board = this.board
     if (!board) return
     // Probe SelectTool through the registry — Tool base doesn't import it.
-    const select = board.getTool('select') as { state?: { kind: string; id?: string } } | undefined
+    const select = board.getTool('select') as {
+      state?: { kind: string; id?: string; selectedAnchorIdxs?: number[] }
+    } | undefined
     const st = select?.state
     if (!st || st.kind !== 'editing' || !st.id) return
     const layer = board.getActiveLayer()
@@ -80,7 +90,18 @@ export class VectorPenTool extends Tool {
     const path = layer.paths.find((p) => p.id === st.id)
     if (!path || path.closed || path.anchors.length === 0) return
 
-    // Snapshot for undo + onDeactivate restore.
+    // Decide which endpoint to extend from based on selectedAnchorIdxs.
+    // Single anchor selected = use that endpoint if it's first or last.
+    // No selection / multi-selection / middle anchor → default to last.
+    let fromEnd: 'first' | 'last' = 'last'
+    const sel = st.selectedAnchorIdxs
+    if (sel && sel.length === 1) {
+      const idx = sel[0]!
+      if (idx === 0) fromEnd = 'first'
+      else if (idx === path.anchors.length - 1) fromEnd = 'last'
+      // Middle anchor selected → fall through to default 'last'.
+    }
+
     this._extendingPathId = path.id
     this._extendingPathSnapshot = {
       ...path,
@@ -90,40 +111,32 @@ export class VectorPenTool extends Tool {
         handleOut: a.handleOut ? { ...a.handleOut } : null,
       })),
     }
-    this._extendingFromEnd = 'last'
-    // Seed our in-progress anchors from the existing path so the rubber band
-    // continues from its last anchor.
-    this.anchors = this._extendingPathSnapshot.anchors.map((a) => ({
+    this._extendingFromEnd = fromEnd
+
+    // Seed our in-progress anchors from the existing path. When extending
+    // from the FIRST endpoint, reverse the array (and swap each anchor's
+    // handleIn ↔ handleOut so the curve renders identically) so the rubber
+    // band continues from the original first anchor.
+    const seeded = this._extendingPathSnapshot.anchors.map((a) => ({
       ...a,
       handleIn: a.handleIn ? { ...a.handleIn } : null,
       handleOut: a.handleOut ? { ...a.handleOut } : null,
     }))
-    // HIDE the original from the layer while we're editing it — otherwise
-    // user sees the unchanging real path AND the live preview drawn on top
-    // (visually two of everything). Commit puts the new geometry back;
-    // onDeactivate / cancel restores the original.
-    layer.paths = layer.paths.filter((p) => p.id !== path.id)
-    board.markDirty()
+    if (fromEnd === 'first') {
+      seeded.reverse()
+      for (const a of seeded) {
+        const tmp = a.handleIn
+        a.handleIn = a.handleOut
+        a.handleOut = tmp
+      }
+    }
+    this.anchors = seeded
     this.scheduleOverlayRedraw()
   }
 
-  /** Restore the original path if we're extending and haven't committed. */
+  /** No-op now — kept for naming continuity. The original path is never
+   * hidden during extension, so there's nothing to restore on cancel. */
   private _restoreOriginalIfExtending(): void {
-    if (!this._extendingPathSnapshot || !this.board) return
-    const layer = this.board.getActiveLayer()
-    if (!(layer instanceof VectorLayer)) return
-    // Only re-add if it's not already there (commit replaces in place).
-    if (!layer.paths.find((p) => p.id === this._extendingPathSnapshot!.id)) {
-      layer.paths.push({
-        ...this._extendingPathSnapshot,
-        anchors: this._extendingPathSnapshot.anchors.map((a) => ({
-          ...a,
-          handleIn: a.handleIn ? { ...a.handleIn } : null,
-          handleOut: a.handleOut ? { ...a.handleOut } : null,
-        })),
-      })
-      this.board.markDirty()
-    }
     this._extendingPathId = null
     this._extendingPathSnapshot = null
   }
@@ -259,39 +272,46 @@ export class VectorPenTool extends Tool {
     if (this.anchors.length < 2) { this.cancelPath(); return }
     const board = this.board!
 
-    // Extending an existing path: PUT IT BACK with the new geometry. The
-    // original was removed from the layer in _maybeBeginExtending so the
-    // hidden geometry didn't overlap the live preview. Single history entry
-    // swaps the snapshot in/out — undo returns the path to its pre-
-    // extension shape; redo re-applies the new geometry.
+    // Extending an existing path: REPLACE its anchors in place. The original
+    // stayed in the layer untouched throughout the extension, so we just
+    // swap the anchors array (un-reversing if we extended from the FIRST
+    // endpoint). One history entry restores the original snapshot on undo.
     if (this._extendingPathId && this._extendingPathSnapshot) {
       const targetId = this._extendingPathId
       const beforeSnap = this._extendingPathSnapshot
+      // When extending from the FIRST endpoint we reversed the anchor array
+      // for editing convenience — undo that on commit so handleIn/Out stays
+      // consistent with the underlying curve direction.
+      let committedAnchors = this.anchors.slice()
+      if (this._extendingFromEnd === 'first') {
+        committedAnchors.reverse()
+        committedAnchors = committedAnchors.map((a) => ({ ...a, handleIn: a.handleOut, handleOut: a.handleIn }))
+      }
       const after: VectorPath = {
         ...beforeSnap,
         closed,
-        anchors: this.anchors.map((a) => ({
+        anchors: committedAnchors.map((a) => ({
           ...a,
           handleIn: a.handleIn ? { ...a.handleIn } : null,
           handleOut: a.handleOut ? { ...a.handleOut } : null,
         })),
       }
-      // Removed during _maybeBeginExtending — push the committed version back.
-      layer.paths.push({
-        ...after,
-        anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
-      })
+      const i = layer.paths.findIndex((p) => p.id === targetId)
+      if (i !== -1) {
+        layer.paths[i] = {
+          ...after,
+          anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
+        }
+      }
       board.history.push({
         undo: () => {
-          const i = layer.paths.findIndex((p) => p.id === targetId)
-          if (i !== -1) layer.paths[i] = { ...beforeSnap, anchors: beforeSnap.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
-          else layer.paths.push({ ...beforeSnap, anchors: beforeSnap.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) })
+          const j = layer.paths.findIndex((p) => p.id === targetId)
+          if (j !== -1) layer.paths[j] = { ...beforeSnap, anchors: beforeSnap.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
           board.markDirty()
         },
         redo: () => {
-          const i = layer.paths.findIndex((p) => p.id === targetId)
-          if (i !== -1) layer.paths[i] = { ...after, anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
-          else layer.paths.push({ ...after, anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) })
+          const j = layer.paths.findIndex((p) => p.id === targetId)
+          if (j !== -1) layer.paths[j] = { ...after, anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
           board.markDirty()
         },
       })

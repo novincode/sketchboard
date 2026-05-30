@@ -529,12 +529,67 @@ export class VectorLayer extends Layer {
     }
     const path = this.paths.find((p) => p.id === id)
     if (path && path.anchors.length > 0) {
+      // Tight bbox via bezier extrema. Anchor-only bbox is loose because a
+      // curve can bulge well outside its control points (matters a LOT for
+      // paths drawn with the pen tool — the user reported the rect-select
+      // box being way off when the curve bowed out beyond its anchors).
+      // For each segment we evaluate the curve at t=0, t=1, and at any
+      // interior roots of B'(t) = 0 — analytical bbox for cubic beziers.
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-      for (const a of path.anchors) {
-        // Only use anchor points (not handles) so the selection box matches the visible path
-        if (a.x < minX) minX = a.x; if (a.x > maxX) maxX = a.x
-        if (a.y < minY) minY = a.y; if (a.y > maxY) maxY = a.y
+      const consider = (x: number, y: number) => {
+        if (x < minX) minX = x; if (x > maxX) maxX = x
+        if (y < minY) minY = y; if (y > maxY) maxY = y
       }
+      const cubicAt = (p0: number, p1: number, p2: number, p3: number, t: number) => {
+        const mt = 1 - t
+        return mt*mt*mt*p0 + 3*mt*mt*t*p1 + 3*mt*t*t*p2 + t*t*t*p3
+      }
+      // Roots of B'(t) for ONE axis (x or y). Returns t values in (0, 1).
+      const extremaT = (p0: number, p1: number, p2: number, p3: number): number[] => {
+        const a = -p0 + 3*p1 - 3*p2 + p3
+        const b = 2*p0 - 4*p1 + 2*p2
+        const c = -p0 + p1
+        // a*t² + b*t + c = 0  (derivative of cubic bezier, factored).
+        const ts: number[] = []
+        if (Math.abs(a) < 1e-9) {
+          // Linear in t — single root.
+          if (Math.abs(b) > 1e-9) {
+            const t = -c / b
+            if (t > 0 && t < 1) ts.push(t)
+          }
+        } else {
+          const disc = b*b - 4*a*c
+          if (disc >= 0) {
+            const sq = Math.sqrt(disc)
+            const t1 = (-b + sq) / (2*a)
+            const t2 = (-b - sq) / (2*a)
+            if (t1 > 0 && t1 < 1) ts.push(t1)
+            if (t2 > 0 && t2 < 1) ts.push(t2)
+          }
+        }
+        return ts
+      }
+      const sampleSegment = (prev: BezierAnchor, curr: BezierAnchor) => {
+        const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
+        const cp2 = curr.handleIn  ?? { x: curr.x, y: curr.y }
+        consider(prev.x, prev.y); consider(curr.x, curr.y)
+        // Straight segment? No bulge, endpoints are enough.
+        if (!prev.handleOut && !curr.handleIn) return
+        for (const t of extremaT(prev.x, cp1.x, cp2.x, curr.x)) {
+          consider(
+            cubicAt(prev.x, cp1.x, cp2.x, curr.x, t),
+            cubicAt(prev.y, cp1.y, cp2.y, curr.y, t),
+          )
+        }
+        for (const t of extremaT(prev.y, cp1.y, cp2.y, curr.y)) {
+          consider(
+            cubicAt(prev.x, cp1.x, cp2.x, curr.x, t),
+            cubicAt(prev.y, cp1.y, cp2.y, curr.y, t),
+          )
+        }
+      }
+      for (let i = 1; i < path.anchors.length; i++) sampleSegment(path.anchors[i - 1]!, path.anchors[i]!)
+      if (path.closed && path.anchors.length >= 2) sampleSegment(path.anchors[path.anchors.length - 1]!, path.anchors[0]!)
       const r = path.strokeWidth / 2
       return { x: minX - r, y: minY - r, w: maxX - minX + path.strokeWidth, h: maxY - minY + path.strokeWidth }
     }
