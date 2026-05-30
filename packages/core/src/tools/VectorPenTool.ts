@@ -1,7 +1,7 @@
 import { Tool } from './Tool'
 import type { PointerData } from '../types'
 import { VectorLayer } from '../layers/VectorLayer'
-import type { BezierAnchor } from '../layers/VectorLayer'
+import type { BezierAnchor, VectorPath } from '../layers/VectorLayer'
 import { Color } from '../math/Color'
 
 export interface VectorPenSettings {
@@ -12,6 +12,8 @@ export interface VectorPenSettings {
 }
 
 const CLOSE_RADIUS_SCREEN = 12   // px — how close to first anchor to auto-close
+/** Screen-px proximity for "hovering over an existing path edge" to insert an anchor. */
+const EDGE_HOVER_RADIUS_SCREEN = 8
 
 export class VectorPenTool extends Tool {
   readonly requiredLayerType = 'vector' as const
@@ -31,17 +33,99 @@ export class VectorPenTool extends Tool {
   private _overlayPending = false
   private _afterRenderUnsub: (() => void) | null = null
 
+  /**
+   * When set, the pen tool is EXTENDING an existing path instead of creating
+   * a new one. Set by onActivate when SelectTool's editing state targets an
+   * open path on the active layer; cleared on commit/cancel. The path is
+   * snapshotted before changes so undo restores the original geometry.
+   */
+  private _extendingPathId: string | null = null
+  private _extendingPathSnapshot: VectorPath | null = null
+  private _extendingFromEnd: 'first' | 'last' = 'last'
+
   onActivate(): void {
     this._afterRenderUnsub = this.board?.hooks.afterRender.tap('vectorpen', () => {
       if (this.anchors.length > 0) this.scheduleOverlayRedraw()
     }) ?? null
+    this._maybeBeginExtending()
   }
 
   onDeactivate(): void {
     this._afterRenderUnsub?.()
     this._afterRenderUnsub = null
+    // Switching tool mid-extension: silently restore the original geometry
+    // (no history entry — the user never committed). Without this, the path
+    // they were continuing visibly vanishes from the canvas.
+    this._restoreOriginalIfExtending()
     this.board?.clearStrokeCanvas()
     this.anchors = []
+  }
+
+  /**
+   * Figma-style continuation: when the user switches to Pen with the Select
+   * tool focused on an OPEN path in editing mode, seed `this.anchors` from
+   * that path so the next click extends it from the appropriate endpoint.
+   * Detects the endpoint based on which is closer to the cursor on activate.
+   * No-op for closed paths or anything else.
+   */
+  private _maybeBeginExtending(): void {
+    const board = this.board
+    if (!board) return
+    // Probe SelectTool through the registry — Tool base doesn't import it.
+    const select = board.getTool('select') as { state?: { kind: string; id?: string } } | undefined
+    const st = select?.state
+    if (!st || st.kind !== 'editing' || !st.id) return
+    const layer = board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return
+    const path = layer.paths.find((p) => p.id === st.id)
+    if (!path || path.closed || path.anchors.length === 0) return
+
+    // Snapshot for undo + onDeactivate restore.
+    this._extendingPathId = path.id
+    this._extendingPathSnapshot = {
+      ...path,
+      anchors: path.anchors.map((a) => ({
+        ...a,
+        handleIn: a.handleIn ? { ...a.handleIn } : null,
+        handleOut: a.handleOut ? { ...a.handleOut } : null,
+      })),
+    }
+    this._extendingFromEnd = 'last'
+    // Seed our in-progress anchors from the existing path so the rubber band
+    // continues from its last anchor.
+    this.anchors = this._extendingPathSnapshot.anchors.map((a) => ({
+      ...a,
+      handleIn: a.handleIn ? { ...a.handleIn } : null,
+      handleOut: a.handleOut ? { ...a.handleOut } : null,
+    }))
+    // HIDE the original from the layer while we're editing it — otherwise
+    // user sees the unchanging real path AND the live preview drawn on top
+    // (visually two of everything). Commit puts the new geometry back;
+    // onDeactivate / cancel restores the original.
+    layer.paths = layer.paths.filter((p) => p.id !== path.id)
+    board.markDirty()
+    this.scheduleOverlayRedraw()
+  }
+
+  /** Restore the original path if we're extending and haven't committed. */
+  private _restoreOriginalIfExtending(): void {
+    if (!this._extendingPathSnapshot || !this.board) return
+    const layer = this.board.getActiveLayer()
+    if (!(layer instanceof VectorLayer)) return
+    // Only re-add if it's not already there (commit replaces in place).
+    if (!layer.paths.find((p) => p.id === this._extendingPathSnapshot!.id)) {
+      layer.paths.push({
+        ...this._extendingPathSnapshot,
+        anchors: this._extendingPathSnapshot.anchors.map((a) => ({
+          ...a,
+          handleIn: a.handleIn ? { ...a.handleIn } : null,
+          handleOut: a.handleOut ? { ...a.handleOut } : null,
+        })),
+      })
+      this.board.markDirty()
+    }
+    this._extendingPathId = null
+    this._extendingPathSnapshot = null
   }
 
   onPointerDown(e: PointerData): void {
@@ -61,6 +145,31 @@ export class VectorPenTool extends Tool {
       const dx = e.x - fs.x, dy = e.y - fs.y
       if (dx * dx + dy * dy <= CLOSE_RADIUS_SCREEN * CLOSE_RADIUS_SCREEN) {
         this.commitPath(layer, true)
+        return
+      }
+    }
+
+    // ── Click-on-edge to insert anchor ─────────────────────────────────────
+    // When NO in-progress path AND the cursor is over an existing path's
+    // curve, insert a new anchor at the click point splitting the segment.
+    // Matches Figma's pen-hover-on-path behavior. Switching to Select +
+    // editing mode after insertion lets the user immediately tweak the new
+    // anchor's handles.
+    if (this.anchors.length === 0 && !this._extendingPathId) {
+      const radiusLocal = EDGE_HOVER_RADIUS_SCREEN / board.camera.zoom
+      const hit = layer.hitTestEdgePoint(world.x, world.y, radiusLocal)
+      if (hit) {
+        const beforeSnap = layer.snapshotElements()
+        const insertedIdx = layer.insertAnchorAt(hit.pathId, hit.segmentIdx, hit.t)
+        if (insertedIdx !== -1) {
+          const afterSnap = layer.snapshotElements()
+          board.history.push({
+            undo: () => { layer.restoreElementsSnapshot(beforeSnap); board.markDirty() },
+            redo: () => { layer.restoreElementsSnapshot(afterSnap);  board.markDirty() },
+          })
+          board.markDirty()
+          this.scheduleOverlayRedraw()
+        }
         return
       }
     }
@@ -139,12 +248,62 @@ export class VectorPenTool extends Tool {
 
   /** Cancel and discard current path (e.g., on Escape). */
   cancelPath(): void {
+    // Restore the hidden original if we were extending — otherwise the path
+    // we were continuing would disappear from the canvas on Escape.
+    this._restoreOriginalIfExtending()
     this.anchors = []
     this.board?.clearStrokeCanvas()
   }
 
   private commitPath(layer: VectorLayer, closed: boolean): void {
     if (this.anchors.length < 2) { this.cancelPath(); return }
+    const board = this.board!
+
+    // Extending an existing path: PUT IT BACK with the new geometry. The
+    // original was removed from the layer in _maybeBeginExtending so the
+    // hidden geometry didn't overlap the live preview. Single history entry
+    // swaps the snapshot in/out — undo returns the path to its pre-
+    // extension shape; redo re-applies the new geometry.
+    if (this._extendingPathId && this._extendingPathSnapshot) {
+      const targetId = this._extendingPathId
+      const beforeSnap = this._extendingPathSnapshot
+      const after: VectorPath = {
+        ...beforeSnap,
+        closed,
+        anchors: this.anchors.map((a) => ({
+          ...a,
+          handleIn: a.handleIn ? { ...a.handleIn } : null,
+          handleOut: a.handleOut ? { ...a.handleOut } : null,
+        })),
+      }
+      // Removed during _maybeBeginExtending — push the committed version back.
+      layer.paths.push({
+        ...after,
+        anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
+      })
+      board.history.push({
+        undo: () => {
+          const i = layer.paths.findIndex((p) => p.id === targetId)
+          if (i !== -1) layer.paths[i] = { ...beforeSnap, anchors: beforeSnap.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+          else layer.paths.push({ ...beforeSnap, anchors: beforeSnap.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) })
+          board.markDirty()
+        },
+        redo: () => {
+          const i = layer.paths.findIndex((p) => p.id === targetId)
+          if (i !== -1) layer.paths[i] = { ...after, anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) }
+          else layer.paths.push({ ...after, anchors: after.anchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })) })
+          board.markDirty()
+        },
+      })
+      this.anchors = []
+      this._extendingPathId = null
+      this._extendingPathSnapshot = null
+      board.clearStrokeCanvas()
+      board.markDirty()
+      return
+    }
+
+    // Fresh path: original create-new behavior.
     const beforePaths = layer.paths.slice()
     const path = layer.createPath(
       [...this.anchors],
@@ -155,8 +314,6 @@ export class VectorPenTool extends Tool {
       this.settings.opacity,
     )
     layer.addPath(path)
-
-    const board = this.board!
     board.history.push({
       undo: () => { layer.paths = [...beforePaths]; board.markDirty() },
       redo: () => { layer.paths = [...beforePaths, path]; board.markDirty() },
@@ -187,6 +344,33 @@ export class VectorPenTool extends Tool {
     const layer = board.getActiveLayer() as VectorLayer | undefined
 
     strokeCtx.clearRect(0, 0, strokeCtx.canvas.width, strokeCtx.canvas.height)
+
+    // Edge-hover hint: when no path in-progress, probe for nearest edge
+    // and draw a "+" marker so the user knows clicking will insert an
+    // anchor. Probe cost: ~20 samples × paths-in-active-layer per frame
+    // (acceptable for typical scenes; rAF-throttled by scheduleOverlayRedraw).
+    if (this.anchors.length === 0 && !this._pendingAnchor && layer && !this._extendingPathId) {
+      const radiusLocal = EDGE_HOVER_RADIUS_SCREEN / board.camera.zoom
+      const hit = layer.hitTestEdgePoint(this.mouseWorld.x, this.mouseWorld.y, radiusLocal)
+      if (hit) {
+        strokeCtx.save()
+        strokeCtx.scale(dpr, dpr)
+        const ps = board.camera.worldToScreen(hit.x + layer.transform.x, hit.y + layer.transform.y, W, H)
+        // Outer ring + plus glyph.
+        strokeCtx.strokeStyle = '#63b3ed'
+        strokeCtx.lineWidth = 2
+        strokeCtx.beginPath()
+        strokeCtx.arc(ps.x, ps.y, 7, 0, Math.PI * 2)
+        strokeCtx.stroke()
+        strokeCtx.beginPath()
+        strokeCtx.moveTo(ps.x - 3, ps.y); strokeCtx.lineTo(ps.x + 3, ps.y)
+        strokeCtx.moveTo(ps.x, ps.y - 3); strokeCtx.lineTo(ps.x, ps.y + 3)
+        strokeCtx.stroke()
+        strokeCtx.restore()
+        return
+      }
+    }
+
     if (this.anchors.length === 0 && !this._pendingAnchor) return
 
     strokeCtx.save()
@@ -261,14 +445,44 @@ export class VectorPenTool extends Tool {
       }
     }
 
-    // 3. If no committed anchors yet (first point being placed), draw a soft dot at pending position
-    if (this.anchors.length === 0 && this._pendingAnchor) {
-      const ps = toScreen(this._pendingAnchor.x, this._pendingAnchor.y)
-      strokeCtx.fillStyle = 'rgba(96, 205, 255, 0.6)'
+    // 3. PENDING anchor (the one being placed RIGHT NOW): always draw an
+    // anchor circle at its position. While dragging, also draw both bezier
+    // handles + tether lines so the user sees the curve being shaped in
+    // real time. This is the preview the user said was missing during
+    // drag — previously we only rendered a soft dot for the very first
+    // anchor and nothing for subsequent ones.
+    if (this._pendingAnchor) {
+      const pa = this._pendingAnchor
+      const ps = toScreen(pa.x, pa.y)
+      // Anchor circle for the pending point.
       strokeCtx.globalAlpha = 1
+      strokeCtx.setLineDash([])
       strokeCtx.beginPath()
-      strokeCtx.arc(ps.x, ps.y, 4, 0, Math.PI * 2)
-      strokeCtx.fill()
+      strokeCtx.arc(ps.x, ps.y, 5, 0, Math.PI * 2)
+      strokeCtx.fillStyle = '#fff'
+      strokeCtx.strokeStyle = '#63b3ed'
+      strokeCtx.lineWidth = 2
+      strokeCtx.fill(); strokeCtx.stroke()
+
+      // Live handle preview while dragging.
+      if (this._isDragging && cursorAnchor.handleIn && cursorAnchor.handleOut) {
+        const hIn = toScreen(cursorAnchor.handleIn.x, cursorAnchor.handleIn.y)
+        const hOut = toScreen(cursorAnchor.handleOut.x, cursorAnchor.handleOut.y)
+        // Tether lines.
+        strokeCtx.strokeStyle = 'rgba(99,179,237,0.6)'
+        strokeCtx.lineWidth = 1
+        strokeCtx.setLineDash([3, 3])
+        strokeCtx.beginPath(); strokeCtx.moveTo(hIn.x, hIn.y); strokeCtx.lineTo(hOut.x, hOut.y); strokeCtx.stroke()
+        strokeCtx.setLineDash([])
+        // Handle squares.
+        for (const h of [hIn, hOut]) {
+          strokeCtx.fillStyle = '#fff'
+          strokeCtx.strokeStyle = '#63b3ed'
+          strokeCtx.lineWidth = 1.5
+          strokeCtx.fillRect(h.x - 3.5, h.y - 3.5, 7, 7)
+          strokeCtx.strokeRect(h.x - 3.5, h.y - 3.5, 7, 7)
+        }
+      }
     }
 
     // Draw handles for committed anchors

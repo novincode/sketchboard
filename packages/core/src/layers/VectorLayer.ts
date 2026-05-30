@@ -326,6 +326,104 @@ export class VectorLayer extends Layer {
   }
 
   /**
+   * Find the closest point ON the curve of any path within `radius` of (x, y).
+   * Returns `{ pathId, segmentIdx, t }` where segmentIdx is the index of the
+   * anchor whose incoming-side segment was closest, and t is the parametric
+   * position along that segment (0 = anchor[i-1], 1 = anchor[i]). For closed
+   * paths, the wrap-around segment is index `anchors.length` (synthetic).
+   * Used by VectorPenTool to insert a new anchor where the user clicked on
+   * an existing edge ("+" cursor mode).
+   */
+  hitTestEdgePoint(x: number, y: number, radius: number): {
+    pathId: string; segmentIdx: number; t: number; x: number; y: number
+  } | null {
+    const r2 = radius * radius
+    let best: { pathId: string; segmentIdx: number; t: number; x: number; y: number; d2: number } | null = null
+    const N = 20
+    for (let pi = this.paths.length - 1; pi >= 0; pi--) {
+      const path = this.paths[pi]!
+      const anchors = path.anchors
+      if (anchors.length < 2) continue
+      const cubicAt = (
+        p0x: number, p0y: number, p1x: number, p1y: number,
+        p2x: number, p2y: number, p3x: number, p3y: number, t: number,
+      ) => {
+        const mt = 1 - t
+        return {
+          x: mt*mt*mt*p0x + 3*mt*mt*t*p1x + 3*mt*t*t*p2x + t*t*t*p3x,
+          y: mt*mt*mt*p0y + 3*mt*mt*t*p1y + 3*mt*t*t*p2y + t*t*t*p3y,
+        }
+      }
+      const checkSeg = (prev: BezierAnchor, curr: BezierAnchor, segIdx: number) => {
+        const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
+        const cp2 = curr.handleIn  ?? { x: curr.x, y: curr.y }
+        for (let j = 0; j <= N; j++) {
+          const t = j / N
+          const pt = cubicAt(prev.x, prev.y, cp1.x, cp1.y, cp2.x, cp2.y, curr.x, curr.y, t)
+          const dx = pt.x - x, dy = pt.y - y
+          const d2 = dx*dx + dy*dy
+          if (d2 <= r2 && (!best || d2 < best.d2)) {
+            best = { pathId: path.id, segmentIdx: segIdx, t, x: pt.x, y: pt.y, d2 }
+          }
+        }
+      }
+      for (let i = 1; i < anchors.length; i++) checkSeg(anchors[i - 1]!, anchors[i]!, i)
+      if (path.closed && anchors.length >= 2) checkSeg(anchors[anchors.length - 1]!, anchors[0]!, anchors.length)
+    }
+    const found = best as { pathId: string; segmentIdx: number; t: number; x: number; y: number; d2: number } | null
+    if (!found) return null
+    return { pathId: found.pathId, segmentIdx: found.segmentIdx, t: found.t, x: found.x, y: found.y }
+  }
+
+  /**
+   * Insert a NEW anchor on the given path at the given segment + parametric
+   * position, splitting the bezier curve at that point using De Casteljau's
+   * algorithm. Returns the index where the new anchor was inserted, or -1
+   * if the path/segment doesn't exist. Handles for the surrounding anchors
+   * are updated so the visual curve doesn't change — the new anchor sits
+   * exactly on the previous curve with the correct tangent.
+   */
+  insertAnchorAt(pathId: string, segmentIdx: number, t: number): number {
+    const path = this.paths.find((p) => p.id === pathId)
+    if (!path) return -1
+    const anchors = path.anchors
+    const n = anchors.length
+    const isWrap = segmentIdx === n
+    const prevIdx = isWrap ? n - 1 : segmentIdx - 1
+    const currIdx = isWrap ? 0 : segmentIdx
+    if (prevIdx < 0 || prevIdx >= n || currIdx < 0 || currIdx >= n) return -1
+    const prev = anchors[prevIdx]!
+    const curr = anchors[currIdx]!
+    const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
+    const cp2 = curr.handleIn  ?? { x: curr.x, y: curr.y }
+    // De Casteljau split.
+    const lerp = (a: { x: number; y: number }, b: { x: number; y: number }, t: number) =>
+      ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t })
+    const q0 = lerp(prev, cp1, t)
+    const q1 = lerp(cp1, cp2, t)
+    const q2 = lerp(cp2, curr, t)
+    const r0 = lerp(q0, q1, t)
+    const r1 = lerp(q1, q2, t)
+    const mid = lerp(r0, r1, t)
+    // Update neighbors.
+    prev.handleOut = { x: q0.x, y: q0.y }
+    curr.handleIn  = { x: q2.x, y: q2.y }
+    const inserted: BezierAnchor = {
+      x: mid.x, y: mid.y,
+      handleIn:  { x: r0.x, y: r0.y },
+      handleOut: { x: r1.x, y: r1.y },
+      type: 'smooth',
+    }
+    const insertIdx = isWrap ? n : currIdx
+    anchors.splice(insertIdx, 0, inserted)
+    // Inserting invalidates the parametric shape descriptor (anchors don't
+    // match the regenerated form anymore). Drop it so future edits don't
+    // overwrite the new anchor.
+    if (path.shape) path.shape = undefined as VectorPath['shape']
+    return insertIdx
+  }
+
+  /**
    * Even-odd-rule point-in-path test for a closed bezier path. Flattens
    * curves to a polyline (sample density matches pathHitTest) and runs a
    * standard ray cast. Used by hitTest's body click handling.

@@ -23,8 +23,6 @@ const ROTATE_HANDLE_OFFSET = 22   // screen px above the top edge
 const ROTATE_SNAP_DEG = 15        // snap angle when shift is held
 /** Pixel inset for radius handles when corner radius is 0 — keeps them clickable. */
 const RADIUS_HANDLE_MIN_INSET = 10
-/** Maximum on-screen distance from the corner the radius handle can sit (prevents handles flying off when zoomed in). */
-const RADIUS_HANDLE_MAX_INSET = 60
 
 interface Bounds { x: number; y: number; w: number; h: number }
 
@@ -53,8 +51,12 @@ type SelectState =
   | { kind: 'moving'; ids: string[]; startLX: number; startLY: number; snaps: ElementSnapshot[]; hasMoved: boolean; isDupe?: boolean }
   | { kind: 'resizing'; ids: string[]; handle: ResizeHandle; startSX: number; startSY: number; startBounds: Bounds; snaps: ElementSnapshot[]; shiftLock: boolean; altCenter: boolean }
   | { kind: 'rotating'; ids: string[]; centerLX: number; centerLY: number; startAngle: number; snaps: ElementSnapshot[] }
-  | { kind: 'editing'; id: string }
-  | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot; createHandles?: boolean }
+  // Editing a single path's anchors. `selectedAnchorIdxs` tracks Figma-style
+  // multi-anchor selection: rect-drag inside the editor, shift-click, etc.
+  // Delete removes the set; dragging any selected anchor moves the whole set.
+  | { kind: 'editing'; id: string; selectedAnchorIdxs: number[] }
+  | { kind: 'dragging-point'; id: string; anchorIdx: number; part: 'anchor' | 'handleIn' | 'handleOut'; snap: ElementSnapshot; createHandles?: boolean; selectedAnchorIdxs: number[]; multiSnap?: ElementSnapshot }
+  | { kind: 'selecting-anchors'; id: string; sx0: number; sy0: number; sx1: number; sy1: number; additive: boolean; baseSelected: number[] }
   | { kind: 'editing-stroke'; id: string }
   | { kind: 'dragging-stroke-point'; id: string; pointIdx: number; snap: ElementSnapshot }
   // Dragging a corner-radius handle on a shape-bearing path. `corner` is the
@@ -217,14 +219,9 @@ export class SelectTool extends Tool {
 
     // ── In edit mode: check handles first ──────────────────────────────────
     if (this.state.kind === 'editing' && isVec) {
-      const hit = this.hitTestHandle(e.x, e.y, this.state.id, layer as VectorLayer)
+      const editState = this.state
+      const hit = this.hitTestHandle(e.x, e.y, editState.id, layer as VectorLayer)
       if (hit) {
-        const snap = this.snapshotElement(layer as VectorLayer, hit.id)
-        // Sticky "create handles" mode: if user Alt-grabs a CORNER anchor
-        // with no handles, we keep generating symmetric handles for the
-        // duration of the drag — even after the first frame writes handles
-        // onto the anchor. Without this flag the next move would see
-        // hasHandles=true and fall back to translating the anchor (the bug).
         const vl = layer as VectorLayer
         const path = vl.paths.find((p) => p.id === hit.id)
         const anchor = path?.anchors[hit.anchorIdx]
@@ -232,7 +229,38 @@ export class SelectTool extends Tool {
           && this._altActive
           && !!anchor
           && !(anchor.handleIn || anchor.handleOut)
-        this.state = { kind: 'dragging-point', snap, ...hit, createHandles }
+        // Anchor click: update multi-selection set (shift = toggle, plain =
+        // replace unless already in set). Handle clicks (handleIn/Out) leave
+        // the anchor selection alone — they're separate manipulators.
+        let nextSelectedIdxs = editState.selectedAnchorIdxs.slice()
+        let multiSnap: ElementSnapshot | undefined
+        if (hit.part === 'anchor') {
+          const isShift = this._shiftActive
+          const wasSelected = nextSelectedIdxs.includes(hit.anchorIdx)
+          if (isShift) {
+            nextSelectedIdxs = wasSelected
+              ? nextSelectedIdxs.filter((i) => i !== hit.anchorIdx)
+              : [...nextSelectedIdxs, hit.anchorIdx]
+          } else if (!wasSelected) {
+            // Clicking an unselected anchor → become the sole selection.
+            nextSelectedIdxs = [hit.anchorIdx]
+          }
+          // Snapshot for multi-anchor drag if more than one is selected and
+          // the user might drag them together.
+          if (nextSelectedIdxs.length > 1) {
+            multiSnap = this.snapshotElement(layer as VectorLayer, hit.id)
+          }
+        }
+        const snap = this.snapshotElement(layer as VectorLayer, hit.id)
+        this.state = {
+          kind: 'dragging-point',
+          snap,
+          ...hit,
+          createHandles,
+          selectedAnchorIdxs: nextSelectedIdxs,
+          multiSnap,
+        }
+        this.scheduleOverlayRedraw()
         return
       }
       // Clicking outside handles: check if hitting a different element or empty space
@@ -240,16 +268,31 @@ export class SelectTool extends Tool {
       const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
       const lx = world.x - vl.transform.x, ly = world.y - vl.transform.y
       const hitId = vl.hitTest(lx, ly, HIT_RADIUS / board.camera.zoom)
-      if (hitId && hitId !== this.state.id) {
+      if (hitId && hitId !== editState.id) {
+        // Clicked a different element → switch selection to it.
         this.state = { kind: 'selected', ids: [hitId] }
-      } else {
-        this.state = { kind: 'idle' }
+        board.canvas.style.cursor = 'default'
+        this._fireSelectionChanged()
+        this.scheduleOverlayRedraw()
+        return
       }
-      board.canvas.style.cursor = 'default'
+      // Empty space inside the current path's editor → start anchor rect-
+      // select instead of exiting edit mode. Shift = additive (preserve
+      // existing selection). The actual rect-vs-deselect choice is made
+      // on pointer-up based on whether the user moved more than DRAG_THRESHOLD.
+      this.state = {
+        kind: 'selecting-anchors',
+        id: editState.id,
+        sx0: e.x, sy0: e.y, sx1: e.x, sy1: e.y,
+        additive: this._shiftActive,
+        baseSelected: editState.selectedAnchorIdxs.slice(),
+      }
+      board.canvas.style.cursor = 'crosshair'
       this.scheduleOverlayRedraw()
       return
     }
     if (this.state.kind === 'dragging-point') return
+    if (this.state.kind === 'selecting-anchors') return
 
     // ── In stroke-edit mode: check stroke points ───────────────────────────
     if (this.state.kind === 'editing-stroke' && isVec) {
@@ -355,9 +398,9 @@ export class SelectTool extends Tool {
           if (doubleClick && ids.length === 1) {
             const vl = layer as VectorLayer
             const path = vl.paths.find((p) => p.id === ids[0])
-            if (path) { this.state = { kind: 'editing', id: ids[0]! }; this.scheduleOverlayRedraw(); return }
+            if (path) { this.state = { kind: 'editing', id: ids[0]!, selectedAnchorIdxs: [] }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
             const stroke = vl.strokes.find((s) => s.id === ids[0])
-            if (stroke) { this.state = { kind: 'editing-stroke', id: ids[0]! }; this.scheduleOverlayRedraw(); return }
+            if (stroke) { this.state = { kind: 'editing-stroke', id: ids[0]! }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
           }
           const world = board.camera.screenToWorld(e.x, e.y, board.logicalWidth, board.logicalHeight)
           const lx = world.x - (layer as VectorLayer).transform.x
@@ -405,7 +448,7 @@ export class SelectTool extends Tool {
       // Double-click on any element → immediately enter edit mode
       if (doubleClick) {
         const path = vl.paths.find((p) => p.id === hitId)
-        if (path) { this.state = { kind: 'editing', id: hitId }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
+        if (path) { this.state = { kind: 'editing', id: hitId, selectedAnchorIdxs: [] }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
         const stroke = vl.strokes.find((s) => s.id === hitId)
         if (stroke) { this.state = { kind: 'editing-stroke', id: hitId }; this._fireSelectionChanged(); this.scheduleOverlayRedraw(); return }
       }
@@ -439,6 +482,12 @@ export class SelectTool extends Tool {
     }
 
     if (this.state.kind === 'selecting') {
+      this.state.sx1 = e.x; this.state.sy1 = e.y
+      this.scheduleOverlayRedraw()
+      return
+    }
+
+    if (this.state.kind === 'selecting-anchors') {
       this.state.sx1 = e.x; this.state.sy1 = e.y
       this.scheduleOverlayRedraw()
       return
@@ -598,20 +647,34 @@ export class SelectTool extends Tool {
       if (!anchor) return
 
       if (st.part === 'anchor') {
-        // The `createHandles` flag was set at pointerdown if Alt was held on
-        // a corner anchor with no handles. It STAYS true for the whole drag,
-        // so each move keeps growing the symmetric handles (rather than the
-        // first move creating them and subsequent moves translating the
-        // anchor — the bug the user reported).
         if (st.createHandles) {
+          // Sticky create-handles mode (Alt+drag on a sharp corner). Keep
+          // generating symmetric handles for the whole drag — without the
+          // sticky flag the first move would write handles, then subsequent
+          // moves would see hasHandles=true and translate the anchor instead.
           anchor.handleOut = { x: lx, y: ly }
           anchor.handleIn  = { x: anchor.x * 2 - lx, y: anchor.y * 2 - ly }
           anchor.type = 'smooth'
         } else {
+          // Multi-anchor drag: if this anchor is part of a multi-selection,
+          // translate ALL selected anchors by the same delta. Matches Figma's
+          // node-editor behavior. Single-anchor drag (selection of 1 or 0)
+          // falls through to the original per-anchor translate.
           const dx = lx - anchor.x, dy = ly - anchor.y
-          if (anchor.handleIn)  { anchor.handleIn.x += dx;  anchor.handleIn.y += dy  }
-          if (anchor.handleOut) { anchor.handleOut.x += dx; anchor.handleOut.y += dy }
-          anchor.x = lx; anchor.y = ly
+          const selected = st.selectedAnchorIdxs
+          if (selected.length > 1 && selected.includes(st.anchorIdx)) {
+            for (const idx of selected) {
+              const a2 = path.anchors[idx]
+              if (!a2) continue
+              if (a2.handleIn)  { a2.handleIn.x += dx;  a2.handleIn.y += dy  }
+              if (a2.handleOut) { a2.handleOut.x += dx; a2.handleOut.y += dy }
+              a2.x += dx; a2.y += dy
+            }
+          } else {
+            if (anchor.handleIn)  { anchor.handleIn.x += dx;  anchor.handleIn.y += dy  }
+            if (anchor.handleOut) { anchor.handleOut.x += dx; anchor.handleOut.y += dy }
+            anchor.x = lx; anchor.y = ly
+          }
         }
       } else if (st.part === 'handleIn' && anchor.handleIn) {
         anchor.handleIn.x = lx; anchor.handleIn.y = ly
@@ -718,14 +781,48 @@ export class SelectTool extends Tool {
     } else if (this.state.kind === 'dragging-point') {
       const st = this.state
       if (layer instanceof VectorLayer) {
+        // Multi-anchor drag used `multiSnap` (single per-element snapshot
+        // captured before the move); single-anchor drag uses `snap`.
+        const before = st.multiSnap ?? st.snap
         const after = this.snapshotElement(layer, st.id)
-        const before = st.snap
         board.history.push({
           undo: () => { this.restoreElement(layer as VectorLayer, before); board.markDirty(); this.scheduleOverlayRedraw() },
           redo: () => { this.restoreElement(layer as VectorLayer, after); board.markDirty(); this.scheduleOverlayRedraw() },
         })
       }
-      this.state = { kind: 'editing', id: st.id }
+      this.state = { kind: 'editing', id: st.id, selectedAnchorIdxs: st.selectedAnchorIdxs }
+    } else if (this.state.kind === 'selecting-anchors') {
+      // Commit anchor rect-select (or treat tiny drag as click-deselect).
+      const st = this.state
+      const dx = st.sx1 - st.sx0, dy = st.sy1 - st.sy0
+      const moved = dx * dx + dy * dy > DRAG_THRESHOLD * DRAG_THRESHOLD
+      if (!moved) {
+        // No drag → empty-space click. Clear anchor selection unless shift held.
+        const nextSelected = st.additive ? st.baseSelected : []
+        this.state = { kind: 'editing', id: st.id, selectedAnchorIdxs: nextSelected }
+      } else if (layer instanceof VectorLayer) {
+        const path = layer.paths.find((p) => p.id === st.id)
+        if (path) {
+          const minSx = Math.min(st.sx0, st.sx1), maxSx = Math.max(st.sx0, st.sx1)
+          const minSy = Math.min(st.sy0, st.sy1), maxSy = Math.max(st.sy0, st.sy1)
+          const hits: number[] = []
+          for (let i = 0; i < path.anchors.length; i++) {
+            const a = path.anchors[i]!
+            const sp = board.camera.worldToScreen(a.x + layer.transform.x, a.y + layer.transform.y, board.logicalWidth, board.logicalHeight)
+            if (sp.x >= minSx && sp.x <= maxSx && sp.y >= minSy && sp.y <= maxSy) hits.push(i)
+          }
+          const nextSelected = st.additive
+            ? [...new Set([...st.baseSelected, ...hits])]
+            : hits
+          this.state = { kind: 'editing', id: st.id, selectedAnchorIdxs: nextSelected }
+        } else {
+          this.state = { kind: 'editing', id: st.id, selectedAnchorIdxs: st.baseSelected }
+        }
+      } else {
+        this.state = { kind: 'editing', id: st.id, selectedAnchorIdxs: st.baseSelected }
+      }
+      board.canvas.style.cursor = 'default'
+      this._fireSelectionChanged()
     } else if (this.state.kind === 'dragging-stroke-point') {
       const st = this.state
       if (layer instanceof VectorLayer) {
@@ -831,6 +928,58 @@ export class SelectTool extends Tool {
     if (!(layer instanceof VectorLayer)) return
     const st = this.state
     if (st.kind !== 'selected' && st.kind !== 'editing' && st.kind !== 'editing-stroke') return
+
+    // Editing mode with anchor selection → delete just those anchors, not
+    // the whole path. Single history entry restores the original anchor
+    // array. If deleting an anchor leaves the path with <2 anchors, the
+    // whole path gets removed (would render invisibly anyway).
+    if (st.kind === 'editing' && st.selectedAnchorIdxs.length > 0) {
+      const path = layer.paths.find((p) => p.id === st.id)
+      if (!path) return
+      const beforeSnap = this.snapshotElement(layer, path.id)
+      const removeSet = new Set(st.selectedAnchorIdxs)
+      path.anchors = path.anchors.filter((_, i) => !removeSet.has(i))
+      // Dropping anchors invalidates the parametric shape descriptor.
+      if (path.shape) path.shape = undefined
+      if (path.anchors.length < 2) {
+        layer.removePath(path.id)
+        board.history.push({
+          undo: () => {
+            // Re-add the path with original anchors.
+            const restored = layer.paths.find((p) => p.id === beforeSnap.id)
+            if (restored) this.restoreElement(layer, beforeSnap)
+            else if (beforeSnap.pathAnchors) {
+              // Was removed; rebuild and append.
+              layer.paths.push({
+                id: beforeSnap.id,
+                anchors: beforeSnap.pathAnchors.map((a) => ({ ...a, handleIn: a.handleIn ? { ...a.handleIn } : null, handleOut: a.handleOut ? { ...a.handleOut } : null })),
+                closed: false,
+                strokeColor: '#000', strokeWidth: 1, fillColor: null, opacity: 1,
+                compositeOperation: 'source-over',
+              })
+            }
+            board.markDirty(); this.scheduleOverlayRedraw()
+          },
+          redo: () => {
+            layer.removePath(path.id)
+            board.markDirty(); this.scheduleOverlayRedraw()
+          },
+        })
+        this.state = { kind: 'idle' }
+      } else {
+        const afterSnap = this.snapshotElement(layer, path.id)
+        board.history.push({
+          undo: () => { this.restoreElement(layer, beforeSnap); board.markDirty(); this.scheduleOverlayRedraw() },
+          redo: () => { this.restoreElement(layer, afterSnap);  board.markDirty(); this.scheduleOverlayRedraw() },
+        })
+        this.state = { kind: 'editing', id: path.id, selectedAnchorIdxs: [] }
+      }
+      board.markDirty()
+      this._fireSelectionChanged()
+      this.scheduleOverlayRedraw()
+      return
+    }
+
     const ids = st.kind === 'selected' ? st.ids : [st.id]
     // Capture originals so deletion is undoable.
     const removedStrokes: VectorStroke[] = []
@@ -1295,13 +1444,31 @@ export class SelectTool extends Tool {
       }
     }
 
-    // Edit mode handles (path)
-    if (this.state.kind === 'editing' || this.state.kind === 'dragging-point') {
+    // Edit mode handles (path) — also draw selected anchors filled blue.
+    if (this.state.kind === 'editing' || this.state.kind === 'dragging-point' || this.state.kind === 'selecting-anchors') {
       const id = this.state.id
+      const selectedSet = this.state.kind === 'editing'
+        ? this.state.selectedAnchorIdxs
+        : this.state.kind === 'dragging-point'
+        ? this.state.selectedAnchorIdxs
+        : this.state.kind === 'selecting-anchors'
+        ? this.state.baseSelected
+        : []
       if (layer instanceof VectorLayer) {
         const path = layer.paths.find((p) => p.id === id)
-        if (path) this.drawEditHandles(strokeCtx, path.anchors, layer, board.camera, W, H)
+        if (path) this.drawEditHandles(strokeCtx, path.anchors, layer, board.camera, W, H, selectedSet)
       }
+    }
+
+    // Anchor rect-select marquee
+    if (this.state.kind === 'selecting-anchors') {
+      const { sx0, sy0, sx1, sy1 } = this.state
+      strokeCtx.strokeStyle = 'rgba(99,179,237,0.9)'
+      strokeCtx.lineWidth = 1.5; strokeCtx.setLineDash([5, 4])
+      strokeCtx.strokeRect(Math.min(sx0, sx1), Math.min(sy0, sy1), Math.abs(sx1 - sx0), Math.abs(sy1 - sy0))
+      strokeCtx.fillStyle = 'rgba(99,179,237,0.07)'
+      strokeCtx.fillRect(Math.min(sx0, sx1), Math.min(sy0, sy1), Math.abs(sx1 - sx0), Math.abs(sy1 - sy0))
+      strokeCtx.setLineDash([])
     }
 
     // Persistent raster lasso selection — render the polygon as
@@ -1425,8 +1592,9 @@ export class SelectTool extends Tool {
 
   // ── Edit handles ──────────────────────────────────────────────────────────
 
-  private drawEditHandles(ctx: CanvasRenderingContext2D, anchors: BezierAnchor[], layer: VectorLayer, camera: Camera, W: number, H: number): void {
+  private drawEditHandles(ctx: CanvasRenderingContext2D, anchors: BezierAnchor[], layer: VectorLayer, camera: Camera, W: number, H: number, selectedIdxs: number[] = []): void {
     const ts = (lx: number, ly: number) => camera.worldToScreen(lx + layer.transform.x, ly + layer.transform.y, W, H)
+    const selectedSet = new Set(selectedIdxs)
 
     // Handle lines (dashed)
     ctx.strokeStyle = 'rgba(99,179,237,0.4)'; ctx.lineWidth = 1; ctx.setLineDash([3, 3])
@@ -1448,12 +1616,17 @@ export class SelectTool extends Tool {
       if (a.handleOut) drawSq(a.handleOut.x, a.handleOut.y)
     }
 
-    // Anchor circles
+    // Anchor circles — selected anchors fill blue so the multi-selection is
+    // immediately readable. Unselected = white fill with blue border.
     ctx.lineWidth = 2
-    for (const a of anchors) {
+    for (let i = 0; i < anchors.length; i++) {
+      const a = anchors[i]!
       const as = ts(a.x, a.y)
-      ctx.beginPath(); ctx.arc(as.x, as.y, 5, 0, Math.PI * 2)
-      ctx.fillStyle = '#fff'; ctx.strokeStyle = '#63b3ed'; ctx.fill(); ctx.stroke()
+      const isSel = selectedSet.has(i)
+      ctx.beginPath(); ctx.arc(as.x, as.y, isSel ? 6 : 5, 0, Math.PI * 2)
+      ctx.fillStyle = isSel ? '#63b3ed' : '#fff'
+      ctx.strokeStyle = isSel ? '#1e3a8a' : '#63b3ed'
+      ctx.fill(); ctx.stroke()
     }
   }
 
@@ -1584,7 +1757,11 @@ export class SelectTool extends Tool {
     const dx = screenInner.x - screenCorner.x
     const dy = screenInner.y - screenCorner.y
     const screenDist = Math.hypot(dx, dy)
-    const targetDist = Math.max(RADIUS_HANDLE_MIN_INSET, Math.min(screenDist, RADIUS_HANDLE_MAX_INSET))
+    // Handle SITS AT the actual rounded-corner elbow. No max-distance clamp —
+    // as the user rounds harder, the handle should track the elbow all the
+    // way to the center, matching Figma. Only the minimum is clamped so the
+    // handle stays clickable at r=0.
+    const targetDist = Math.max(RADIUS_HANDLE_MIN_INSET, screenDist)
     if (screenDist > 0.01) {
       const norm = targetDist / screenDist
       return { x: screenCorner.x + dx * norm, y: screenCorner.y + dy * norm }
