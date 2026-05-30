@@ -305,9 +305,16 @@ export class VectorLayer extends Layer {
   /** Return the id of the topmost stroke or path near (x,y) within `radius`. */
   hitTest(x: number, y: number, radius: number): string | null {
     const r2 = radius * radius
-    // Check paths first (drawn on top conceptually) — sample bezier curves for accurate hit testing
+    // Check paths first (drawn on top conceptually). For each path:
+    //   1. Edge proximity (catches stroke clicks on un-filled or transparent paths).
+    //   2. If closed AND has fillColor, also accept clicks INSIDE the body — so
+    //      clicking the middle of a filled rectangle selects it instead of
+    //      requiring the user to land on the stroke. Matches every other
+    //      vector editor (Figma, Illustrator, Sketch).
     for (let i = this.paths.length - 1; i >= 0; i--) {
-      if (VectorLayer.pathHitTest(this.paths[i]!, x, y, r2)) return this.paths[i]!.id
+      const path = this.paths[i]!
+      if (VectorLayer.pathHitTest(path, x, y, r2)) return path.id
+      if (path.closed && path.fillColor && VectorLayer.pathContainsPoint(path, x, y)) return path.id
     }
     for (let i = this.strokes.length - 1; i >= 0; i--) {
       for (const p of this.strokes[i]!.points) {
@@ -316,6 +323,45 @@ export class VectorLayer extends Layer {
       }
     }
     return null
+  }
+
+  /**
+   * Even-odd-rule point-in-path test for a closed bezier path. Flattens
+   * curves to a polyline (sample density matches pathHitTest) and runs a
+   * standard ray cast. Used by hitTest's body click handling.
+   */
+  private static pathContainsPoint(path: VectorPath, x: number, y: number): boolean {
+    const { anchors } = path
+    if (anchors.length < 3) return false
+    // Flatten to polyline samples.
+    const N = 12
+    const samples: Array<{ x: number; y: number }> = []
+    const isStraight = (a: BezierAnchor, b: BezierAnchor) => !a.handleOut && !b.handleIn
+    const pushSeg = (prev: BezierAnchor, curr: BezierAnchor) => {
+      if (isStraight(prev, curr)) { samples.push({ x: curr.x, y: curr.y }); return }
+      const cp1 = prev.handleOut ?? { x: prev.x, y: prev.y }
+      const cp2 = curr.handleIn  ?? { x: curr.x, y: curr.y }
+      for (let j = 1; j <= N; j++) {
+        const t = j / N, mt = 1 - t
+        samples.push({
+          x: mt*mt*mt*prev.x + 3*mt*mt*t*cp1.x + 3*mt*t*t*cp2.x + t*t*t*curr.x,
+          y: mt*mt*mt*prev.y + 3*mt*mt*t*cp1.y + 3*mt*t*t*cp2.y + t*t*t*curr.y,
+        })
+      }
+    }
+    samples.push({ x: anchors[0]!.x, y: anchors[0]!.y })
+    for (let i = 1; i < anchors.length; i++) pushSeg(anchors[i - 1]!, anchors[i]!)
+    pushSeg(anchors[anchors.length - 1]!, anchors[0]!)
+    // Even-odd raycast.
+    let inside = false
+    for (let i = 0, j = samples.length - 1; i < samples.length; j = i++) {
+      const xi = samples[i]!.x, yi = samples[i]!.y
+      const xj = samples[j]!.x, yj = samples[j]!.y
+      if (((yi > y) !== (yj > y)) && (x < ((xj - xi) * (y - yi)) / (yj - yi) + xi)) {
+        inside = !inside
+      }
+    }
+    return inside
   }
 
   /** Sample a cubic bezier at 20 pts per segment to check if point is within r2. */

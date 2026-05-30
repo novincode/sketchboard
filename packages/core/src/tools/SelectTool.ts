@@ -138,8 +138,21 @@ export class SelectTool extends Tool {
     if (this.board) this.board.canvas.style.cursor = ''
     this._afterRenderUnsub?.(); this._afterRenderUnsub = null
     this.board?.clearStrokeCanvas()
-    this.state = { kind: 'idle' }
-    this._fireSelectionChanged()
+    // Preserve selection state across tool switches — Figma-style. When the
+    // user picks the brush, pen, or any other tool, they shouldn't lose the
+    // current selection or the edit-mode focus on a path. Switching back to
+    // Select reactivates the same state, with the overlay redrawn from it.
+    // Only ephemeral mid-gesture states get reset (pending-select, selecting,
+    // moving, resizing, rotating, dragging-*) because those rely on a live
+    // pointer; everything else stays put.
+    const k = this.state.kind
+    const ephemeral = k === 'pending-select' || k === 'selecting' || k === 'moving'
+      || k === 'resizing' || k === 'rotating' || k === 'dragging-point'
+      || k === 'dragging-stroke-point' || k === 'dragging-radius'
+    if (ephemeral) {
+      this.state = { kind: 'idle' }
+      this._fireSelectionChanged()
+    }
     this._altDown = false
     this._shiftDown = false
     if (this._onKeyDown) window.removeEventListener('keydown', this._onKeyDown)
@@ -530,20 +543,29 @@ export class SelectTool extends Tool {
       //             radius, distance from vertex to cursor projected onto the
       //             vertex→center direction works well.
       const cornerPos = this._cornerWorldPos(shape, st.corner)
-      const cx = shape.x + shape.width / 2
-      const cy = shape.y + shape.height / 2
-      const dirX = cx - cornerPos.x
-      const dirY = cy - cornerPos.y
-      const dirLen = Math.hypot(dirX, dirY) || 1
-      const ux = dirX / dirLen, uy = dirY / dirLen
+      // Bisector direction in local coords — matches the radiusHandleScreenPos
+      // placement so the cursor follows the handle 1:1 during drag.
+      let ux: number, uy: number
+      if (shape.kind === 'rect') {
+        ux = st.corner === 0 || st.corner === 3 ? 1 : -1
+        uy = st.corner === 0 || st.corner === 1 ? 1 : -1
+        const len = Math.SQRT2
+        ux /= len; uy /= len
+      } else {
+        const cx = shape.x + shape.width / 2
+        const cy = shape.y + shape.height / 2
+        const dirX = cx - cornerPos.x
+        const dirY = cy - cornerPos.y
+        const dirLen = Math.hypot(dirX, dirY) || 1
+        ux = dirX / dirLen; uy = dirY / dirLen
+      }
       const dx = lx - cornerPos.x, dy = ly - cornerPos.y
       const proj = dx * ux + dy * uy
       let rDrag: number
       const maxR = Math.min(shape.width, shape.height) / 2
       if (shape.kind === 'rect') {
-        // For rect: rounded-corner inset is the perpendicular distance from
-        // the corner to where the arc begins — recover from the diagonal
-        // projection by dividing by √2.
+        // proj is along the 45° diagonal in local coords; recover radius
+        // (perpendicular inset on each edge) by dividing by √2.
         rDrag = Math.max(0, Math.min(maxR, proj / Math.SQRT2))
       } else {
         // For polygon: radius is the offset along each adjacent edge.
@@ -1531,14 +1553,31 @@ export class SelectTool extends Tool {
     if (!this.board) return null
     const { camera, logicalWidth: W, logicalHeight: H } = this.board
     const cornerLocal = this._cornerWorldPos(shape, corner)
-    const cx = shape.x + shape.width / 2
-    const cy = shape.y + shape.height / 2
-    const dirX = cx - cornerLocal.x
-    const dirY = cy - cornerLocal.y
-    const dirLen = Math.hypot(dirX, dirY) || 1
-    const ux = dirX / dirLen, uy = dirY / dirLen
+    // Direction along which the handle sits, in LOCAL coords.
+    // - rect: 45° bisector into the rect (aspect-ratio invariant; using
+    //   corner→center would shift handles off-axis on non-square rects,
+    //   producing the "handles look offset per corner" the user reported).
+    // - polygon: vertex→center (each vertex of a regular polygon points at
+    //   the center along its angle bisector — same vector).
+    let ux: number, uy: number
+    if (shape.kind === 'rect') {
+      ux = corner === 0 || corner === 3 ? 1 : -1   // TL/BL → +x; TR/BR → -x
+      uy = corner === 0 || corner === 1 ? 1 : -1   // TL/TR → +y; BR/BL → -y
+      const len = Math.SQRT2
+      ux /= len; uy /= len
+    } else {
+      const cx = shape.x + shape.width / 2
+      const cy = shape.y + shape.height / 2
+      const dirX = cx - cornerLocal.x
+      const dirY = cy - cornerLocal.y
+      const dirLen = Math.hypot(dirX, dirY) || 1
+      ux = dirX / dirLen; uy = dirY / dirLen
+    }
     const radiusIdx = corner % 4
     const r = shape.cornerRadius ? shape.cornerRadius[radiusIdx] ?? 0 : 0
+    // Distance from corner vertex to the radius elbow ALONG the bisector.
+    // For rect: r along x + r along y = r*sqrt(2) along the diagonal.
+    // For polygon: matches the existing dragging math (no √2).
     const worldDist = shape.kind === 'rect' ? r * Math.SQRT2 : r
     const screenCorner = camera.worldToScreen(cornerLocal.x + layer.transform.x, cornerLocal.y + layer.transform.y, W, H)
     const screenInner = camera.worldToScreen(cornerLocal.x + ux * worldDist + layer.transform.x, cornerLocal.y + uy * worldDist + layer.transform.y, W, H)
@@ -1546,11 +1585,17 @@ export class SelectTool extends Tool {
     const dy = screenInner.y - screenCorner.y
     const screenDist = Math.hypot(dx, dy)
     const targetDist = Math.max(RADIUS_HANDLE_MIN_INSET, Math.min(screenDist, RADIUS_HANDLE_MAX_INSET))
-    const norm = screenDist > 0.01 ? targetDist / screenDist : 0
-    return {
-      x: screenCorner.x + (dx === 0 && dy === 0 ? ux : dx) * (screenDist > 0.01 ? norm : RADIUS_HANDLE_MIN_INSET),
-      y: screenCorner.y + (dx === 0 && dy === 0 ? uy : dy) * (screenDist > 0.01 ? norm : RADIUS_HANDLE_MIN_INSET),
+    if (screenDist > 0.01) {
+      const norm = targetDist / screenDist
+      return { x: screenCorner.x + dx * norm, y: screenCorner.y + dy * norm }
     }
+    // r === 0: sample the local→screen mapping to place the handle at a
+    // consistent minimum inset along the bisector direction in screen space.
+    const sample = camera.worldToScreen(cornerLocal.x + ux + layer.transform.x, cornerLocal.y + uy + layer.transform.y, W, H)
+    const sdx = sample.x - screenCorner.x
+    const sdy = sample.y - screenCorner.y
+    const slen = Math.hypot(sdx, sdy) || 1
+    return { x: screenCorner.x + (sdx / slen) * RADIUS_HANDLE_MIN_INSET, y: screenCorner.y + (sdy / slen) * RADIUS_HANDLE_MIN_INSET }
   }
 
   /**
